@@ -446,6 +446,16 @@ Built-in libraries:
 - `lib:transport` — HTTP, WebSocket, SSE, TCP
 - `lib:protocol` — JSON-RPC, and other protocol primitives
 
+### Module Exports
+
+Exports are explicit opt-in. Nothing is exported unless listed:
+
+```json
+{
+  "exports": ["MatrixEvent", "parseEvent", "MatrixSource"]
+}
+```
+
 Standard library types (`option<T>`, `result<T, E>`) are defined in `lib:std` — no special cases in the language core.
 
 ## Effects — Handler Syntax
@@ -472,8 +482,28 @@ Effect types are **inferred** by default — the type checker tracks which effec
 
 Unannotated functions have their effect set inferred. Annotated functions are checked against the declared set.
 
+## Linearity
+
+Marinada has opt-in linear and affine types. Linearity is a type modifier, applicable to any type:
+
+| Modifier  | Constraint                          |
+|-----------|-------------------------------------|
+| `linear`  | Must be used exactly once           |
+| `affine`  | Must be used at most once (droppable, not copyable) |
+| (none)    | Unrestricted                        |
+
+Capabilities are `linear` by default — they cannot be silently copied or dropped. Continuations are `linear` by default. Regular data is unrestricted.
+
+```
+linear Cap<Network>
+linear Continuation
+affine FileHandle
+```
+
+The type checker enforces linearity only where annotated. No ergonomic cost for unrestricted values.
+
 ## Open Questions
 
-- Effect handler clause syntax — current form is a working proposal; may evolve.
-- Module exports — how does a module expose types/ops to importers?
-- Continuation linearity tracking — how strictly should the type system enforce one-shot vs multi-shot?
+- Effect handler clause syntax — settled: `[effect-name, ...payload-bindings, k]`, `return` clause has no `k`.
+- How do linear values interact with `unknown` and gradual typing?
+- Linearity in DU variants — if a DU contains a linear field, does the whole DU become linear?
