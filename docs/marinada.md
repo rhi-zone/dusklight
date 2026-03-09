@@ -115,10 +115,10 @@ The `?` op propagates errors up: if the inner expression is `Err`, return it imm
 `letrec` for mutually recursive definitions (required for tree traversal):
 
 ```json
-["letrec", [["f", ["fn", ["x"], ...body-using-f...]]], ["f", initial]]
+["letrec", [["f", ["fn", ["x"], ["f", "x"]]]], ["f", 0]]
 ```
 
-TCO is guaranteed — implementations must not overflow the stack on tail-recursive calls.
+TCO is guaranteed — implementations must not overflow the stack on tail-recursive calls. The compiler transforms tail calls; user code does not need trampolining.
 
 ### `unknown`
 
@@ -368,8 +368,67 @@ Plugin ops declare their input/output types as part of registration, so generate
 
 ---
 
+## Effects
+
+Marinada has algebraic effects. Effects unify what would otherwise be separate language mechanisms:
+
+| Effect    | Models                          |
+|-----------|---------------------------------|
+| `Error`   | Short-circuit error propagation |
+| `Async`   | Suspension and resumption       |
+| `Yield`   | Generators and streams          |
+| Custom    | Plugin-defined effects          |
+
+Effects are performed with `["perform", effect, payload]` and handled with `["handle", expr, handler]`. Handlers are user-defined — the language does not hardcode what effects mean.
+
+There is no function coloring problem — effectful and pure functions are not syntactically distinguished. The type checker tracks which effects an expression may perform.
+
+### Effect-Aware Reactivity
+
+Reactivity is effect-aware. When a reactive computation's dependencies change, the system cancels any in-flight effects from the previous run and restarts the computation. Behavior per effect:
+
+- **`Error`** — propagates through the reactive graph cleanly
+- **`Async`** — previous continuation is cancelled, computation restarts (analogous to Solid's `createResource`)
+- **`Yield`** — generator restarts from the beginning
+
+This means reactive async data fetches, reactive streams, and reactive error propagation all work without restriction. Pure reactive computations (no effects) are a subset of this model.
+
+### Standard Effects
+
+`Error`, `Async`, and `Yield` are standard library effects, not language primitives. They are defined using the same effect mechanism available to plugins.
+
+## Lambdas
+
+```json
+["fn", ["x", "y"], ["+", "x", "y"]]
+```
+
+Parameters are untyped by default (`unknown`). Optional type annotations:
+
+```json
+["fn", [["x", "int"], ["y", "int"]], ["+", "x", "y"]]
+```
+
+## Types
+
+Type definitions (DUs, aliases) live in a separate schema/manifest, not inline in expressions. A Marinada module is a JSON object:
+
+```json
+{
+  "types": [
+    { "name": "Shape", "variants": [
+      { "tag": "Circle", "fields": [["radius", "float"]] },
+      { "tag": "Rect",   "fields": [["width", "float"], ["height", "float"]] }
+    ]}
+  ],
+  "main": ["Circle", 1.5]
+}
+```
+
+Standard library types (`option<T>`, `result<T, E>`) are defined this way — no special cases in the language core.
+
 ## Open Questions
 
-- DU type definition syntax — `["type", ...]` is a placeholder; exact form TBD.
-- `fn` / lambda syntax — referenced above but not yet specified.
-- `?` error propagation — exact semantics when used outside a `result` context.
+- Effect handler syntax — `["handle", ...]` form is a placeholder; exact form TBD.
+- Module imports — how does one module reference types/ops from another?
+- Effect type signatures — how are effects declared in the type system?
