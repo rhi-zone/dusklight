@@ -502,8 +502,20 @@ affine FileHandle
 
 The type checker enforces linearity only where annotated. No ergonomic cost for unrestricted values.
 
+### Linearity and `unknown`
+
+`unknown` carries a linearity modifier. `linear unknown` is a distinct type from `unknown`. Passing a linear value where `unknown` is expected is a type error unless the target is `linear unknown`. Linear values cannot silently become unrestricted by casting.
+
+### Linearity Propagation through DUs
+
+Linearity propagates structurally. If any variant of a DU contains a linear field, the DU itself is inferred as linear — no manual annotation required. The type checker computes this from the type definition.
+
+```
+type Handle = Open(linear FileHandle) | Closed
+// Handle is inferred as linear — Open contains a linear field
+```
+
 ## Open Questions
 
 - Effect handler clause syntax — settled: `[effect-name, ...payload-bindings, k]`, `return` clause has no `k`.
-- How do linear values interact with `unknown` and gradual typing?
-- Linearity in DU variants — if a DU contains a linear field, does the whole DU become linear?
+- Interaction between effect-aware reactivity and linearity — if a reactive computation holds a linear value and re-runs, what happens to the previous instance?
