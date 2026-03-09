@@ -1,5 +1,5 @@
 import type { Expr } from "./types.ts";
-import type { EvalResult } from "./evaluate.ts";
+import type { EvalResult, Effect } from "./evaluate.ts";
 import type { Env } from "./env.ts";
 
 export type Value =
@@ -13,7 +13,8 @@ export type Value =
   | { kind: "bytes"; value: Uint8Array }
   | { kind: "fn"; params: string[]; body: Expr; env: Env }
   | { kind: "variant"; tag: string; fields: Value[] }
-  | { kind: "cap"; id: string; methods: Record<string, (...args: Value[]) => EvalResult> };
+  | { kind: "cap"; id: string; methods: Record<string, (...args: Value[]) => EvalResult> }
+  | { kind: "continuation"; resume: (v: Value) => Generator<Effect, EvalResult, Value> };
 
 export const NULL: Value = { kind: "null" };
 export const TRUE: Value = { kind: "bool", value: true };
@@ -75,6 +76,8 @@ export function valEqual(a: Value, b: Value): boolean {
     }
     case "cap":
       return a === b;
+    case "continuation":
+      return a === b;
   }
 }
 
@@ -111,5 +114,7 @@ export function valueToString(v: Value): string {
       return `${v.tag}(${v.fields.map(valueToString).join(", ")})`;
     case "cap":
       return `<cap:${v.id}>`;
+    case "continuation":
+      return "<continuation>";
   }
 }

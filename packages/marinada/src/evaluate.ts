@@ -10,6 +10,8 @@ export type EvalError = {
 
 export type EvalResult = { ok: true; value: Value } | { ok: false; error: EvalError };
 
+export type Effect = { tag: string; payload: Value };
+
 // --- Result helpers ---
 
 function ok(value: Value): EvalResult {
@@ -208,9 +210,19 @@ function setIn(obj: Value, path: Value[], val: Value, pathPrefix: number[]): Eva
   return setField(obj, key, newChildResult.value, pathPrefix);
 }
 
-// --- Call a fn value ---
+// --- Generator type alias ---
 
-function callFn(fn: Value, args: Value[], callPath: number[]): EvalResult {
+type EvalGen = Generator<Effect, EvalResult, Value>;
+
+// --- Call a fn or continuation value (generator version) ---
+
+function* callFnGen(fn: Value, args: Value[], callPath: number[]): EvalGen {
+  if (fn.kind === "continuation") {
+    if (args.length !== 1) {
+      return err("ARITY_ERROR", callPath, "continuation expects 1 arg, got " + String(args.length));
+    }
+    return yield* fn.resume(args[0] as Value);
+  }
   if (fn.kind !== "fn") {
     return err("TYPE_ERROR", callPath, "call requires fn, got " + typeName(fn));
   }
@@ -225,7 +237,7 @@ function callFn(fn: Value, args: Value[], callPath: number[]): EvalResult {
   for (let i = 0; i < fn.params.length; i++) {
     bindings[fn.params[i] as string] = args[i] as Value;
   }
-  return evalExpr(fn.body, fn.env.extend(bindings));
+  return yield* evalGen(fn.body, fn.env.extend(bindings));
 }
 
 // --- isVariantTag: string starting with uppercase ---
@@ -234,9 +246,60 @@ function isUpperCase(s: string): boolean {
   return s.length > 0 && (s[0] as string) >= "A" && (s[0] as string) <= "Z";
 }
 
-// --- Main evaluator ---
+// --- Handler dispatch ---
 
-function evalExpr(expr: Expr, env: Env): EvalResult {
+// Parsed handler clause: either an effect clause or the return clause.
+type EffectClause = {
+  kind: "effect";
+  tag: string;
+  payloadBinding: string;
+  kBinding: string;
+  body: Expr;
+};
+type ReturnClause = {
+  kind: "return";
+  binding: string;
+  body: Expr;
+};
+
+function* dispatchHandler(
+  innerGen: EvalGen,
+  step: IteratorResult<Effect, EvalResult>,
+  effectClauses: EffectClause[],
+  returnClause: ReturnClause | null,
+  env: Env,
+): EvalGen {
+  while (!step.done) {
+    const effect = step.value;
+    const clause = effectClauses.find((c) => c.tag === effect.tag);
+    if (clause) {
+      // Build continuation: calling it resumes innerGen from its current suspension point
+      const k: Value = {
+        kind: "continuation",
+        resume: (resumeVal: Value) =>
+          dispatchHandler(innerGen, innerGen.next(resumeVal), effectClauses, returnClause, env),
+      };
+      const bindEnv = env.extend({ [clause.payloadBinding]: effect.payload, [clause.kBinding]: k });
+      return yield* evalGen(clause.body, bindEnv);
+    } else {
+      // Propagate unhandled effect outward; receive the resume value from the outer handler
+      const resumeVal: Value = yield effect;
+      step = innerGen.next(resumeVal);
+    }
+  }
+  // Inner computation completed
+  const finalResult = step.value;
+  if (!finalResult.ok) return finalResult;
+  if (returnClause) {
+    const bindEnv = env.extend({ [returnClause.binding]: finalResult.value });
+    return yield* evalGen(returnClause.body, bindEnv);
+  }
+  return finalResult;
+}
+
+// --- Main evaluator (generator) ---
+
+function* evalGen(expr: Expr, env: Env): EvalGen {
   // Atoms
   if (expr === null) return ok(NULL);
   if (typeof expr === "boolean") return ok(bool(expr));
@@ -272,9 +335,10 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
   if (isUpperCase(op)) {
     const fields: Value[] = [];
     for (let i = 1; i < arr.length; i++) {
-      const r = prependPath(evalExpr(at(arr, i), env), i);
-      if (!r.ok) return r;
-      fields.push(r.value);
+      const r = yield* evalGen(at(arr, i), env);
+      const rp = prependPath(r, i);
+      if (!rp.ok) return rp;
+      fields.push(rp.value);
     }
     return ok({ kind: "variant", tag: op, fields });
   }
@@ -284,9 +348,9 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
     case "get": {
       if (arr.length !== 3)
         return err("ARITY_ERROR", [], "get requires 2 args, got " + String(arr.length - 1));
-      const objR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const objR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!objR.ok) return objR;
-      const keyR = prependPath(evalExpr(at(arr, 2), env), 2);
+      const keyR = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!keyR.ok) return keyR;
       return getField(objR.value, keyR.value, [2]);
     }
@@ -294,9 +358,9 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
     case "get-in": {
       if (arr.length !== 3)
         return err("ARITY_ERROR", [], "get-in requires 2 args, got " + String(arr.length - 1));
-      const objR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const objR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!objR.ok) return objR;
-      const pathR = prependPath(evalExpr(at(arr, 2), env), 2);
+      const pathR = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!pathR.ok) return pathR;
       if (pathR.value.kind !== "array") {
         return err("TYPE_ERROR", [2], "get-in path must be array, got " + typeName(pathR.value));
@@ -307,11 +371,11 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
     case "set": {
       if (arr.length !== 4)
         return err("ARITY_ERROR", [], "set requires 3 args, got " + String(arr.length - 1));
-      const objR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const objR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!objR.ok) return objR;
-      const keyR = prependPath(evalExpr(at(arr, 2), env), 2);
+      const keyR = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!keyR.ok) return keyR;
-      const valR = prependPath(evalExpr(at(arr, 3), env), 3);
+      const valR = prependPath(yield* evalGen(at(arr, 3), env), 3);
       if (!valR.ok) return valR;
       return setField(objR.value, keyR.value, valR.value, [2]);
     }
@@ -319,14 +383,14 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
     case "set-in": {
       if (arr.length !== 4)
         return err("ARITY_ERROR", [], "set-in requires 3 args, got " + String(arr.length - 1));
-      const objR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const objR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!objR.ok) return objR;
-      const pathR = prependPath(evalExpr(at(arr, 2), env), 2);
+      const pathR = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!pathR.ok) return pathR;
       if (pathR.value.kind !== "array") {
         return err("TYPE_ERROR", [2], "set-in path must be array, got " + typeName(pathR.value));
       }
-      const valR = prependPath(evalExpr(at(arr, 3), env), 3);
+      const valR = prependPath(yield* evalGen(at(arr, 3), env), 3);
       if (!valR.ok) return valR;
       return setIn(objR.value, pathR.value.value, valR.value, [1]);
     }
@@ -339,9 +403,9 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
     case "%": {
       if (arr.length !== 3)
         return err("ARITY_ERROR", [], op + " requires 2 args, got " + String(arr.length - 1));
-      const ar = prependPath(evalExpr(at(arr, 1), env), 1);
+      const ar = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!ar.ok) return ar;
-      const br = prependPath(evalExpr(at(arr, 2), env), 2);
+      const br = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!br.ok) return br;
       return applyArith(op, ar.value, br.value, []);
     }
@@ -349,18 +413,18 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
     // --- Comparison ---
     case "==": {
       if (arr.length !== 3) return err("ARITY_ERROR", [], "== requires 2 args");
-      const ar = prependPath(evalExpr(at(arr, 1), env), 1);
+      const ar = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!ar.ok) return ar;
-      const br = prependPath(evalExpr(at(arr, 2), env), 2);
+      const br = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!br.ok) return br;
       return ok(bool(valEqual(ar.value, br.value)));
     }
 
     case "!=": {
       if (arr.length !== 3) return err("ARITY_ERROR", [], "!= requires 2 args");
-      const ar = prependPath(evalExpr(at(arr, 1), env), 1);
+      const ar = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!ar.ok) return ar;
-      const br = prependPath(evalExpr(at(arr, 2), env), 2);
+      const br = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!br.ok) return br;
       return ok(bool(!valEqual(ar.value, br.value)));
     }
@@ -370,9 +434,9 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
     case "<=":
     case ">=": {
       if (arr.length !== 3) return err("ARITY_ERROR", [], op + " requires 2 args");
-      const ar = prependPath(evalExpr(at(arr, 1), env), 1);
+      const ar = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!ar.ok) return ar;
-      const br = prependPath(evalExpr(at(arr, 2), env), 2);
+      const br = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!br.ok) return br;
       return applyNumericCmp(op, ar.value, br.value, []);
     }
@@ -380,12 +444,12 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
     // --- Logic ---
     case "and": {
       if (arr.length !== 3) return err("ARITY_ERROR", [], "and requires 2 args");
-      const ar = prependPath(evalExpr(at(arr, 1), env), 1);
+      const ar = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!ar.ok) return ar;
       if (ar.value.kind !== "bool") {
         return err("TYPE_ERROR", [1], "and requires bool, got " + typeName(ar.value));
       }
-      const br = prependPath(evalExpr(at(arr, 2), env), 2);
+      const br = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!br.ok) return br;
       if (br.value.kind !== "bool") {
         return err("TYPE_ERROR", [2], "and requires bool, got " + typeName(br.value));
@@ -395,12 +459,12 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "or": {
       if (arr.length !== 3) return err("ARITY_ERROR", [], "or requires 2 args");
-      const ar = prependPath(evalExpr(at(arr, 1), env), 1);
+      const ar = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!ar.ok) return ar;
       if (ar.value.kind !== "bool") {
         return err("TYPE_ERROR", [1], "or requires bool, got " + typeName(ar.value));
       }
-      const br = prependPath(evalExpr(at(arr, 2), env), 2);
+      const br = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!br.ok) return br;
       if (br.value.kind !== "bool") {
         return err("TYPE_ERROR", [2], "or requires bool, got " + typeName(br.value));
@@ -410,7 +474,7 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "not": {
       if (arr.length !== 2) return err("ARITY_ERROR", [], "not requires 1 arg");
-      const ar = prependPath(evalExpr(at(arr, 1), env), 1);
+      const ar = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!ar.ok) return ar;
       if (ar.value.kind !== "bool") {
         return err("TYPE_ERROR", [1], "not requires bool, got " + typeName(ar.value));
@@ -421,15 +485,15 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
     // --- Control flow ---
     case "if": {
       if (arr.length !== 4) return err("ARITY_ERROR", [], "if requires 3 args (cond, then, else)");
-      const condR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const condR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!condR.ok) return condR;
       if (condR.value.kind !== "bool") {
         return err("TYPE_ERROR", [1], "if condition must be bool, got " + typeName(condR.value));
       }
       if (condR.value.value) {
-        return prependPath(evalExpr(at(arr, 2), env), 2);
+        return prependPath(yield* evalGen(at(arr, 2), env), 2);
       } else {
-        return prependPath(evalExpr(at(arr, 3), env), 3);
+        return prependPath(yield* evalGen(at(arr, 3), env), 3);
       }
     }
 
@@ -437,7 +501,7 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
       if (arr.length < 2) return err("ARITY_ERROR", [], "do requires at least 1 expr");
       let last: EvalResult = ok(NULL);
       for (let i = 1; i < arr.length; i++) {
-        last = prependPath(evalExpr(at(arr, i), env), i);
+        last = prependPath(yield* evalGen(at(arr, i), env), i);
         if (!last.ok) return last;
       }
       return last;
@@ -460,11 +524,11 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
         if (typeof name !== "string") {
           return err("TYPE_ERROR", [1, i, 0], "let binding name must be a string");
         }
-        const valR = prependPath(evalExpr(binding[1] as Expr, currentEnv), i);
+        const valR = prependPath(yield* evalGen(binding[1] as Expr, currentEnv), i);
         if (!valR.ok) return valR;
         currentEnv = currentEnv.extend({ [name]: valR.value });
       }
-      return prependPath(evalExpr(at(arr, 2), currentEnv), 2);
+      return prependPath(yield* evalGen(at(arr, 2), currentEnv), 2);
     }
 
     case "letrec": {
@@ -494,11 +558,11 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
       // Now evaluate each binding in the recursive env and mutate the frame
       for (let i = 0; i < bindings.length; i++) {
         const binding = bindings[i] as Expr[];
-        const valR = prependPath(evalExpr(binding[1] as Expr, recEnv), i);
+        const valR = prependPath(yield* evalGen(binding[1] as Expr, recEnv), i);
         if (!valR.ok) return valR;
         recEnv.set(names[i] as string, valR.value);
       }
-      return prependPath(evalExpr(at(arr, 2), recEnv), 2);
+      return prependPath(yield* evalGen(at(arr, 2), recEnv), 2);
     }
 
     // --- Type ops ---
@@ -508,7 +572,7 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
       if (typeof typStr !== "string") {
         return err("TYPE_ERROR", [1], "is requires a type name string as first arg");
       }
-      const valR = prependPath(evalExpr(at(arr, 2), env), 2);
+      const valR = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!valR.ok) return valR;
       return ok(bool(checkType(valR.value, typStr)));
     }
@@ -519,7 +583,7 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
       if (typeof typStr !== "string") {
         return err("TYPE_ERROR", [1], "as requires a type name string as first arg");
       }
-      const valR = prependPath(evalExpr(at(arr, 2), env), 2);
+      const valR = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!valR.ok) return valR;
       if (!checkType(valR.value, typStr)) {
         return err("TYPE_ERROR", [2], "expected " + typStr + ", got " + typeName(valR.value));
@@ -529,22 +593,22 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "untyped": {
       if (arr.length !== 2) return err("ARITY_ERROR", [], "untyped requires 1 arg");
-      return prependPath(evalExpr(at(arr, 1), env), 1);
+      return prependPath(yield* evalGen(at(arr, 1), env), 1);
     }
 
     // --- Collections ---
     case "map": {
       if (arr.length !== 3) return err("ARITY_ERROR", [], "map requires 2 args");
-      const fnR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const fnR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!fnR.ok) return fnR;
-      const arrR = prependPath(evalExpr(at(arr, 2), env), 2);
+      const arrR = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!arrR.ok) return arrR;
       if (arrR.value.kind !== "array") {
         return err("TYPE_ERROR", [2], "map requires array, got " + typeName(arrR.value));
       }
       const results: Value[] = [];
       for (const item of arrR.value.value) {
-        const r = callFn(fnR.value, [item], [1]);
+        const r = yield* callFnGen(fnR.value, [item], [1]);
         if (!r.ok) return r;
         results.push(r.value);
       }
@@ -553,16 +617,16 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "filter": {
       if (arr.length !== 3) return err("ARITY_ERROR", [], "filter requires 2 args");
-      const fnR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const fnR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!fnR.ok) return fnR;
-      const arrR = prependPath(evalExpr(at(arr, 2), env), 2);
+      const arrR = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!arrR.ok) return arrR;
       if (arrR.value.kind !== "array") {
         return err("TYPE_ERROR", [2], "filter requires array, got " + typeName(arrR.value));
       }
       const results: Value[] = [];
       for (const item of arrR.value.value) {
-        const r = callFn(fnR.value, [item], [1]);
+        const r = yield* callFnGen(fnR.value, [item], [1]);
         if (!r.ok) return r;
         if (r.value.kind !== "bool") {
           return err(
@@ -578,18 +642,18 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "reduce": {
       if (arr.length !== 4) return err("ARITY_ERROR", [], "reduce requires 3 args");
-      const fnR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const fnR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!fnR.ok) return fnR;
-      const initR = prependPath(evalExpr(at(arr, 2), env), 2);
+      const initR = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!initR.ok) return initR;
-      const arrR = prependPath(evalExpr(at(arr, 3), env), 3);
+      const arrR = prependPath(yield* evalGen(at(arr, 3), env), 3);
       if (!arrR.ok) return arrR;
       if (arrR.value.kind !== "array") {
         return err("TYPE_ERROR", [3], "reduce requires array, got " + typeName(arrR.value));
       }
       let acc = initR.value;
       for (const item of arrR.value.value) {
-        const r = callFn(fnR.value, [acc, item], [1]);
+        const r = yield* callFnGen(fnR.value, [acc, item], [1]);
         if (!r.ok) return r;
         acc = r.value;
       }
@@ -598,7 +662,7 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "count": {
       if (arr.length !== 2) return err("ARITY_ERROR", [], "count requires 1 arg");
-      const arrR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const arrR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!arrR.ok) return arrR;
       if (arrR.value.kind === "array") {
         return ok({ kind: "int", value: BigInt(arrR.value.value.length) });
@@ -615,9 +679,9 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "merge": {
       if (arr.length !== 3) return err("ARITY_ERROR", [], "merge requires 2 args");
-      const r1R = prependPath(evalExpr(at(arr, 1), env), 1);
+      const r1R = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!r1R.ok) return r1R;
-      const r2R = prependPath(evalExpr(at(arr, 2), env), 2);
+      const r2R = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!r2R.ok) return r2R;
       if (r1R.value.kind !== "record") {
         return err("TYPE_ERROR", [1], "merge requires record, got " + typeName(r1R.value));
@@ -634,7 +698,7 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "keys": {
       if (arr.length !== 2) return err("ARITY_ERROR", [], "keys requires 1 arg");
-      const recR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const recR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!recR.ok) return recR;
       if (recR.value.kind !== "record") {
         return err("TYPE_ERROR", [1], "keys requires record, got " + typeName(recR.value));
@@ -648,7 +712,7 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "vals": {
       if (arr.length !== 2) return err("ARITY_ERROR", [], "vals requires 1 arg");
-      const recR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const recR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!recR.ok) return recR;
       if (recR.value.kind !== "record") {
         return err("TYPE_ERROR", [1], "vals requires record, got " + typeName(recR.value));
@@ -661,7 +725,7 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
       if (arr.length < 2) return err("ARITY_ERROR", [], "concat requires at least 1 arg");
       let result = "";
       for (let i = 1; i < arr.length; i++) {
-        const r = prependPath(evalExpr(at(arr, i), env), i);
+        const r = prependPath(yield* evalGen(at(arr, i), env), i);
         if (!r.ok) return r;
         if (r.value.kind !== "string") {
           return err("TYPE_ERROR", [i], "concat requires string, got " + typeName(r.value));
@@ -673,17 +737,17 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "slice": {
       if (arr.length !== 4) return err("ARITY_ERROR", [], "slice requires 3 args");
-      const sR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const sR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!sR.ok) return sR;
       if (sR.value.kind !== "string") {
         return err("TYPE_ERROR", [1], "slice requires string, got " + typeName(sR.value));
       }
-      const startR = prependPath(evalExpr(at(arr, 2), env), 2);
+      const startR = prependPath(yield* evalGen(at(arr, 2), env), 2);
       if (!startR.ok) return startR;
       if (!isInt(startR.value)) {
         return err("TYPE_ERROR", [2], "slice start must be int, got " + typeName(startR.value));
       }
-      const endR = prependPath(evalExpr(at(arr, 3), env), 3);
+      const endR = prependPath(yield* evalGen(at(arr, 3), env), 3);
       if (!endR.ok) return endR;
       if (!isInt(endR.value)) {
         return err("TYPE_ERROR", [3], "slice end must be int, got " + typeName(endR.value));
@@ -696,14 +760,14 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
 
     case "to-string": {
       if (arr.length !== 2) return err("ARITY_ERROR", [], "to-string requires 1 arg");
-      const valR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const valR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!valR.ok) return valR;
       return ok({ kind: "string", value: valueToString(valR.value) });
     }
 
     case "parse-number": {
       if (arr.length !== 2) return err("ARITY_ERROR", [], "parse-number requires 1 arg");
-      const valR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const valR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!valR.ok) return valR;
       if (valR.value.kind !== "string") {
         return err("TYPE_ERROR", [1], "parse-number requires string, got " + typeName(valR.value));
@@ -752,22 +816,22 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
     case "call": {
       // ["call", fn, arg1, arg2, ...]
       if (arr.length < 2) return err("ARITY_ERROR", [], "call requires at least 1 arg");
-      const fnR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const fnR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!fnR.ok) return fnR;
       const args: Value[] = [];
       for (let i = 2; i < arr.length; i++) {
-        const r = prependPath(evalExpr(at(arr, i), env), i);
+        const r = prependPath(yield* evalGen(at(arr, i), env), i);
         if (!r.ok) return r;
         args.push(r.value);
       }
-      return callFn(fnR.value, args, []);
+      return yield* callFnGen(fnR.value, args, []);
     }
 
     // --- Match ---
     case "match": {
       // ["match", expr, [["Tag", "b1", ...], body], ...]
       if (arr.length < 3) return err("ARITY_ERROR", [], "match requires at least 2 args");
-      const scrutR = prependPath(evalExpr(at(arr, 1), env), 1);
+      const scrutR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!scrutR.ok) return scrutR;
       const scrutVal = scrutR.value;
 
@@ -811,7 +875,7 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
           }
           bindings[bName] = scrutVal.fields[j] as Value;
         }
-        return prependPath(evalExpr(body, env.extend(bindings)), i);
+        return prependPath(yield* evalGen(body, env.extend(bindings)), i);
       }
 
       // No pattern matched
@@ -823,6 +887,84 @@ function evalExpr(expr: Expr, env: Env): EvalResult {
         );
       }
       return err("NON_EXHAUSTIVE_MATCH", [], "non-exhaustive match: no clause matched");
+    }
+
+    // --- Effects ---
+    case "perform": {
+      // ["perform", tag, payload]
+      if (arr.length !== 3) return err("ARITY_ERROR", [], "perform requires 2 args");
+      const tagExpr = arr[1];
+      if (typeof tagExpr !== "string") {
+        return err("TYPE_ERROR", [1], "perform tag must be a string");
+      }
+      const payloadR = prependPath(yield* evalGen(at(arr, 2), env), 2);
+      if (!payloadR.ok) return payloadR;
+      // Yield the effect; receive the resume value from the handler
+      const resumeVal: Value = yield { tag: tagExpr, payload: payloadR.value };
+      return ok(resumeVal);
+    }
+
+    case "handle": {
+      // ["handle", expr, clause1, clause2, ..., ?returnClause]
+      // Each clause: [["EffectTag", "payloadBinding", "k"], body]
+      // Return clause: [["return", "x"], body]
+      if (arr.length < 2) return err("ARITY_ERROR", [], "handle requires at least 1 arg");
+
+      // Parse clauses
+      const effectClauses: EffectClause[] = [];
+      let returnClause: ReturnClause | null = null;
+
+      for (let i = 2; i < arr.length; i++) {
+        const clause = arr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          return err("TYPE_ERROR", [i], "handle clause must be [pattern, body]");
+        }
+        const pattern = clause[0];
+        const body = clause[1] as Expr;
+        if (!Array.isArray(pattern) || pattern.length < 1) {
+          return err(
+            "TYPE_ERROR",
+            [i, 0],
+            "handle clause pattern must be an array starting with a tag",
+          );
+        }
+        const tag = pattern[0];
+        if (typeof tag !== "string") {
+          return err("TYPE_ERROR", [i, 0], "handle clause tag must be a string");
+        }
+        if (tag === "return") {
+          // Return clause: [["return", "x"], body]
+          if (pattern.length !== 2 || typeof pattern[1] !== "string") {
+            return err("TYPE_ERROR", [i, 0], 'return clause must be ["return", bindingName]');
+          }
+          returnClause = { kind: "return", binding: pattern[1], body };
+        } else {
+          // Effect clause: [["EffectTag", "payloadBinding", "k"], body]
+          if (
+            pattern.length !== 3 ||
+            typeof pattern[1] !== "string" ||
+            typeof pattern[2] !== "string"
+          ) {
+            return err(
+              "TYPE_ERROR",
+              [i, 0],
+              'effect clause must be ["EffectTag", payloadBinding, kBinding]',
+            );
+          }
+          effectClauses.push({
+            kind: "effect",
+            tag,
+            payloadBinding: pattern[1],
+            kBinding: pattern[2],
+            body,
+          });
+        }
+      }
+
+      // Run inner expression as a generator
+      const innerGen = evalGen(at(arr, 1), env);
+      const firstStep = innerGen.next();
+      return yield* dispatchHandler(innerGen, firstStep, effectClauses, returnClause, env);
     }
 
     default:
@@ -859,6 +1001,8 @@ function checkType(v: Value, typStr: string): boolean {
       return v.kind === "variant";
     case "cap":
       return v.kind === "cap";
+    case "continuation":
+      return v.kind === "continuation";
     default:
       return false;
   }
@@ -870,7 +1014,20 @@ export { Env, EMPTY_ENV };
 export type { Value };
 
 export function evaluate(expr: Expr, env: Env = EMPTY_ENV): EvalResult {
-  return evalExpr(expr, env);
+  const gen = evalGen(expr, env);
+  let step = gen.next();
+  while (!step.done) {
+    // An effect was yielded with no handler — this is an error
+    return {
+      ok: false,
+      error: {
+        code: "UNHANDLED_EFFECT",
+        path: [],
+        message: "unhandled effect: " + step.value.tag,
+      },
+    };
+  }
+  return step.value;
 }
 
 /** Convenience: build a record Value from a plain object. */
