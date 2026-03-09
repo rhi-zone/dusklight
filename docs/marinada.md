@@ -9,10 +9,18 @@ Expressions are **JSON arrays** — s-expressions as a data structure, not a cus
 The JSON array is the canonical runtime format. Programs can be loaded from anywhere — config files, API responses, user input — and evaluated dynamically. Typed constructors in TS and Rust are a dev-time authoring layer that compiles down to the same JSON arrays. The runtime doesn't know or care which path produced an expression.
 
 Two implementations derive from this spec:
-- **JS** — JITs to native JS. Used for JSON/text data.
-- **Rust/WASM** — Bytecode + JIT. Used for binary formats and heavy computation.
+- **JS** — JITs to native JS signals (Solid.js-style). Used for JSON/text data. Owns the reactive graph in browser contexts.
+- **Rust/WASM** — Bytecode + JIT. Used for binary formats and heavy computation. Computes values; JS signals layer owns reactivity in the browser. For native targets, a Rust signals system (e.g. leptos) owns reactivity instead.
 
 Both implementations must produce identical results for all valid programs.
+
+## Reactivity
+
+Reactivity is a **compiler concern**, not a runtime polling concern. The compiler analyzes each expression's dependencies and emits reactive wiring — subscriptions are never written manually.
+
+In the JS implementation, Marinada expressions compile to signals. A property expression like `["get", settings, "spacing"]` compiles to a signal that updates exactly when `settings.spacing` changes. Only affected expressions re-evaluate — no VDOM diffing, no full re-renders.
+
+This makes layout property bindings (à la QML) first-class: any layout property can be a Marinada expression, and the compiler ensures it stays in sync with its dependencies automatically.
 
 ---
 

@@ -134,10 +134,30 @@ Inspired by SwiftUI/QML — minimal, complete, no jank. Layout is negotiated: pa
 | `ZStack`    | Layered/overlay. For modals, tooltips.   |
 | `Grid`      | 2D grid. Explicit rows/columns.          |
 | `Spacer`    | Fills available space.                   |
+| `ForEach`   | Traversal over a collection. Each item gets a scoped optic. |
 | `HMasonry`  | Horizontal masonry. Maybe.               |
 | `VMasonry`  | Vertical masonry. Maybe.                 |
 
 Layout nodes are JSON. CSS is an implementation detail — the layout model does not expose it.
+
+### Data Flow via Optics
+
+Each layout node carries an optional optic that focuses its slice of the data. Children compose their optic onto the parent's. Reads and writes both flow through the same optic — no read/write asymmetry.
+
+`ForEach` is a traversal — an optic over a collection. Each item gets a lens focused on that element.
+
+Optics are first-class values in Marinada (`Lens<S, A>`, `Traversal<S, A>`) with built-in composition ops:
+
+```json
+["lens.field", "messages"]     // Lens into a record field
+["lens.index", 0]              // Lens into an array element
+["traversal.each"]             // Traversal over all array elements
+["lens.compose", l1, l2]       // Compose two optics
+```
+
+### Property Bindings
+
+All layout properties are Marinada expressions (à la QML). The compiler tracks dependencies and emits reactive wiring automatically — a property updates exactly when its dependencies change. No manual subscriptions, no polling.
 
 ---
 
@@ -225,7 +245,7 @@ Config files are JSONC. Stored at:
 - [x] ~~Plugin distribution~~ npm/jsr/URL/local. All resolve to ES modules.
 - [x] ~~Control plane~~ Actions are Marinada expressions. No read/write asymmetry.
 - [x] ~~Serializers~~ Not a special category — just Marinada ops that produce strings/bytes.
-- [ ] Layout system — data model for layout trees, how Marinada wires to layout nodes.
+- [x] ~~Layout system~~ Optics for data scoping (lenses/traversals compose down the tree). Properties are Marinada expressions with compiler-emitted reactivity (signals). ForEach is a traversal.
 - [x] ~~Capability grant flow~~ Two levels: (1) **max set** defined in config file via setup wizard — the ceiling of what Dusklight itself may do; (2) **attenuation** via UI at runtime — user decides what each app/view/plugin actually receives, always a subset of the max. Root capabilities only ever narrow as they flow down.
 - [x] ~~Local agent protocol~~ Cap'n Proto over Unix socket. Zero-copy; capability model maps directly onto the wire format.
 - [ ] Renderer mount API — needs more thought; current signature is placeholder.
