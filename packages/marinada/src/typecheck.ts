@@ -1,4 +1,4 @@
-import type { Expr, Module } from "./types.ts";
+import type { Expr, Module, TypeDef } from "./types.ts";
 
 // --- MType ---
 
@@ -15,7 +15,9 @@ export type MType =
   | { kind: "fn"; params: MType[]; ret: MType }
   | { kind: "union"; types: MType[] }
   | { kind: "linear"; inner: MType }
-  | { kind: "affine"; inner: MType };
+  | { kind: "affine"; inner: MType }
+  | { kind: "variant"; tag: string; fields: MType[] }
+  | { kind: "named"; name: string };
 
 // Singleton constants
 const UNKNOWN: MType = { kind: "unknown" };
@@ -104,6 +106,10 @@ function typeName(t: MType): string {
       return "linear " + typeName(t.inner);
     case "affine":
       return "affine " + typeName(t.inner);
+    case "variant":
+      return t.fields.length === 0 ? t.tag : t.tag + "(" + t.fields.map(typeName).join(", ") + ")";
+    case "named":
+      return t.name;
   }
 }
 
@@ -160,6 +166,13 @@ function typesEqual(a: MType, b: MType): boolean {
       return typesEqual(a.inner, (b as { kind: "linear"; inner: MType }).inner);
     case "affine":
       return typesEqual(a.inner, (b as { kind: "affine"; inner: MType }).inner);
+    case "variant": {
+      const bv = b as { kind: "variant"; tag: string; fields: MType[] };
+      if (a.tag !== bv.tag || a.fields.length !== bv.fields.length) return false;
+      return a.fields.every((f, i) => typesEqual(f, bv.fields[i] as MType));
+    }
+    case "named":
+      return a.name === (b as { kind: "named"; name: string }).name;
   }
 }
 
@@ -994,11 +1007,64 @@ export function typecheck(expr: Expr, env?: TypeEnv): TypecheckResult {
   return { ok: true, type };
 }
 
+// --- lib:std definitions ---
+
+// lib:std exports option<T> and result<T, E> as variant constructors with unknown fields.
+// Tags: None (0 fields), Some (1 field), Ok (1 field), Err (1 field).
+const STD_TYPE_BINDINGS: Record<string, MType> = {
+  None: { kind: "variant", tag: "None", fields: [] },
+  Some: { kind: "variant", tag: "Some", fields: [UNKNOWN] },
+  Ok: { kind: "variant", tag: "Ok", fields: [UNKNOWN] },
+  Err: { kind: "variant", tag: "Err", fields: [UNKNOWN] },
+};
+
+/** Load type defs from a TypeDef[] into a Record of name→MType bindings. */
+function typeDefsToBindings(defs: TypeDef[]): Record<string, MType> {
+  const bindings: Record<string, MType> = {};
+  for (const def of defs) {
+    for (const variant of def.variants) {
+      const fields: MType[] = (variant.fields ?? []).map(([, typeName_]) =>
+        parseTypeAnnotation(typeName_),
+      );
+      bindings[variant.tag] = { kind: "variant", tag: variant.tag, fields };
+    }
+  }
+  return bindings;
+}
+
+/** Resolve imports for a module into type env bindings. Unknown schemes → all unknown. */
+function resolveImportBindings(imports: Module["imports"]): Record<string, MType> {
+  const bindings: Record<string, MType> = {};
+  for (const imp of imports ?? []) {
+    if (imp.from === "lib:std") {
+      for (const name of imp.import) {
+        const t = STD_TYPE_BINDINGS[name];
+        if (t !== undefined) {
+          bindings[name] = t;
+        } else {
+          // Known lib:std but not a variant constructor — treat as unknown
+          bindings[name] = UNKNOWN;
+        }
+      }
+    } else {
+      // local:, https:, or unknown lib: — stub: all imports are unknown
+      for (const name of imp.import) {
+        bindings[name] = UNKNOWN;
+      }
+    }
+  }
+  return bindings;
+}
+
 export function typecheckModule(module: Module): TypecheckResult {
-  // Stub: imports are not resolved; type defs are noted but not fully checked.
-  // The main expression is checked with an empty env.
   const ctx: Ctx = { errors: [], path: [] };
-  const type = inferType(module.main, EMPTY_TYPE_ENV, ctx);
+
+  // Build type env: start with import bindings, then layer type def bindings on top
+  const importBindings = resolveImportBindings(module.imports);
+  const typeDefBindings = typeDefsToBindings(module.types ?? []);
+  const moduleEnv = EMPTY_TYPE_ENV.extend({ ...importBindings, ...typeDefBindings });
+
+  const type = inferType(module.main, moduleEnv, ctx);
   if (ctx.errors.length > 0) {
     return { ok: false, errors: ctx.errors };
   }
