@@ -20,6 +20,16 @@ export type Source = {
   // The source plugin's manifest registers a factory that produces SourceResult.
 };
 
+export type SourceConfig = Record<string, unknown>;
+
+/** A source factory creates a SourceResult from a config object and capabilities. */
+export type SourceFactory = {
+  readonly id: string;
+  /** JSON Schema describing the config object, used for wizard/UI generation. */
+  readonly configSchema?: unknown;
+  create(config: SourceConfig, caps: Record<string, Cap<unknown>>): SourceResult;
+};
+
 // --- Parsers ---
 
 export type ParseContext = {
@@ -199,6 +209,7 @@ export type PluginManifest = {
   readonly version: string;
   /** Declared capability requirements. Format: "capability-type:scope", e.g. "network:api.example.com" */
   readonly capabilities?: string[];
+  readonly sources?: SourceFactory[];
   readonly parsers?: Parser[];
   readonly patterns?: Pattern[];
   readonly renderers?: Renderer<unknown, unknown>[];

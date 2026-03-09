@@ -2,6 +2,8 @@ export type {
   Cap,
   Source,
   SourceResult,
+  SourceConfig,
+  SourceFactory,
   ParseContext,
   ParseResult,
   Parser,

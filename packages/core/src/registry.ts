@@ -1,7 +1,8 @@
-import type { Parser, Pattern, Renderer, PluginManifest } from "./types.ts";
+import type { Parser, Pattern, Renderer, SourceFactory, PluginManifest } from "./types.ts";
 
 export class PluginRegistry {
   private manifests = new Map<string, PluginManifest>();
+  private sources = new Map<string, SourceFactory>();
   private parsers = new Map<string, Parser>();
   // keyed by content type
   private parsersByContentType = new Map<string, Parser[]>();
@@ -13,6 +14,9 @@ export class PluginRegistry {
       throw new Error(`Plugin already registered: ${manifest.id}`);
     }
     this.manifests.set(manifest.id, manifest);
+    for (const source of manifest.sources ?? []) {
+      this.sources.set(source.id, source);
+    }
     for (const parser of manifest.parsers ?? []) {
       this.parsers.set(parser.id, parser);
       for (const ct of parser.contentTypes) {
@@ -33,6 +37,9 @@ export class PluginRegistry {
     const manifest = this.manifests.get(pluginId);
     if (!manifest) return;
     this.manifests.delete(pluginId);
+    for (const source of manifest.sources ?? []) {
+      this.sources.delete(source.id);
+    }
     for (const parser of manifest.parsers ?? []) {
       this.parsers.delete(parser.id);
       for (const ct of parser.contentTypes) {
@@ -53,6 +60,10 @@ export class PluginRegistry {
     for (const renderer of manifest.renderers ?? []) {
       this.renderers.delete(renderer.id);
     }
+  }
+
+  getSourceFactory(sourceId: string): SourceFactory | undefined {
+    return this.sources.get(sourceId);
   }
 
   getManifest(pluginId: string): PluginManifest | undefined {
