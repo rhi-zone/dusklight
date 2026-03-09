@@ -515,7 +515,18 @@ type Handle = Open(linear FileHandle) | Closed
 // Handle is inferred as linear — Open contains a linear field
 ```
 
+### Linearity and Reactivity
+
+When a reactive computation re-runs due to a dependency change, any linear values from the previous run must be cleaned up before the re-run. Silent drop is not allowed — it would defeat linearity.
+
+Linear types used in reactive computations must declare a destructor — a cleanup expression run before the value is discarded. The runtime calls it automatically on re-run.
+
+```json
+{ "name": "FileHandle", "linear": true, "destructor": ["fn", ["h"], ["close", "h"]] }
+```
+
+Affine types (at most once) may be silently dropped — dropping is explicitly permitted by the `affine` modifier.
+
 ## Open Questions
 
 - Effect handler clause syntax — settled: `[effect-name, ...payload-bindings, k]`, `return` clause has no `k`.
-- Interaction between effect-aware reactivity and linearity — if a reactive computation holds a linear value and re-runs, what happens to the previous instance?
