@@ -198,22 +198,50 @@ Require `boolean`. Return `boolean`.
 ### Collections
 
 ```json
-["map", f, array]           // apply f to each element, return new array.
-["filter", pred, array]     // return elements where pred returns true.
-["reduce", f, init, array]  // fold.
-["count", array]            // return length.
-["merge", r1, r2]           // return new record with r2 keys overriding r1.
-["keys", record]            // return array<string> of keys.
-["vals", record]            // return array of values.
+["array", e1, e2, "..."]    // construct an array.
+["count", coll]             // return length of array or record.
+["array-get", arr, i]       // get element at index i.
+["array-push", arr, elem]   // return new array with elem appended.
+["array-slice", arr, s, e]  // return subarray [s, e).
+["record-get", r, key]      // get field.
+["record-set", r, key, val] // return new record with key set.
+["record-del", r, key]      // return new record without key.
+["record-keys", r]          // return array<string> of keys.
+["record-vals", r]          // return array of values.
+["record-merge", r1, r2]    // return new record with r2 keys overriding r1.
 ```
+
+`map`, `filter`, `reduce`, and other higher-order collection functions are defined in `lib:std` as ordinary Marinada `letrec` expressions over these primitives. The compiler sees through them and optimizes (constant folding, loop fusion) by pattern-matching on the resulting AST.
 
 ### String Operations
 
 ```json
-["concat", s1, s2, "..."]   // concatenate strings.
-["slice", s, start, end]    // substring.
+["str-len", s]              // length in Unicode code points.
+["str-get", s, i]           // code point at index i as int.
+["str-concat", s1, s2]      // concatenate two strings.
+["str-slice", s, start, end]// substring [start, end).
+["str-cmp", s1, s2]         // -1 | 0 | 1.
 ["to-string", val]          // convert any primitive to string.
-["parse-number", s]         // string → number | null.
+["parse-int", s]            // string → int | null.
+["parse-float", s]          // string → float | null.
+```
+
+Higher-level string ops (`split`, `trim`, `starts-with`, `ends-with`, `replace`, `to-upper`, `to-lower`) are defined in `lib:std`.
+
+### Math
+
+```json
+["floor", x]   ["ceil", x]    ["round", x]
+["abs", x]     ["min", a, b]  ["max", a, b]
+["pow", a, b]  ["sqrt", x]
+["int->float", x]   ["float->int", x]   // explicit numeric coercions
+```
+
+### Bitwise
+
+```json
+["bit-and", a, b]  ["bit-or", a, b]  ["bit-xor", a, b]
+["bit-not", a]     ["bit-shl", a, n]  ["bit-shr", a, n]
 ```
 
 ### Function & Method Calls
@@ -260,31 +288,6 @@ Plugin-defined capability types are declared in the plugin manifest alongside th
 
 ---
 
-## Plugin Operations
-
-Plugins register named operations at load time. A plugin op declaration:
-
-```json
-{
-  "id": "kafka.produce",
-  "inputs": [
-    { "name": "topic", "type": "string" },
-    { "name": "value", "type": "bytes" }
-  ],
-  "output": { "type": "null" }
-}
-```
-
-Declared types are used by the type checker. If a plugin op does not declare types, its inputs and output are `unknown`.
-
-Plugin ops are called like built-ins:
-
-```json
-["kafka.produce", "my-topic", ["as", "bytes", ["get", "msg", "payload"]]]
-```
-
----
-
 ## Error Format
 
 All errors include:
@@ -310,9 +313,28 @@ Example:
 
 ---
 
+## Compiler Architecture
+
+The compiler knows a **fixed, complete primitive set** — the ops listed above. This set is the entire language core; it is not extensible. Plugins that need native behavior expose it through capabilities (`call.method`), not by registering new ops.
+
+`lib:std` is just a module. It is loaded and resolved exactly like any other module — no special-casing in the compiler or runtime. `map`, `filter`, `reduce`, and other standard functions are defined as ordinary Marinada `letrec` expressions over the primitives above. The compiler sees through them transparently.
+
+Because lib:std definitions are plain AST, the compiler's optimization passes apply uniformly:
+
+- **Constant folding** — `["+", 1, 2]` → `3` at compile time
+- **Inlining** — small known functions are inlined at call sites
+- **Loop fusion** — `["call", map, f, ["call", map, g, arr]]` fuses to a single traversal
+- **Dead code elimination** — unreachable branches removed
+
+These passes operate by pattern-matching on the Marinada AST. They fire on lib:std functions and user functions alike — there are no privileged names.
+
+Each backend (JS JIT, future WASM, future Rust native) lowers the same fixed primitive set to its target. The Marinada AST is the shared representation between the language and all backends. No separate IR type is needed.
+
+---
+
 ## Evaluation Model
 
-Programs are pure data transformations with no implicit side effects. Side effects (network, mutation) only occur through explicitly declared plugin ops at world boundaries.
+Programs are pure data transformations with no implicit side effects. Side effects (network, mutation) only occur at world boundaries through capabilities (`call.method`).
 
 Evaluation order is strict (eager): arguments are evaluated before the operation.
 
@@ -441,10 +463,10 @@ All imports resolve to modules the same way. No special cases.
 | `local:`  | Filesystem path                                  |
 | `https:`  | URL                                              |
 
-Built-in libraries:
-- `lib:std` — core data manipulation, standard DUs (`option`, `result`), standard effects
-- `lib:transport` — HTTP, WebSocket, SSE, TCP
-- `lib:protocol` — JSON-RPC, and other protocol primitives
+Built-in libraries (all resolved as ordinary modules, no special-casing):
+- `lib:std` — standard functions (`map`, `filter`, `reduce`, `compose`, ...), standard DUs (`option`, `result`), standard effects (`Error`, `Async`, `Yield`)
+- `lib:transport` — HTTP, WebSocket, SSE, TCP capabilities
+- `lib:protocol` — JSON-RPC and other protocol primitives
 
 ### Module Exports
 
