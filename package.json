@@ -3,8 +3,13 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "typecheck": "echo 'No TypeScript source yet - skipping typecheck'",
-    "lint": "echo 'No TypeScript source yet - skipping lint'"
+    "typecheck": "bun run --filter '*' typecheck",
+    "lint": "bun run --filter '*' lint",
+    "test": "bun run --filter '*' test",
+    "build": "bun run --filter '*' build"
   }
 }
