@@ -26,8 +26,6 @@ docs/.vitepress/dist/
 # Rust
 agent/target/
 
-# Bun
-bun.lock
 
 # Normalize
 .normalize/*
