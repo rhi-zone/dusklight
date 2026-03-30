@@ -1,6 +1,6 @@
 # Marinada
 
-> **Status: design in progress.** Core model is settled; some details remain open (see Open Questions).
+> **Status: implementation in progress.** The JS implementation is complete: JIT compiler (to native JS), tree-walking evaluator, gradual type checker, and module system are all implemented with tests. The spec is settled.
 
 Marinada is the expression language at the core of Dusklight. It is a small, gradually-typed language designed for data manipulation and world-boundary actions.
 

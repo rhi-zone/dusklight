@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: Dusklight
-  text: Universal Data UI
-  tagline: Pattern-driven rendering for arbitrary data
+  text: Universal UI Client
+  tagline: Pattern-driven rendering and capability-safe actions for arbitrary data
   actions:
     - theme: brand
       text: Philosophy
@@ -15,9 +15,11 @@ hero:
 
 features:
   - title: Pattern-First Rendering
-    details: Data flows through recognition → rendering. Teach Dusklight patterns, it applies them everywhere.
+    details: Data flows through recognition → rendering. Teach Dusklight patterns, it applies them everywhere. Multiple renderers may match; the user picks, preferences persist.
+  - title: Marinada Expression Language
+    details: Actions are pure JSON expressions — serializable, inspectable, replayable. The same language drives layout property bindings, renderer dispatch, and optics composition.
+  - title: Capability-Based Security
+    details: Plugins operate under the object-capability model. No ambient authority. A plugin that hasn't been granted a capability cannot exercise it — authority is visible in the program.
   - title: Everything is a Plugin
-    details: Parsers, pattern matchers, renderers - all pluggable. Core orchestrates, plugins do the work.
-  - title: Progressive Disclosure
-    details: Unknown data is still explorable. Annotate structure, annotations become patterns.
+    details: Sources, parsers, patterns, renderers — all pluggable ES modules. Core orchestrates, plugins do the work. Distribution via npm, jsr, URL, or local path.
 ---

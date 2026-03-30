@@ -2,7 +2,7 @@
 
 High-level technical design for Dusklight.
 
-> **Status: design in progress.** This document reflects decisions made so far. Many details remain open.
+> **Status: implementation in progress.** Core types, plugin registry, and Marinada (JIT compiler, type checker, module system) are implemented. App shell with Solid.js and a JSON tree renderer are working. Source/parser/transport plugins are scaffolded. The design is settled; implementation continues.
 
 ---
 
