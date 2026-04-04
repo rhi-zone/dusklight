@@ -1,5 +1,11 @@
 # TODO
 
+### [ ] Marinada: consider `$` prefix for pattern bindings (from defocus)
+
+Lowercase-string-as-binding in `match` has a latent bug: `["match", x, ["friendly", body]]` binds `"friendly"` as a variable instead of matching the literal string. This hasn't surfaced in Dusklight because variant tags are uppercase, but defocus hit it immediately when matching plain string payloads.
+
+defocus adopted `$`-prefixed bindings (`"$x"`) to resolve the ambiguity. Consider aligning Marinada — `_` for wildcard, `$name` for bindings, everything else is literal. Breaking change: audit existing `match` expressions in Dusklight for lowercase bindings that would need `$` prefix.
+
 ### [x] Update CLAUDE.md — corrections as documentation lag (2026-03-29)
 
 Add to the corrections section:
