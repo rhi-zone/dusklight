@@ -243,8 +243,12 @@ describe("typecheckModule", () => {
       main: ["Circle", 1.5],
     };
     const result = typecheckModule(module);
-    // variant call returns unknown in the current type checker (no per-tag inference yet)
-    expect(result).toMatchObject({ ok: true });
+    // Phase 1: variant constructor calls are NOT_YET_IMPLEMENTED.
+    // Phase 2 will introduce variant-constructor schemes from type defs.
+    expect(result).toMatchObject({
+      ok: false,
+      errors: expect.arrayContaining([expect.objectContaining({ code: "NOT_YET_IMPLEMENTED" })]),
+    });
   });
 
   it("type-checks module with lib:std import — None in scope", () => {
