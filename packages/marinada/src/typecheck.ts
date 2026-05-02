@@ -1339,6 +1339,27 @@ function inferType(expr: Expr, env: TypeEnv, ctx: Ctx): MType {
         return UNKNOWN;
       }
       withPath(ctx, 1, (sub) => inferType(at(arr, 1), env, sub));
+
+      // First pass: find the return clause to determine the handle expression's type.
+      // return clause: [["return", binding], body]
+      let returnType: MType | null = null;
+      for (let i = 2; i < arr.length; i++) {
+        const clause = arr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) continue;
+        const pattern = clause[0];
+        if (!Array.isArray(pattern) || pattern.length < 1) continue;
+        if (pattern[0] === "return") {
+          const returnBinding = pattern[1];
+          const returnEnv =
+            typeof returnBinding === "string" ? env.extend({ [returnBinding]: UNKNOWN }) : env;
+          returnType = withPath(ctx, i, (sub) =>
+            withPath(sub, 1, (sub2) => inferType(clause[1] as Expr, returnEnv, sub2)),
+          );
+          break;
+        }
+      }
+
+      // Second pass: type-check all clauses, binding payload and k appropriately.
       for (let i = 2; i < arr.length; i++) {
         const clause = arr[i];
         if (!Array.isArray(clause) || clause.length !== 2) {
@@ -1360,12 +1381,23 @@ function inferType(expr: Expr, env: TypeEnv, ctx: Ctx): MType {
           );
           continue;
         }
-        // Bind pattern variables (tag bindings + optional continuation k) as unknown
+        // Skip return clause — already typed in first pass.
+        if (pattern[0] === "return") continue;
+
+        // Effect clause: [EffectTag, payload, k]
+        // Bind payload as unknown; bind k as fn(unknown) -> returnType (or UNKNOWN if no return clause).
         const patternBindings: Record<string, MType> = {};
+        // pattern[1] is payload binding, pattern[2] is continuation k
         for (let j = 1; j < pattern.length; j++) {
           const bName = pattern[j];
           if (typeof bName === "string") {
-            patternBindings[bName] = UNKNOWN;
+            if (j === pattern.length - 1 && pattern.length > 2) {
+              // Last binding in an effect clause with >1 binding is k (the continuation)
+              const kRetType = returnType ?? UNKNOWN;
+              patternBindings[bName] = { kind: "fn", params: [UNKNOWN], ret: kRetType };
+            } else {
+              patternBindings[bName] = UNKNOWN;
+            }
           }
         }
         const branchEnv = env.extend(patternBindings);
@@ -1373,7 +1405,8 @@ function inferType(expr: Expr, env: TypeEnv, ctx: Ctx): MType {
           withPath(sub, 1, (sub2) => inferType(clause[1] as Expr, branchEnv, sub2)),
         );
       }
-      return UNKNOWN;
+
+      return returnType ?? UNKNOWN;
     }
 
     default:
