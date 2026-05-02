@@ -16,6 +16,18 @@ module.ts:25 skips all non-lib:std imports. `local:` and `https:` schemes parse 
 
 `cond` is handled in typecheck.ts but has no case in evaluate.ts — inverse of the perform/handle gap.
 
+### [ ] Marinada: enforce linearity on closure capture
+
+Linear values captured in closures are not checked — the linearity pass counts each syntactic reference as exactly 1 use, so a linear value referenced inside an `fn` body counts once regardless of how many times the closure is called. Either forbid linear values in closures, or model call-count (undecidable in general — likely needs a "must be called exactly once" closure annotation).
+
+### [ ] Marinada: enforce linearity in `letrec` mutual recursion
+
+Linear values passed across a `letrec` recursion boundary are not modelled — the pass doesn't detect duplication through mutual recursion. Needs either forbidding linear values in recursive bindings or more careful use-count modelling across the SCC.
+
+### [ ] Marinada: error on unhandled effects at module scope
+
+`perform` without an enclosing `handle` currently typechecks — the effect row floats up with no top-level constraint. Module-level main expressions should be constrained to a pure (empty) effect row, so unhandled effects are caught at the boundary rather than silently accepted.
+
 ### [ ] Marinada: consider `$` prefix for pattern bindings (from defocus)
 
 Lowercase-string-as-binding in `match` has a latent bug: `["match", x, ["friendly", body]]` binds `"friendly"` as a variable instead of matching the literal string. This hasn't surfaced in Dusklight because variant tags are uppercase, but defocus hit it immediately when matching plain string payloads.
