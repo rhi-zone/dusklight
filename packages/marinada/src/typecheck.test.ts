@@ -1198,6 +1198,26 @@ describe("Phase 3: match", () => {
     expect(result.ok).toBe(true);
     if (result.ok) expect(prettyType(result.type)).toBe("int");
   });
+
+  // ---- Unhandled effects at module scope ----
+
+  it("perform at module scope without handle → UNHANDLED_EFFECTS", () => {
+    const result = typecheckModule({ main: ["perform", "Error", 42] });
+    expect(result).toEqual(err("UNHANDLED_EFFECTS"));
+  });
+
+  it("perform wrapped in handle at module scope → passes", () => {
+    // handle absorbs the Error effect; the module expression is pure.
+    const result = typecheckModule({
+      main: [
+        "handle",
+        ["perform", "Error", 42],
+        [["Error", "payload", "k"], 0],
+        [["return", "v"], "v"],
+      ],
+    });
+    expect(result.ok).toBe(true);
+  });
 });
 
 // --- Phase 5: capabilities and call.method ---
@@ -2232,9 +2252,9 @@ describe("adversarial", () => {
 
   // ---- Soundness holes / gradual escapes ----
   it("perform with no enclosing handle typechecks (effect propagates via row)", () => {
-    // Currently: succeeds with a fresh resume-var; the effect tag floats up
-    // through the ambient effect row. This is intentional — the effect is
-    // simply unhandled at module level.
+    // typecheck() is a standalone expression checker — no module-scope purity
+    // constraint. The effect tag floats up through the ambient effect row and
+    // the check passes. Module-level perform is caught by typecheckModule.
     const result = typecheck(["perform", "X", 1]);
     expect(result.ok).toBe(true);
   });

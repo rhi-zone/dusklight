@@ -3699,6 +3699,19 @@ export function typecheckModule(module: Module): TypecheckResult {
   };
   const moduleEnv = EMPTY_TYPE_ENV;
   const t = infer(module.main, moduleEnv, ctx);
+  // Check that the module's top-level expression is pure (no unhandled effects).
+  // We only report concrete unhandled tags — a fully-unknown effect row (a
+  // free var, no tags) is a gradual escape and must not trigger the error.
+  // A row with concrete fields is always a real unhandled effect, regardless
+  // of whether the row's tail is closed ("empty") or a fresh free var (the
+  // normal artifact of addEffectToRow at module scope).
+  const effectsRow = zonk(ctx.currentEffects, state.subst);
+  if (effectsRow.kind === "row" && effectsRow.fields.size > 0) {
+    const tags = [...effectsRow.fields.keys()].sort();
+    addError(ctx, "UNHANDLED_EFFECTS", "unhandled effects at module scope: " + tags.join(", "), {
+      got: tags.join(", "),
+    });
+  }
   if (ctx.errors.length === 0) {
     const linCtx: LinCtx = {
       errors: ctx.errors,
