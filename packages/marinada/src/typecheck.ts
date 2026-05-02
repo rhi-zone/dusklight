@@ -2743,16 +2743,25 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       if (!expectArity(ctx, "record-del", arr, 2)) return state.freshVar();
       const rT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
       const keyExpr = arr[2];
-      // Just require record; deletion of an unknown key returns the same row (open).
-      const row = state.freshVar();
-      withPath(ctx, 1, (sub) =>
-        unifyOrError(sub, { kind: "record", row }, rT, "record-del requires record"),
-      );
       if (typeof keyExpr !== "string") {
         withPath(ctx, 2, (sub) =>
           addError(sub, "TYPE_MISMATCH", "record-del key must be a string literal"),
         );
+        // Still require record-shape for the input.
+        const row = state.freshVar();
+        withPath(ctx, 1, (sub) =>
+          unifyOrError(sub, { kind: "record", row }, rT, "record-del requires record"),
+        );
+        return rT;
       }
+      // Require the input to be a record that has `keyExpr`. For a closed
+      // record, this fails if the key is absent (TYPE_MISMATCH). For an open
+      // record, the row var absorbs the field — succeeds either way.
+      const fieldT = state.freshVar();
+      const expected = openRecordWithField(state, keyExpr, fieldT);
+      withPath(ctx, 1, (sub) =>
+        unifyOrError(sub, expected, rT, "record-del: missing key " + keyExpr),
+      );
       return rT;
     }
 

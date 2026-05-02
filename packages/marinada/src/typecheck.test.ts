@@ -1233,7 +1233,11 @@ describe("Phase 5: capabilities and call.method", () => {
   });
 
   it("call.method on Cap<Storage> 'set' → null", () => {
-    const env = EMPTY_TYPE_ENV.extend({ st: CAP_STORAGE, k: STRING, v: STRING });
+    const env = EMPTY_TYPE_ENV.extend({
+      st: CAP_STORAGE,
+      k: STRING,
+      v: STRING,
+    });
     const result = typecheck(["call.method", "st", "set", "k", "v"], env);
     expect(result).toEqual(ok(NULL_T));
   });
@@ -2065,14 +2069,22 @@ describe("Phase 6: linearity", () => {
   });
 
   it("linear value in if — used in both branches once each → ok", () => {
-    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, b: BOOL, consume: CONSUME_LIN });
+    const env = EMPTY_TYPE_ENV.extend({
+      x: LINEAR_INT,
+      b: BOOL,
+      consume: CONSUME_LIN,
+    });
     // MAX merge: each branch uses x once → final use count is 1.
     const result = typecheck(["if", "b", ["call", "consume", "x"], ["call", "consume", "x"]], env);
     expect(result.ok).toBe(true);
   });
 
   it("linear value in if — used twice in one branch → DUPLICATED_LINEAR", () => {
-    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, b: BOOL, consume: CONSUME_LIN });
+    const env = EMPTY_TYPE_ENV.extend({
+      x: LINEAR_INT,
+      b: BOOL,
+      consume: CONSUME_LIN,
+    });
     const result = typecheck(
       ["if", "b", ["+", ["call", "consume", "x"], ["call", "consume", "x"]], 0],
       env,
@@ -2081,7 +2093,11 @@ describe("Phase 6: linearity", () => {
   });
 
   it("linear value in match — each branch uses once → ok", () => {
-    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, o: INT, consume: CONSUME_LIN });
+    const env = EMPTY_TYPE_ENV.extend({
+      x: LINEAR_INT,
+      o: INT,
+      consume: CONSUME_LIN,
+    });
     const result = typecheck(
       [
         "match",
@@ -2098,7 +2114,11 @@ describe("Phase 6: linearity", () => {
   });
 
   it("linear value in match — used twice in one branch → DUPLICATED_LINEAR", () => {
-    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, o: INT, consume: CONSUME_LIN });
+    const env = EMPTY_TYPE_ENV.extend({
+      x: LINEAR_INT,
+      o: INT,
+      consume: CONSUME_LIN,
+    });
     const result = typecheck(
       [
         "match",
@@ -2116,7 +2136,11 @@ describe("Phase 6: linearity", () => {
 
   it("Cap<Network> is linear by default — used twice → DUPLICATED_LINEAR", () => {
     const env = EMPTY_TYPE_ENV.extend({
-      net: { kind: "named", name: "Cap", args: [{ kind: "named", name: "Network", args: [] }] },
+      net: {
+        kind: "named",
+        name: "Cap",
+        args: [{ kind: "named", name: "Network", args: [] }],
+      },
       url: STRING,
     });
     const result = typecheck(
@@ -2155,5 +2179,217 @@ describe("Phase 6: linearity", () => {
     const env = EMPTY_TYPE_ENV.extend({ mkLin: MK_LIN, consume: CONSUME_LIN });
     const result = typecheck(["let", [["x", ["call", "mkLin"]]], ["call", "consume", "x"]], env);
     expect(result.ok).toBe(true);
+  });
+});
+
+// ===========================================================================
+// Adversarial tests — confirmed bug fixes + behavioural pinning.
+// ===========================================================================
+
+describe("adversarial", () => {
+  // ---- Bug fix: record-del on closed record with missing key ----
+  it("record-del on closed record with missing key → TYPE_MISMATCH", () => {
+    expect(typecheck(["record-del", ["record", ["x", 1]], "y"])).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("record-del on closed record with existing key → same record type", () => {
+    const result = typecheck(["record-del", ["record", ["x", 1], ["y", 2]], "x"]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("{x: int, y: int}");
+  });
+
+  it("record-del on open record (fn param) succeeds — key may or may not be present", () => {
+    // The row var absorbs the deleted key, so this typechecks.
+    const result = typecheck(["fn", ["r"], ["record-del", "r", "k"]]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("record-del key must be a string literal", () => {
+    expect(typecheck(["record-del", ["record", ["x", 1]], ["+", 1, 2]])).toEqual(
+      err("TYPE_MISMATCH"),
+    );
+  });
+
+  // ---- vals on heterogeneous record errors via unification ----
+  it("vals on heterogeneous record → TYPE_MISMATCH", () => {
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    expect(typecheck(["vals", ["record", ["x", 1], ["y", "s"]]], env)).toEqual(
+      err("TYPE_MISMATCH"),
+    );
+  });
+
+  it("vals on homogeneous record → array<T>", () => {
+    const result = typecheck(["vals", ["record", ["x", 1], ["y", 2], ["z", 3]]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("array<int>");
+  });
+
+  it("vals on empty record → array<a> (polymorphic element)", () => {
+    const result = typecheck(["vals", ["record"]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toMatch(/^array<[a-z]\d*>$/);
+  });
+
+  // ---- Soundness holes / gradual escapes ----
+  it("perform with no enclosing handle typechecks (effect propagates via row)", () => {
+    // Currently: succeeds with a fresh resume-var; the effect tag floats up
+    // through the ambient effect row. This is intentional — the effect is
+    // simply unhandled at module level.
+    const result = typecheck(["perform", "X", 1]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("as int on an unknown value typechecks at int (intentional gradual escape)", () => {
+    // A bad runtime cast that would crash at runtime still typechecks.
+    // This is the documented gradual-escape hatch.
+    const result = typecheck(["+", ["as", "int", ["untyped", 1]], 1]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  // ---- Inference edge cases ----
+  it("get-in with empty path returns the record itself", () => {
+    const result = typecheck(["get-in", ["record", ["x", 1]], ["array"]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("{x: int}");
+  });
+
+  it("merge of two open-row records loses precision (no fields known statically)", () => {
+    // Both inputs have only row variables for content; result is an open
+    // record with no known fields and a fresh tail.
+    const result = typecheck(["fn", ["a", "b"], ["merge", "a", "b"]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toContain("->");
+      // Result record body has no concrete fields.
+      expect(prettyType(result.type)).toMatch(/->\s*\{\s*\|\s*[a-z]\d*\}/);
+    }
+  });
+
+  it("match on unknown scrutinee skips exhaustiveness (does not error)", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: UNKNOWN });
+    // Only Some covered — would normally be NON_EXHAUSTIVE, but x: unknown
+    // suppresses the check.
+    const result = typecheck(["match", "x", [["Some", "v"], 1]], env);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("int");
+  });
+
+  // ---- Linearity edge cases ----
+  it("linear value stored in record field, retrieved, used once → ok", () => {
+    const LINEAR_INT: MType = { kind: "linear", inner: INT };
+    const CONSUME: MType = { kind: "fn", params: [LINEAR_INT], ret: INT };
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME });
+    const result = typecheck(
+      ["let", [["r", ["record", ["v", "x"]]]], ["call", "consume", ["get", "r", "v"]]],
+      env,
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("linear value captured in closure body — currently NOT flagged (known gap)", () => {
+    // Documents a conservative limitation: a fn that captures a linear free
+    // variable does not, by itself, count as a use (the body is not evaluated
+    // at definition time). Calling the closure later would consume the value,
+    // but the type system doesn't track this. Pin: this currently passes.
+    const LINEAR_INT: MType = { kind: "linear", inner: INT };
+    const CONSUME: MType = { kind: "fn", params: [LINEAR_INT], ret: INT };
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME });
+    const result = typecheck(["fn", [], ["call", "consume", "x"]], env);
+    expect(result.ok).toBe(true);
+  });
+
+  it("linear value used in letrec body once → ok (pin current behaviour)", () => {
+    const LINEAR_INT: MType = { kind: "linear", inner: INT };
+    const CONSUME: MType = { kind: "fn", params: [LINEAR_INT], ret: INT };
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME });
+    const result = typecheck(["letrec", [["f", ["fn", [], 0]]], ["call", "consume", "x"]], env);
+    expect(result.ok).toBe(true);
+  });
+
+  // ---- Row polymorphism stress ----
+  it("merge of two records with overlapping field of different types — error when forced into same shape", () => {
+    // Force two merge results into an array; the shapes must unify.
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    const result = typecheck(
+      [
+        "array",
+        ["merge", ["record", ["x", 1]], ["record", ["y", "s"]]],
+        ["merge", ["record", ["x", "s"]], ["record", ["y", 1]]],
+      ],
+      env,
+    );
+    expect(result).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("fn reading field from unknown-typed record → return type is a fresh var", () => {
+    // x: unknown bypasses row constraint generation; result is an unconstrained var.
+    const result = typecheck(["fn", [["r", "unknown"]], ["get", "r", "name"]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const s = prettyType(result.type);
+      expect(s).toContain("fn(unknown)");
+    }
+  });
+
+  it("polymorphic field-getter used at two different record shapes in same let", () => {
+    const result = typecheck([
+      "let",
+      [["g", ["fn", ["r"], ["get", "r", "name"]]]],
+      [
+        "array",
+        ["call", "g", ["record", ["name", 1]]],
+        ["call", "g", ["record", ["name", 2], ["age", 3]]],
+      ],
+    ]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("array<int>");
+  });
+
+  // ---- Effect row stress ----
+  it("function with effect passed where pure fn expected → TYPE_MISMATCH", () => {
+    const PURE_FN: MType = {
+      kind: "fn",
+      params: [{ kind: "fn", params: [], ret: INT }],
+      ret: INT,
+    };
+    const env = EMPTY_TYPE_ENV.extend({ pureF: PURE_FN });
+    const result = typecheck(["call", "pureF", ["fn", [], ["perform", "X", null]]], env);
+    expect(result).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("two perform calls with same tag but different payload types in same handle body → TYPE_MISMATCH", () => {
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    const result = typecheck(
+      [
+        "handle",
+        ["do", ["perform", "T", 1], ["perform", "T", "s"]],
+        [
+          ["T", "v", "k"],
+          ["call", "k", "v"],
+        ],
+      ],
+      env,
+    );
+    expect(result).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  // ---- Empty / degenerate cases ----
+  it("empty record literal → {} (empty closed record)", () => {
+    const result = typecheck(["record"]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("{}");
+    const result2 = typecheck(["{}"]);
+    expect(result2.ok).toBe(true);
+    if (result2.ok) expect(prettyType(result2.type)).toBe("{}");
+  });
+
+  it("empty array literal → array<a> (polymorphic element)", () => {
+    const result = typecheck(["array"]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toMatch(/^array<[a-z]\d*>$/);
+  });
+
+  it("match with zero clauses → ARITY_ERROR", () => {
+    expect(typecheck(["match", 1])).toEqual(err("ARITY_ERROR"));
   });
 });
