@@ -829,6 +829,14 @@ function substVars(t: MType, mapping: Map<number, MType>): MType {
 // ---------------------------------------------------------------------------
 
 function parseTypeAnnotation(s: string, params?: Set<string>): MType {
+  // `linear T` / `affine T` — recognised as a prefix modifier so users can
+  // opt into linearity on parameter / field annotations.
+  if (s.startsWith("linear ")) {
+    return { kind: "linear", inner: parseTypeAnnotation(s.slice(7), params) };
+  }
+  if (s.startsWith("affine ")) {
+    return { kind: "affine", inner: parseTypeAnnotation(s.slice(7), params) };
+  }
   switch (s) {
     case "null":
       return NULL_T;
@@ -2941,6 +2949,573 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
 }
 
 // ---------------------------------------------------------------------------
+// Linearity pass (Phase 6)
+// ---------------------------------------------------------------------------
+//
+// Opt-in linear/affine usage checker. Runs *after* HM inference completes —
+// types are zonked, so we can ask questions like "is this binding linear?"
+// without worrying about unification residue.
+//
+// Strategy: a usage-counting walk over the AST. The pass tracks declared
+// linear/affine bindings only. References to non-linear values, and code that
+// uses no linear types at all, pay no overhead.
+//
+// Branching (`if`, `cond`, `match`): each branch is walked with a snapshot of
+// the relevant entries, then we merge by taking the MAX uses across branches.
+// Conservative: if any branch uses a linear value twice, that's an error.
+//
+// Function bodies: a fn is its own scope; linear params are checked at the
+// end of the body. Capturing an outer linear variable counts as one use of
+// that outer var per syntactic occurrence — we don't model "fn called N
+// times". This matches the conservative-safe-choice rule.
+//
+// Errors: DROPPED_LINEAR (zero uses), DUPLICATED_LINEAR (>1 use of linear),
+// DUPLICATED_AFFINE (>1 use of affine).
+
+type Linearity = "linear" | "affine";
+
+type UsageEntry = {
+  /** Original linearity classification — drives which errors apply. */
+  linearity: Linearity;
+  uses: number;
+  /** Source path of the *binder*, for error reporting. */
+  bindPath: number[];
+  /** Display name of the binder, for error messages. */
+  name: string;
+};
+
+/**
+ * Scope of usage tracking. Entries are looked up by name walking up the parent
+ * chain. Entries are mutated in place during the walk.
+ */
+type UsageScope = {
+  entries: Map<string, UsageEntry>;
+  parent: UsageScope | null;
+};
+
+function lookupUsage(scope: UsageScope, name: string): UsageEntry | undefined {
+  let s: UsageScope | null = scope;
+  while (s !== null) {
+    const e = s.entries.get(name);
+    if (e !== undefined) return e;
+    s = s.parent;
+  }
+  return undefined;
+}
+
+/**
+ * Classify a (zonked) MType as linear, affine, or unrestricted. `Cap<T>` is
+ * treated as linear by default per spec — capabilities cannot be silently
+ * copied or dropped.
+ *
+ * `unknown` is conservatively treated as non-linear (gradual escape). The
+ * spec carves out `linear unknown` as a distinct type — that case is handled
+ * by the explicit `linear` wrapper.
+ */
+function classifyLinearity(t: MType): Linearity | null {
+  switch (t.kind) {
+    case "linear":
+      return "linear";
+    case "affine":
+      return "affine";
+    case "named":
+      // Capabilities are linear by default per spec.
+      if (t.name === "Cap") return "linear";
+      return null;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Snapshot the `uses` field of every entry reachable through the scope chain.
+ * Used by branching constructs so we can run each branch from the same
+ * starting point and then merge with MAX.
+ */
+function snapshotUses(scope: UsageScope): Map<UsageEntry, number> {
+  const snap = new Map<UsageEntry, number>();
+  let s: UsageScope | null = scope;
+  while (s !== null) {
+    for (const e of s.entries.values()) {
+      if (!snap.has(e)) snap.set(e, e.uses);
+    }
+    s = s.parent;
+  }
+  return snap;
+}
+
+function restoreUses(snap: Map<UsageEntry, number>): void {
+  for (const [e, n] of snap) e.uses = n;
+}
+
+function maxMergeUses(target: Map<UsageEntry, number>, snap: Map<UsageEntry, number>): void {
+  for (const [e, n] of snap) {
+    const cur = target.get(e);
+    if (cur === undefined || n > cur) target.set(e, n);
+  }
+}
+
+/**
+ * Walk a list of branch bodies. Each branch starts from the same usage
+ * snapshot; afterwards each entry's `uses` becomes the MAX across branches.
+ *
+ * `runBranch` takes a setup callback (typically running the branch's walker)
+ * and is called once per branch.
+ */
+function withBranches(scope: UsageScope, branches: Array<() => void>): void {
+  if (branches.length === 0) return;
+  const baseline = snapshotUses(scope);
+  const merged = new Map<UsageEntry, number>(baseline);
+  for (const run of branches) {
+    restoreUses(baseline);
+    run();
+    const after = snapshotUses(scope);
+    maxMergeUses(merged, after);
+  }
+  restoreUses(merged);
+}
+
+type LinCtx = {
+  errors: TypecheckError[];
+  path: number[];
+  state: State;
+  ctors: Map<string, string>;
+  typeDefs: Map<string, TypeDefInfo>;
+  effectSigs: Map<string, EffectSig>;
+  capMethods: Map<string, Map<string, CapMethodSig>>;
+};
+
+/**
+ * Determine the (zonked) type of an expression in a given env. Used by the
+ * linearity pass to discover whether a `let`-bound RHS produces a linear or
+ * affine value. Runs `infer` against a throwaway error buffer — any new
+ * errors produced are discarded since HM already validated the program.
+ */
+function probeType(expr: Expr, env: TypeEnv, ctx: LinCtx): MType {
+  const sub: Ctx = {
+    errors: [],
+    path: [],
+    state: ctx.state,
+    typeDefs: ctx.typeDefs,
+    ctors: ctx.ctors,
+    effectSigs: ctx.effectSigs,
+    capMethods: ctx.capMethods,
+    currentEffects: freshEffectsRow(ctx.state),
+  };
+  const t = infer(expr, env, sub);
+  return zonk(t, ctx.state.subst);
+}
+
+function linAddError(
+  ctx: LinCtx,
+  code: string,
+  message: string,
+  path: number[],
+  extras?: { expected?: string; got?: string },
+): void {
+  ctx.errors.push({ code, path: [...path], message, ...extras });
+}
+
+/**
+ * Final check on a binding leaving scope: emit DROPPED_LINEAR or
+ * DUPLICATED_LINEAR / DUPLICATED_AFFINE based on the entry's final use count.
+ */
+function checkBindingFinal(ctx: LinCtx, entry: UsageEntry): void {
+  if (entry.linearity === "linear") {
+    if (entry.uses === 0) {
+      linAddError(
+        ctx,
+        "DROPPED_LINEAR",
+        "linear value '" + entry.name + "' is never used (must be used exactly once)",
+        entry.bindPath,
+      );
+    } else if (entry.uses > 1) {
+      linAddError(
+        ctx,
+        "DUPLICATED_LINEAR",
+        "linear value '" +
+          entry.name +
+          "' is used " +
+          String(entry.uses) +
+          " times (must be used exactly once)",
+        entry.bindPath,
+      );
+    }
+  } else {
+    // affine: at most once
+    if (entry.uses > 1) {
+      linAddError(
+        ctx,
+        "DUPLICATED_AFFINE",
+        "affine value '" +
+          entry.name +
+          "' is used " +
+          String(entry.uses) +
+          " times (must be used at most once)",
+        entry.bindPath,
+      );
+    }
+  }
+}
+
+function withLinPath<T>(ctx: LinCtx, idx: number, fn: (sub: LinCtx) => T): T {
+  const sub: LinCtx = {
+    errors: ctx.errors,
+    path: [...ctx.path, idx],
+    state: ctx.state,
+    ctors: ctx.ctors,
+    typeDefs: ctx.typeDefs,
+    effectSigs: ctx.effectSigs,
+    capMethods: ctx.capMethods,
+  };
+  return fn(sub);
+}
+
+/**
+ * Walk an expression in linearity mode, accumulating use counts on `scope`.
+ *
+ * The walker mirrors `infer` structurally but is independent — it only cares
+ * about variable references (use sites) and the binders that introduce
+ * tracked names (let, letrec, fn params, match patterns).
+ *
+ * For ops we don't need to special-case (most builtins), the default child
+ * walk is fine: just recurse into every child sub-expression.
+ */
+function walkLin(expr: Expr, scope: UsageScope, env: TypeEnv, ctx: LinCtx): void {
+  if (expr === null || typeof expr === "boolean" || typeof expr === "number") return;
+  if (typeof expr === "string") {
+    // Variable reference — increment the matching usage entry, if tracked.
+    const entry = lookupUsage(scope, expr);
+    if (entry !== undefined) entry.uses += 1;
+    return;
+  }
+
+  const arr = expr as Expr[];
+  if (arr.length === 0) return;
+  const op = arr[0];
+  if (typeof op !== "string") return;
+
+  // Variant constructors and unknown ops just recurse into children.
+  if (isUpperCase(op)) {
+    for (let i = 1; i < arr.length; i++) {
+      withLinPath(ctx, i, (sub) => walkLin(at(arr, i), scope, env, sub));
+    }
+    return;
+  }
+
+  switch (op) {
+    case "if": {
+      if (arr.length !== 4) return;
+      withLinPath(ctx, 1, (sub) => walkLin(at(arr, 1), scope, env, sub));
+      withBranches(scope, [
+        () => withLinPath(ctx, 2, (sub) => walkLin(at(arr, 2), scope, env, sub)),
+        () => withLinPath(ctx, 3, (sub) => walkLin(at(arr, 3), scope, env, sub)),
+      ]);
+      return;
+    }
+    case "cond": {
+      // Tests run unconditionally (sequentially); branches merge via MAX.
+      const branches: Array<() => void> = [];
+      for (let i = 1; i < arr.length; i++) {
+        const clause = arr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) continue;
+        const test = clause[0];
+        const body = clause[1] as Expr;
+        if (test !== "else") {
+          withLinPath(ctx, i, (sub) =>
+            withLinPath(sub, 0, (sub2) => walkLin(test as Expr, scope, env, sub2)),
+          );
+        }
+        const idx = i;
+        branches.push(() =>
+          withLinPath(ctx, idx, (sub) =>
+            withLinPath(sub, 1, (sub2) => walkLin(body, scope, env, sub2)),
+          ),
+        );
+      }
+      withBranches(scope, branches);
+      return;
+    }
+    case "do": {
+      for (let i = 1; i < arr.length; i++) {
+        withLinPath(ctx, i, (sub) => walkLin(at(arr, i), scope, env, sub));
+      }
+      return;
+    }
+    case "let": {
+      if (arr.length !== 3) return;
+      const bindings = arr[1];
+      if (!Array.isArray(bindings)) return;
+      const introduced: UsageEntry[] = [];
+      let curEnv = env;
+      let curScope = scope;
+      for (let i = 0; i < bindings.length; i++) {
+        const b = bindings[i];
+        if (!Array.isArray(b) || b.length !== 2) continue;
+        const name = b[0];
+        if (typeof name !== "string") continue;
+        // Walk the binding RHS in the *current* scope/env (sequential let).
+        withLinPath(ctx, 1, (sub) =>
+          withLinPath(sub, i, (sub2) => walkLin(b[1] as Expr, curScope, curEnv, sub2)),
+        );
+        // Decide whether the binding itself is linear/affine. Probe the RHS
+        // type via a fresh inference run (state is shared so substitution
+        // already settled by HM is reused).
+        const rhsT = probeType(b[1] as Expr, curEnv, ctx);
+        const body = rhsT.kind === "scheme" ? rhsT.body : rhsT;
+        const lin = classifyLinearity(body);
+        if (lin !== null) {
+          const entry: UsageEntry = {
+            linearity: lin,
+            uses: 0,
+            bindPath: [...ctx.path, 1, i],
+            name,
+          };
+          curScope = {
+            entries: new Map([[name, entry]]),
+            parent: curScope,
+          };
+          introduced.push(entry);
+        }
+        // Extend env with the binding's type so subsequent RHSs and the body
+        // resolve `name`.
+        curEnv = curEnv.extend({ [name]: rhsT });
+      }
+      withLinPath(ctx, 2, (sub) => walkLin(at(arr, 2), curScope, curEnv, sub));
+      for (const e of introduced) checkBindingFinal(ctx, e);
+      return;
+    }
+    case "letrec": {
+      if (arr.length !== 3) return;
+      const bindings = arr[1];
+      if (!Array.isArray(bindings)) return;
+      // For letrec we don't attempt to model linear recursive bindings —
+      // walk all RHSs and the body in the same scope. Linear bindings declared
+      // in letrec are checked the same way.
+      const introduced: UsageEntry[] = [];
+      let curScope = scope;
+      // First, allocate fresh placeholders so all RHS probes can see the
+      // names. Then probe each RHS to detect linearity.
+      const placeholders: Record<string, MType> = {};
+      for (let i = 0; i < bindings.length; i++) {
+        const b = bindings[i];
+        if (!Array.isArray(b) || b.length !== 2) continue;
+        const name = b[0];
+        if (typeof name !== "string") continue;
+        placeholders[name] = ctx.state.freshVar();
+      }
+      const recEnv = env.extend(placeholders);
+      for (let i = 0; i < bindings.length; i++) {
+        const b = bindings[i];
+        if (!Array.isArray(b) || b.length !== 2) continue;
+        const name = b[0];
+        if (typeof name !== "string") continue;
+        const rhsT = probeType(b[1] as Expr, recEnv, ctx);
+        const body = rhsT.kind === "scheme" ? rhsT.body : rhsT;
+        const lin = classifyLinearity(body);
+        if (lin !== null) {
+          const entry: UsageEntry = {
+            linearity: lin,
+            uses: 0,
+            bindPath: [...ctx.path, 1, i],
+            name,
+          };
+          curScope = { entries: new Map([[name, entry]]), parent: curScope };
+          introduced.push(entry);
+        }
+      }
+      for (let i = 0; i < bindings.length; i++) {
+        const b = bindings[i];
+        if (!Array.isArray(b) || b.length !== 2) continue;
+        withLinPath(ctx, 1, (sub) =>
+          withLinPath(sub, i, (sub2) => walkLin(b[1] as Expr, curScope, recEnv, sub2)),
+        );
+      }
+      withLinPath(ctx, 2, (sub) => walkLin(at(arr, 2), curScope, recEnv, sub));
+      for (const e of introduced) checkBindingFinal(ctx, e);
+      return;
+    }
+    case "fn": {
+      if (arr.length !== 3) return;
+      const paramsExpr = arr[1];
+      if (!Array.isArray(paramsExpr)) return;
+      // Each linear/affine param introduces a fresh tracked entry. The fn
+      // body is its own scope: outer linear vars are still reachable (a
+      // syntactic reference inside the body counts as one use of the outer
+      // entry — captured-by-closure semantics, conservative).
+      const introduced: UsageEntry[] = [];
+      let bodyScope: UsageScope = { entries: new Map(), parent: scope };
+      for (let i = 0; i < paramsExpr.length; i++) {
+        const p = paramsExpr[i];
+        let pname: string | null = null;
+        let ptype: MType | null = null;
+        if (typeof p === "string") {
+          pname = p;
+        } else if (Array.isArray(p) && p.length >= 1 && typeof p[0] === "string") {
+          pname = p[0];
+          if (p.length >= 2 && typeof p[1] === "string") {
+            ptype = parseTypeAnnotation(p[1] as string);
+          }
+        }
+        if (pname === null) continue;
+        if (ptype === null) continue;
+        const lin = classifyLinearity(ptype);
+        if (lin !== null) {
+          const entry: UsageEntry = {
+            linearity: lin,
+            uses: 0,
+            bindPath: [...ctx.path, 1, i],
+            name: pname,
+          };
+          bodyScope.entries.set(pname, entry);
+          introduced.push(entry);
+        }
+      }
+      withLinPath(ctx, 2, (sub) => walkLin(at(arr, 2), bodyScope, env, sub));
+      for (const e of introduced) checkBindingFinal(ctx, e);
+      return;
+    }
+    case "match": {
+      if (arr.length < 3) return;
+      // Walk scrutinee — references in the scrutinee count (consume the
+      // value being matched, including any tracked outer linear).
+      withLinPath(ctx, 1, (sub) => walkLin(at(arr, 1), scope, env, sub));
+      const branches: Array<() => void> = [];
+      for (let i = 2; i < arr.length; i++) {
+        const clause = arr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) continue;
+        const pattern = clause[0];
+        const body = clause[1] as Expr;
+        const idx = i;
+        branches.push(() => {
+          // Pattern bindings: extend the scope with any field bindings whose
+          // type is linear/affine. We use the post-inference field types when
+          // available via the constructor table.
+          const introduced: UsageEntry[] = [];
+          let branchScope: UsageScope = { entries: new Map(), parent: scope };
+          if (
+            Array.isArray(pattern) &&
+            pattern.length >= 1 &&
+            typeof pattern[0] === "string" &&
+            isUpperCase(pattern[0])
+          ) {
+            const tag = pattern[0];
+            const typeName_ = ctx.ctors.get(tag);
+            const def = typeName_ === undefined ? undefined : ctx.typeDefs.get(typeName_);
+            if (def !== undefined) {
+              const fieldTs = def.variants.get(tag) ?? [];
+              for (let j = 1; j < pattern.length; j++) {
+                const bname = pattern[j];
+                if (typeof bname !== "string" || bname === "_") continue;
+                const ft = fieldTs[j - 1];
+                if (ft === undefined) continue;
+                const lin = classifyLinearity(ft);
+                if (lin !== null) {
+                  const entry: UsageEntry = {
+                    linearity: lin,
+                    uses: 0,
+                    bindPath: [...ctx.path, idx, 0, j],
+                    name: bname,
+                  };
+                  branchScope.entries.set(bname, entry);
+                  introduced.push(entry);
+                }
+              }
+            }
+          }
+          withLinPath(ctx, idx, (sub) =>
+            withLinPath(sub, 1, (sub2) => walkLin(body, branchScope, env, sub2)),
+          );
+          for (const e of introduced) checkBindingFinal(ctx, e);
+        });
+      }
+      withBranches(scope, branches);
+      return;
+    }
+    case "handle": {
+      // Body executes; clauses execute when their tag is performed (treated
+      // as alternative branches). Conservative: walk body unconditionally,
+      // walk each clause body as a branch.
+      if (arr.length < 2) return;
+      withLinPath(ctx, 1, (sub) => walkLin(at(arr, 1), scope, env, sub));
+      const branches: Array<() => void> = [];
+      for (let i = 2; i < arr.length; i++) {
+        const clause = arr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) continue;
+        const body = clause[1] as Expr;
+        const idx = i;
+        branches.push(() =>
+          withLinPath(ctx, idx, (sub) =>
+            withLinPath(sub, 1, (sub2) => walkLin(body, scope, env, sub2)),
+          ),
+        );
+      }
+      // Note: the clause body running is mutually-exclusive *relative to the
+      // body completing without the handler firing* — but for conservative
+      // enforcement we treat clauses as alternatives to one another (MAX
+      // merge), which is a sound over-approximation for the "used at most
+      // once per dynamic execution" intent.
+      if (branches.length > 0) withBranches(scope, branches);
+      return;
+    }
+    default: {
+      // Generic op: just recurse into all children.
+      for (let i = 1; i < arr.length; i++) {
+        withLinPath(ctx, i, (sub) => walkLin(at(arr, i), scope, env, sub));
+      }
+      return;
+    }
+  }
+}
+
+/**
+ * Run the linearity pass over an expression. Top-level linear bindings (from
+ * the initial env) become tracked entries on the root scope and are checked
+ * after the walk completes.
+ */
+function runLinearityPass(expr: Expr, env: TypeEnv, ctx: LinCtx): void {
+  // Build a root scope with entries for any initial-env binding whose
+  // (zonked) type is linear/affine. Any reference to those names in the
+  // top-level expression counts; at the end we run the same final check.
+  const rootEntries = new Map<string, UsageEntry>();
+  const introduced: UsageEntry[] = [];
+  for (const t of env.allBindings()) void t; // touch to keep import warnings quiet
+  // We need names — but TypeEnv only exposes types via allBindings(). Walk
+  // the chain manually using a small helper.
+  const seen = new Set<string>();
+  const walkEnv = (e: TypeEnv | null): void => {
+    if (e === null) return;
+    // Access private bindings through a duck-typed cast — keeps the public
+    // TypeEnv API minimal.
+    const inner = (e as unknown as { bindings: Map<string, MType>; parent: TypeEnv | null })
+      .bindings;
+    for (const [name, t] of inner) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const z = zonk(t, ctx.state.subst);
+      const body = z.kind === "scheme" ? z.body : z;
+      const lin = classifyLinearity(body);
+      if (lin !== null) {
+        const entry: UsageEntry = {
+          linearity: lin,
+          uses: 0,
+          bindPath: [],
+          name,
+        };
+        rootEntries.set(name, entry);
+        introduced.push(entry);
+      }
+    }
+    walkEnv((e as unknown as { parent: TypeEnv | null }).parent);
+  };
+  walkEnv(env);
+
+  const root: UsageScope = { entries: rootEntries, parent: null };
+  walkLin(expr, root, env, ctx);
+  for (const e of introduced) checkBindingFinal(ctx, e);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -2960,7 +3535,22 @@ export function typecheck(expr: Expr, env?: TypeEnv): TypecheckResult {
     capMethods: makeBuiltinCapMethods(),
     currentEffects: freshEffectsRow(state),
   };
-  const t = infer(expr, env ?? EMPTY_TYPE_ENV, ctx);
+  const useEnv = env ?? EMPTY_TYPE_ENV;
+  const t = infer(expr, useEnv, ctx);
+  // Linearity pass runs only if HM inference succeeded — running it on a
+  // partially-typed program would just produce noisy follow-on errors.
+  if (ctx.errors.length === 0) {
+    const linCtx: LinCtx = {
+      errors: ctx.errors,
+      path: [],
+      state,
+      ctors,
+      typeDefs,
+      effectSigs,
+      capMethods: ctx.capMethods,
+    };
+    runLinearityPass(expr, useEnv, linCtx);
+  }
   if (ctx.errors.length > 0) {
     return { ok: false, errors: ctx.errors };
   }
@@ -3100,6 +3690,18 @@ export function typecheckModule(module: Module): TypecheckResult {
   };
   const moduleEnv = EMPTY_TYPE_ENV;
   const t = infer(module.main, moduleEnv, ctx);
+  if (ctx.errors.length === 0) {
+    const linCtx: LinCtx = {
+      errors: ctx.errors,
+      path: [],
+      state,
+      ctors,
+      typeDefs,
+      effectSigs,
+      capMethods: ctx.capMethods,
+    };
+    runLinearityPass(module.main, moduleEnv, linCtx);
+  }
   if (ctx.errors.length > 0) {
     return { ok: false, errors: ctx.errors };
   }

@@ -1966,3 +1966,194 @@ describe("HM: error quality", () => {
     }
   });
 });
+
+// ===========================================================================
+// Phase 6: linearity enforcement
+// ===========================================================================
+
+describe("Phase 6: linearity", () => {
+  const LINEAR_INT: MType = { kind: "linear", inner: INT };
+  const AFFINE_INT: MType = { kind: "affine", inner: INT };
+  // A consumer fn that takes a linear int and returns int. Used to set up
+  // "consume the linear value" scenarios without relying on arithmetic ops
+  // (which require unwrapped numerics).
+  const CONSUME_LIN: MType = { kind: "fn", params: [LINEAR_INT], ret: INT };
+  const CONSUME_AFF: MType = { kind: "fn", params: [AFFINE_INT], ret: INT };
+  const MK_LIN: MType = { kind: "fn", params: [], ret: LINEAR_INT };
+  const MK_AFF: MType = { kind: "fn", params: [], ret: AFFINE_INT };
+
+  it("linear value used twice → DUPLICATED_LINEAR", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME_LIN });
+    // Two consume calls — each references x once → 2 uses total.
+    const result = typecheck(["+", ["call", "consume", "x"], ["call", "consume", "x"]], env);
+    expect(result).toEqual(err("DUPLICATED_LINEAR"));
+  });
+
+  it("linear value used once → ok", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME_LIN });
+    const result = typecheck(["call", "consume", "x"], env);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("linear value never used (let-bound) → DROPPED_LINEAR", () => {
+    const env = EMPTY_TYPE_ENV.extend({ mkLin: MK_LIN });
+    const result = typecheck(["let", [["x", ["call", "mkLin"]]], 0], env);
+    expect(result).toEqual(err("DROPPED_LINEAR"));
+  });
+
+  it("linear value used exactly once in let body → ok", () => {
+    const env = EMPTY_TYPE_ENV.extend({ mkLin: MK_LIN, consume: CONSUME_LIN });
+    const result = typecheck(["let", [["x", ["call", "mkLin"]]], ["call", "consume", "x"]], env);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("affine value used twice → DUPLICATED_AFFINE", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: AFFINE_INT, consume: CONSUME_AFF });
+    const result = typecheck(["+", ["call", "consume", "x"], ["call", "consume", "x"]], env);
+    expect(result).toEqual(err("DUPLICATED_AFFINE"));
+  });
+
+  it("affine value used once → ok", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: AFFINE_INT, consume: CONSUME_AFF });
+    const result = typecheck(["call", "consume", "x"], env);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("affine value never used → ok (droppable)", () => {
+    const env = EMPTY_TYPE_ENV.extend({ mkAff: MK_AFF });
+    const result = typecheck(["let", [["x", ["call", "mkAff"]]], 0], env);
+    expect(result.ok).toBe(true);
+  });
+
+  it("linear value passed to function (consumed once) → ok", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME_LIN });
+    const result = typecheck(["call", "consume", "x"], env);
+    expect(result.ok).toBe(true);
+  });
+
+  it("linear fn parameter not used in body → DROPPED_LINEAR", () => {
+    const result = typecheck(["fn", [["x", "linear int"]], 0]);
+    expect(result).toEqual(err("DROPPED_LINEAR"));
+  });
+
+  it("linear fn parameter used exactly once → ok", () => {
+    const result = typecheck(["fn", [["x", "linear int"]], "x"]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("linear fn parameter used twice in body → DUPLICATED_LINEAR", () => {
+    const env = EMPTY_TYPE_ENV.extend({ consume: CONSUME_LIN });
+    const result = typecheck(
+      ["fn", [["x", "linear int"]], ["+", ["call", "consume", "x"], ["call", "consume", "x"]]],
+      env,
+    );
+    expect(result).toEqual(err("DUPLICATED_LINEAR"));
+  });
+
+  it("affine fn parameter not used → ok", () => {
+    const result = typecheck(["fn", [["x", "affine int"]], 0]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("affine fn parameter used twice → DUPLICATED_AFFINE", () => {
+    const env = EMPTY_TYPE_ENV.extend({ consume: CONSUME_AFF });
+    const result = typecheck(
+      ["fn", [["x", "affine int"]], ["+", ["call", "consume", "x"], ["call", "consume", "x"]]],
+      env,
+    );
+    expect(result).toEqual(err("DUPLICATED_AFFINE"));
+  });
+
+  it("linear value in if — used in both branches once each → ok", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, b: BOOL, consume: CONSUME_LIN });
+    // MAX merge: each branch uses x once → final use count is 1.
+    const result = typecheck(["if", "b", ["call", "consume", "x"], ["call", "consume", "x"]], env);
+    expect(result.ok).toBe(true);
+  });
+
+  it("linear value in if — used twice in one branch → DUPLICATED_LINEAR", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, b: BOOL, consume: CONSUME_LIN });
+    const result = typecheck(
+      ["if", "b", ["+", ["call", "consume", "x"], ["call", "consume", "x"]], 0],
+      env,
+    );
+    expect(result).toEqual(err("DUPLICATED_LINEAR"));
+  });
+
+  it("linear value in match — each branch uses once → ok", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, o: INT, consume: CONSUME_LIN });
+    const result = typecheck(
+      [
+        "match",
+        ["Some", "o"],
+        [
+          ["Some", "_"],
+          ["call", "consume", "x"],
+        ],
+        [["None"], ["call", "consume", "x"]],
+      ],
+      env,
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("linear value in match — used twice in one branch → DUPLICATED_LINEAR", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, o: INT, consume: CONSUME_LIN });
+    const result = typecheck(
+      [
+        "match",
+        ["Some", "o"],
+        [
+          ["Some", "_"],
+          ["+", ["call", "consume", "x"], ["call", "consume", "x"]],
+        ],
+        [["None"], ["call", "consume", "x"]],
+      ],
+      env,
+    );
+    expect(result).toEqual(err("DUPLICATED_LINEAR"));
+  });
+
+  it("Cap<Network> is linear by default — used twice → DUPLICATED_LINEAR", () => {
+    const env = EMPTY_TYPE_ENV.extend({
+      net: { kind: "named", name: "Cap", args: [{ kind: "named", name: "Network", args: [] }] },
+      url: STRING,
+    });
+    const result = typecheck(
+      ["do", ["call.method", "net", "get", "url"], ["call.method", "net", "get", "url"]],
+      env,
+    );
+    expect(result).toEqual(err("DUPLICATED_LINEAR"));
+  });
+
+  it("non-linear code is unaffected (no linearity errors on plain int)", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: INT });
+    const result = typecheck(["+", "x", "x"], env);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("non-linear code in a fn body unaffected", () => {
+    const result = typecheck(["fn", [["x", "int"]], ["+", "x", "x"]]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("linear used three times → DUPLICATED_LINEAR with count in message", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME_LIN });
+    const result = typecheck(
+      ["+", ["call", "consume", "x"], ["+", ["call", "consume", "x"], ["call", "consume", "x"]]],
+      env,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      const e = result.errors.find((x) => x.code === "DUPLICATED_LINEAR");
+      expect(e).toBeDefined();
+      expect(e?.message).toContain("3 times");
+    }
+  });
+
+  it("linear let binding consumed by function call is OK", () => {
+    const env = EMPTY_TYPE_ENV.extend({ mkLin: MK_LIN, consume: CONSUME_LIN });
+    const result = typecheck(["let", [["x", ["call", "mkLin"]]], ["call", "consume", "x"]], env);
+    expect(result.ok).toBe(true);
+  });
+});
