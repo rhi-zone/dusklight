@@ -424,17 +424,23 @@ describe("array ops", () => {
   });
 
   it("array-len → int", () => {
-    const env = EMPTY_TYPE_ENV.extend({ a: { kind: "array", elem: INT } as MType });
+    const env = EMPTY_TYPE_ENV.extend({
+      a: { kind: "array", elem: INT } as MType,
+    });
     expect(typecheck(["array-len", "a"], env)).toEqual(ok(INT));
   });
 
   it("array-get → element type", () => {
-    const env = EMPTY_TYPE_ENV.extend({ a: { kind: "array", elem: INT } as MType });
+    const env = EMPTY_TYPE_ENV.extend({
+      a: { kind: "array", elem: INT } as MType,
+    });
     expect(typecheck(["array-get", "a", 0], env)).toEqual(ok(INT));
   });
 
   it("array-push preserves element type", () => {
-    const env = EMPTY_TYPE_ENV.extend({ a: { kind: "array", elem: INT } as MType });
+    const env = EMPTY_TYPE_ENV.extend({
+      a: { kind: "array", elem: INT } as MType,
+    });
     expect(typecheck(["array-push", "a", 5], env)).toEqual(ok({ kind: "array", elem: INT }));
   });
 
@@ -481,7 +487,9 @@ describe("array ops", () => {
   });
 
   it("count array → int", () => {
-    const env = EMPTY_TYPE_ENV.extend({ arr: { kind: "array", elem: INT } as MType });
+    const env = EMPTY_TYPE_ENV.extend({
+      arr: { kind: "array", elem: INT } as MType,
+    });
     expect(typecheck(["count", "arr"], env)).toEqual(ok(INT));
   });
 
@@ -537,14 +545,9 @@ describe("string ops", () => {
   });
 });
 
-// --- Phase 3+ ops are not-yet-implemented ---
+// --- Phase 4+ ops are not-yet-implemented ---
 
-describe("Phase 3+ ops fail loudly", () => {
-  it("match → NOT_YET_IMPLEMENTED", () => {
-    const env = EMPTY_TYPE_ENV.extend({ v: UNKNOWN });
-    expect(typecheck(["match", "v", [["Tag"], 42]], env)).toEqual(err("NOT_YET_IMPLEMENTED"));
-  });
-
+describe("Phase 4+ ops fail loudly", () => {
   it("perform → NOT_YET_IMPLEMENTED", () => {
     expect(typecheck(["perform", "Async", null])).toEqual(err("NOT_YET_IMPLEMENTED"));
   });
@@ -553,9 +556,13 @@ describe("Phase 3+ ops fail loudly", () => {
     expect(typecheck(["handle", null])).toEqual(err("NOT_YET_IMPLEMENTED"));
   });
 
-  it("variant constructor → NOT_YET_IMPLEMENTED", () => {
-    // Phase 2 will introduce variant constructor schemes from type defs.
-    expect(typecheck(["Circle", 1.5])).toEqual(err("NOT_YET_IMPLEMENTED"));
+  it("unregistered variant constructor → UNKNOWN_VARIANT", () => {
+    expect(typecheck(["Circle", 1.5])).toEqual(err("UNKNOWN_VARIANT"));
+  });
+
+  it("match on unregistered variant → UNKNOWN_VARIANT", () => {
+    const env = EMPTY_TYPE_ENV.extend({ v: UNKNOWN });
+    expect(typecheck(["match", "v", [["Tag"], 42]], env)).toEqual(err("UNKNOWN_VARIANT"));
   });
 });
 
@@ -671,7 +678,11 @@ describe("row polymorphism", () => {
   });
 
   it("polymorphic get-name applied to records with extra fields", () => {
-    const env = EMPTY_TYPE_ENV.extend({ alice: STRING, bob: STRING, addr: STRING });
+    const env = EMPTY_TYPE_ENV.extend({
+      alice: STRING,
+      bob: STRING,
+      addr: STRING,
+    });
     const result = typecheck(
       [
         "let",
@@ -829,13 +840,237 @@ describe("edge cases", () => {
 
   it("variant constructor with subexpr errors propagated", () => {
     const env = EMPTY_TYPE_ENV.extend({ s: STRING });
-    // Circle is NOT_YET_IMPLEMENTED, but the inner arithmetic error is also reported.
+    // Circle is unknown (no type def in scope). Inner arithmetic error still reported.
     const result = typecheck(["Circle", ["+", "s", 1]], env);
     expect(result.ok).toBe(false);
     if (!result.ok) {
-      // Should have both NOT_YET_IMPLEMENTED and TYPE_MISMATCH
       const codes = result.errors.map((e) => e.code);
       expect(codes).toContain("TYPE_MISMATCH");
     }
+  });
+});
+
+// --- Phase 3: discriminated unions, nominal types, match exhaustiveness ---
+
+describe("Phase 3: variant constructors", () => {
+  it("Some(int) → option<int> via lib:std", () => {
+    const result = typecheckModule({ main: ["Some", 42] });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toBe("option<int>");
+    }
+  });
+
+  it("None → option<a> (polymorphic)", () => {
+    const result = typecheckModule({ main: ["None"] });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // option with a fresh type var
+      expect(prettyType(result.type)).toMatch(/^option<[a-z]\d*>$/);
+    }
+  });
+
+  it("Ok(string) → result<string, e>", () => {
+    const result = typecheck(["Ok", "s"], EMPTY_TYPE_ENV.extend({ s: STRING }));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toMatch(/^result<string, [a-z]\d*>$/);
+    }
+  });
+
+  it("Err(int) → result<a, int>", () => {
+    const result = typecheckModule({ main: ["Err", 7] });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toMatch(/^result<[a-z]\d*, int>$/);
+    }
+  });
+
+  it("module-defined Shape constructor → Shape", () => {
+    const result = typecheckModule({
+      types: [
+        {
+          name: "Shape",
+          variants: [
+            { tag: "Circle", fields: [["radius", "float"]] },
+            {
+              tag: "Rect",
+              fields: [
+                ["width", "float"],
+                ["height", "float"],
+              ],
+            },
+          ],
+        },
+      ],
+      main: ["Circle", 1.5],
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("Shape");
+  });
+
+  it("Circle with wrong field type → TYPE_MISMATCH", () => {
+    const result = typecheckModule({
+      types: [
+        {
+          name: "Shape",
+          variants: [{ tag: "Circle", fields: [["radius", "float"]] }],
+        },
+      ],
+      main: ["Circle", "not-a-float"],
+    });
+    expect(result).toEqual(err("UNDEFINED_VAR"));
+  });
+
+  it("Circle with wrong arity → ARITY_ERROR", () => {
+    const result = typecheckModule({
+      types: [
+        {
+          name: "Shape",
+          variants: [{ tag: "Circle", fields: [["radius", "float"]] }],
+        },
+      ],
+      main: ["Circle", 1.5, 2.5],
+    });
+    expect(result).toEqual(err("ARITY_ERROR"));
+  });
+});
+
+describe("Phase 3: nominal types", () => {
+  it("named<int> and named<float> with same name unify args (mismatch on int vs float)", () => {
+    // Construct two option values with conflicting payload types and force them
+    // into the same array; HM unification fails.
+    const result = typecheckModule({
+      main: ["array", ["Some", 1], ["Some", 1.5]],
+    });
+    expect(result).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("Foo and Bar with same arity are still distinct (nominal, not structural)", () => {
+    const result = typecheckModule({
+      types: [
+        { name: "A", variants: [{ tag: "FooA" }] },
+        { name: "B", variants: [{ tag: "FooB" }] },
+      ],
+      main: ["array", ["FooA"], ["FooB"]],
+    });
+    expect(result).toEqual(err("TYPE_MISMATCH"));
+  });
+});
+
+describe("Phase 3: match", () => {
+  it("match binds variant fields with correct types", () => {
+    const result = typecheckModule({
+      types: [
+        {
+          name: "Shape",
+          variants: [
+            { tag: "Circle", fields: [["radius", "float"]] },
+            {
+              tag: "Rect",
+              fields: [
+                ["width", "float"],
+                ["height", "float"],
+              ],
+            },
+          ],
+        },
+      ],
+      main: [
+        "match",
+        ["Circle", 1.5],
+        [["Circle", "r"], "r"],
+        [
+          ["Rect", "w", "h"],
+          ["*", "w", "h"],
+        ],
+      ],
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("float");
+  });
+
+  it("match on Some/None binds inner type", () => {
+    const result = typecheckModule({
+      main: [
+        "match",
+        ["Some", 42],
+        [
+          ["Some", "x"],
+          ["+", "x", 1],
+        ],
+        [["None"], 0],
+      ],
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("int");
+  });
+
+  it("non-exhaustive match → NON_EXHAUSTIVE_MATCH", () => {
+    const result = typecheckModule({
+      types: [
+        {
+          name: "Shape",
+          variants: [{ tag: "Circle", fields: [["r", "float"]] }, { tag: "Square" }],
+        },
+      ],
+      main: ["match", ["Circle", 1.5], [["Circle", "r"], "r"]],
+    });
+    expect(result).toEqual(err("NON_EXHAUSTIVE_MATCH"));
+  });
+
+  it("exhaustive via wildcard passes", () => {
+    const result = typecheckModule({
+      types: [
+        {
+          name: "Shape",
+          variants: [{ tag: "Circle", fields: [["r", "float"]] }, { tag: "Square" }],
+        },
+      ],
+      main: ["match", ["Circle", 1.5], [["Circle", "r"], "r"], ["_", 9.99]],
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("float");
+  });
+
+  it("exhaustive via variable binding passes", () => {
+    const result = typecheckModule({
+      types: [{ name: "Shape", variants: [{ tag: "A" }, { tag: "B" }] }],
+      main: ["match", ["A"], ["x", 1]],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("match on option exhaustively → ok", () => {
+    const result = typecheckModule({
+      main: ["match", ["Some", 1], [["Some", "x"], "x"], [["None"], 0]],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("match on option non-exhaustively → NON_EXHAUSTIVE_MATCH", () => {
+    const result = typecheckModule({
+      main: ["match", ["Some", 1], [["Some", "x"], "x"]],
+    });
+    expect(result).toEqual(err("NON_EXHAUSTIVE_MATCH"));
+  });
+
+  it("match branch type mismatch → TYPE_MISMATCH", () => {
+    const result = typecheckModule({
+      main: ["match", ["Some", 1], [["Some", "x"], "x"], [["None"], "not-an-int"]],
+    });
+    expect(result).toEqual(err("UNDEFINED_VAR"));
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    expect(typecheck(["match", ["Some", 1], [["Some", "x"], "x"], [["None"], "s"]], env)).toEqual(
+      err("TYPE_MISMATCH"),
+    );
+  });
+
+  it("match on result<int, string> exhaustively", () => {
+    const result = typecheckModule({
+      main: ["match", ["Ok", 42], [["Ok", "x"], "x"], [["Err", "e"], 0]],
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("int");
   });
 });

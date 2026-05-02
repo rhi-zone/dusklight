@@ -213,7 +213,7 @@ describe("typecheckModule", () => {
     }
   });
 
-  it("type-checks module with type definitions — variant constructor is known in env", () => {
+  it("type-checks module with type definitions — variant constructor produces named type", () => {
     const module: Module = {
       types: [
         {
@@ -221,14 +221,13 @@ describe("typecheckModule", () => {
           variants: [{ tag: "Red" }, { tag: "Green" }, { tag: "Blue" }],
         },
       ],
-      // Using "Red" as a variable reference — it's in the type env as a variant type
-      main: "Red",
+      // Phase 3: constructors are not first-class values; they're invoked as ["Red"].
+      main: ["Red"],
     };
     const result = typecheckModule(module);
-    // "Red" resolves to { kind: 'variant', tag: 'Red', fields: [] } from type defs
     expect(result).toEqual({
       ok: true,
-      type: { kind: "variant", tag: "Red", fields: [] },
+      type: { kind: "named", name: "Color", args: [] },
     });
   });
 
@@ -243,36 +242,37 @@ describe("typecheckModule", () => {
       main: ["Circle", 1.5],
     };
     const result = typecheckModule(module);
-    // Phase 1: variant constructor calls are NOT_YET_IMPLEMENTED.
-    // Phase 2 will introduce variant-constructor schemes from type defs.
-    expect(result).toMatchObject({
-      ok: false,
-      errors: expect.arrayContaining([expect.objectContaining({ code: "NOT_YET_IMPLEMENTED" })]),
+    expect(result).toEqual({
+      ok: true,
+      type: { kind: "named", name: "Shape", args: [] },
     });
   });
 
-  it("type-checks module with lib:std import — None in scope", () => {
+  it("type-checks module that uses None constructor (option<T> from lib:std)", () => {
     const module: Module = {
-      imports: [{ from: "lib:std", import: ["None"] }],
-      // Referencing "None" as a variable — should resolve to its variant type
-      main: "None",
+      // lib:std types (option, result) are pre-registered; explicit import is
+      // not required for type checking constructors.
+      main: ["None"],
+    };
+    const result = typecheckModule(module);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.type.kind).toBe("named");
+      if (result.type.kind === "named") {
+        expect(result.type.name).toBe("option");
+        expect(result.type.args.length).toBe(1);
+      }
+    }
+  });
+
+  it("type-checks module that uses Some constructor", () => {
+    const module: Module = {
+      main: ["Some", 42],
     };
     const result = typecheckModule(module);
     expect(result).toEqual({
       ok: true,
-      type: { kind: "variant", tag: "None", fields: [] },
-    });
-  });
-
-  it("type-checks module with lib:std Some import", () => {
-    const module: Module = {
-      imports: [{ from: "lib:std", import: ["Some"] }],
-      main: "Some",
-    };
-    const result = typecheckModule(module);
-    expect(result).toEqual({
-      ok: true,
-      type: { kind: "variant", tag: "Some", fields: [{ kind: "unknown" }] },
+      type: { kind: "named", name: "option", args: [{ kind: "int" }] },
     });
   });
 

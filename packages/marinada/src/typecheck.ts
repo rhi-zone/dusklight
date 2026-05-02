@@ -20,8 +20,24 @@ export type MType =
   | { kind: "linear"; inner: MType }
   | { kind: "affine"; inner: MType }
   | { kind: "variant"; tag: string; fields: MType[] }
-  | { kind: "named"; name: string }
+  | { kind: "named"; name: string; args: MType[] }
   | { kind: "scheme"; quantified: number[]; body: MType };
+
+// ---------------------------------------------------------------------------
+// Type definitions (DUs)
+// ---------------------------------------------------------------------------
+
+/**
+ * A type definition: a parameterised DU. Variants map tag → list of field types,
+ * where any free type vars in those types come from `params` (one fresh var
+ * is allocated per param at instantiation time).
+ */
+export type TypeDefInfo = {
+  /** Type parameter names, in order. */
+  params: string[];
+  /** Variants. Each variant has a list of field types referencing params. */
+  variants: Map<string, MType[]>;
+};
 
 // Singletons for atomic types
 const UNKNOWN: MType = { kind: "unknown" };
@@ -92,8 +108,13 @@ function zonk(t: MType, subst: Substitution): MType {
     case "float":
     case "string":
     case "bytes":
-    case "named":
       return r;
+    case "named":
+      return {
+        kind: "named",
+        name: r.name,
+        args: r.args.map((a) => zonk(a, subst)),
+      };
     case "array":
       return { kind: "array", elem: zonk(r.elem, subst) };
     case "row": {
@@ -122,7 +143,11 @@ function zonk(t: MType, subst: Substitution): MType {
         fields: r.fields.map((f) => zonk(f, subst)),
       };
     case "scheme":
-      return { kind: "scheme", quantified: r.quantified, body: zonk(r.body, subst) };
+      return {
+        kind: "scheme",
+        quantified: r.quantified,
+        body: zonk(r.body, subst),
+      };
   }
 }
 
@@ -143,7 +168,9 @@ function ftv(t: MType, subst: Substitution, out: Set<number>): void {
     case "float":
     case "string":
     case "bytes":
+      return;
     case "named":
+      for (const a of r.args) ftv(a, subst, out);
       return;
     case "array":
       ftv(r.elem, subst, out);
@@ -252,6 +279,10 @@ type Ctx = {
   errors: TypecheckError[];
   path: number[];
   state: State;
+  /** Type definition table — keyed by type name (e.g. "option", "Shape"). */
+  typeDefs: Map<string, TypeDefInfo>;
+  /** Constructor index: tag → declaring type name. */
+  ctors: Map<string, string>;
 };
 
 function addError(
@@ -264,7 +295,13 @@ function addError(
 }
 
 function withPath<T>(ctx: Ctx, idx: number, fn: (sub: Ctx) => T): T {
-  const sub: Ctx = { errors: ctx.errors, path: [...ctx.path, idx], state: ctx.state };
+  const sub: Ctx = {
+    errors: ctx.errors,
+    path: [...ctx.path, idx],
+    state: ctx.state,
+    typeDefs: ctx.typeDefs,
+    ctors: ctx.ctors,
+  };
   return fn(sub);
 }
 
@@ -313,7 +350,7 @@ function typeName(t: MType): string {
     case "variant":
       return t.fields.length === 0 ? t.tag : t.tag + "(" + t.fields.map(typeName).join(", ") + ")";
     case "named":
-      return t.name;
+      return t.args.length === 0 ? t.name : t.name + "<" + t.args.map(typeName).join(", ") + ">";
     case "scheme":
       return (
         "forall " + t.quantified.map((id) => "t" + String(id)).join(",") + ". " + typeName(t.body)
@@ -375,7 +412,7 @@ export function prettyType(t: MType): string {
       case "variant":
         return t.fields.length === 0 ? t.tag : t.tag + "(" + t.fields.map(go).join(", ") + ")";
       case "named":
-        return t.name;
+        return t.args.length === 0 ? t.name : t.name + "<" + t.args.map(go).join(", ") + ">";
       case "scheme":
         return "forall " + t.quantified.map((id) => name(id)).join(",") + ". " + go(t.body);
     }
@@ -399,7 +436,9 @@ function occurs(id: number, t: MType, subst: Substitution): boolean {
     case "float":
     case "string":
     case "bytes":
+      return false;
     case "named":
+      for (const a of r.args) if (occurs(id, a, subst)) return true;
       return false;
     case "array":
       return occurs(id, r.elem, subst);
@@ -467,9 +506,23 @@ function unify(a: MType, b: MType, subst: Substitution, state: State): UnifyResu
     case "string":
     case "bytes":
       return { ok: true };
-    case "named":
-      if (ra.name === (rb as { kind: "named"; name: string }).name) return { ok: true };
-      return { ok: false, reason: ra.name + " vs " + (rb as { name: string }).name };
+    case "named": {
+      const nb = rb as { kind: "named"; name: string; args: MType[] };
+      if (ra.name !== nb.name) {
+        return { ok: false, reason: ra.name + " vs " + nb.name };
+      }
+      if (ra.args.length !== nb.args.length) {
+        return {
+          ok: false,
+          reason: ra.name + " arity " + String(ra.args.length) + " vs " + String(nb.args.length),
+        };
+      }
+      for (let i = 0; i < ra.args.length; i++) {
+        const r = unify(ra.args[i] as MType, nb.args[i] as MType, subst, state);
+        if (!r.ok) return r;
+      }
+      return { ok: true };
+    }
     case "array":
       return unify(ra.elem, (rb as { kind: "array"; elem: MType }).elem, subst, state);
     case "fn": {
@@ -662,8 +715,13 @@ function substVars(t: MType, mapping: Map<number, MType>): MType {
     case "float":
     case "string":
     case "bytes":
-    case "named":
       return t;
+    case "named":
+      return {
+        kind: "named",
+        name: t.name,
+        args: t.args.map((a) => substVars(a, mapping)),
+      };
     case "array":
       return { kind: "array", elem: substVars(t.elem, mapping) };
     case "row": {
@@ -697,7 +755,11 @@ function substVars(t: MType, mapping: Map<number, MType>): MType {
     case "scheme": {
       const innerMap = new Map(mapping);
       for (const q of t.quantified) innerMap.delete(q);
-      return { kind: "scheme", quantified: t.quantified, body: substVars(t.body, innerMap) };
+      return {
+        kind: "scheme",
+        quantified: t.quantified,
+        body: substVars(t.body, innerMap),
+      };
     }
   }
 }
@@ -706,7 +768,7 @@ function substVars(t: MType, mapping: Map<number, MType>): MType {
 // Type annotation parsing
 // ---------------------------------------------------------------------------
 
-function parseTypeAnnotation(s: string): MType {
+function parseTypeAnnotation(s: string, params?: Set<string>): MType {
   switch (s) {
     case "null":
       return NULL_T;
@@ -724,6 +786,11 @@ function parseTypeAnnotation(s: string): MType {
     case "unknown":
       return UNKNOWN;
     default:
+      // If the annotation matches a known type parameter, return a placeholder
+      // "named" sentinel that `instantiateWith` will replace with a fresh var.
+      if (params !== undefined && params.has(s)) {
+        return { kind: "named", name: s, args: [] };
+      }
       return UNKNOWN;
   }
 }
@@ -809,13 +876,295 @@ function infer(expr: Expr, env: TypeEnv, ctx: Ctx): MType {
   const op = opExpr;
 
   if (isUpperCase(op)) {
-    for (let i = 1; i < arr.length; i++) {
-      withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
-    }
-    return notYetImplemented(ctx, op);
+    return inferVariantConstructor(op, arr, env, ctx);
   }
 
   return inferOp(op, arr, env, ctx);
+}
+
+/**
+ * Look up a variant constructor and produce a `named<...>` type with fresh
+ * type-parameter vars. Each field of the constructor is unified against the
+ * inferred argument type.
+ */
+function inferVariantConstructor(tag: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
+  const typeName_ = ctx.ctors.get(tag);
+  if (typeName_ === undefined) {
+    // Still typecheck arguments so inner errors surface, then error.
+    for (let i = 1; i < arr.length; i++) {
+      withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
+    }
+    addError(ctx, "UNKNOWN_VARIANT", "unknown variant constructor: " + tag);
+    return ctx.state.freshVar();
+  }
+  const def = ctx.typeDefs.get(typeName_) as TypeDefInfo;
+  // Allocate fresh vars for each type parameter.
+  const paramVars = new Map<string, MType>();
+  const paramArgs: MType[] = [];
+  for (const p of def.params) {
+    const v = ctx.state.freshVar();
+    paramVars.set(p, v);
+    paramArgs.push(v);
+  }
+  const fieldTypes = (def.variants.get(tag) as MType[]).map((ft) => instantiateWith(ft, paramVars));
+  const argCount = arr.length - 1;
+  if (argCount !== fieldTypes.length) {
+    for (let i = 1; i < arr.length; i++) {
+      withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
+    }
+    addError(
+      ctx,
+      "ARITY_ERROR",
+      tag + " expects " + String(fieldTypes.length) + " field(s), got " + String(argCount),
+    );
+    return { kind: "named", name: typeName_, args: paramArgs };
+  }
+  for (let i = 1; i < arr.length; i++) {
+    const argT = withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
+    const expected = fieldTypes[i - 1] as MType;
+    withPath(ctx, i, (sub) => unifyOrError(sub, expected, argT, tag + ": field " + String(i - 1)));
+  }
+  return { kind: "named", name: typeName_, args: paramArgs };
+}
+
+/**
+ * Replace type-parameter placeholders (special "var" types stored in a map by
+ * name) inside a stored field-type. Field types in TypeDefInfo use special
+ * placeholder vars: {kind:"var", id: -K} where K is the index in def.params.
+ * We accept the placeholder convention: we use a Map<string, MType> for fresh
+ * args and identify placeholders by a separate marker. To keep things simple
+ * we instead store field types using {kind:"var", id} where ids are "param
+ * tokens" tracked separately. For Phase 3 we use a simpler approach: field
+ * types are stored with literal `{kind:"named", name:"<paramName>", args:[]}`
+ * acting as a sentinel — and `instantiateWith` rewrites those.
+ */
+function instantiateWith(t: MType, paramVars: Map<string, MType>): MType {
+  switch (t.kind) {
+    case "named": {
+      const replacement = paramVars.get(t.name);
+      if (replacement !== undefined && t.args.length === 0) return replacement;
+      return {
+        kind: "named",
+        name: t.name,
+        args: t.args.map((a) => instantiateWith(a, paramVars)),
+      };
+    }
+    case "var":
+    case "unknown":
+    case "null":
+    case "bool":
+    case "int":
+    case "float":
+    case "string":
+    case "bytes":
+      return t;
+    case "array":
+      return { kind: "array", elem: instantiateWith(t.elem, paramVars) };
+    case "row": {
+      const fields = new Map<string, MType>();
+      for (const [k, v] of t.fields) fields.set(k, instantiateWith(v, paramVars));
+      return { kind: "row", fields, rest: t.rest };
+    }
+    case "record":
+      return { kind: "record", row: instantiateWith(t.row, paramVars) };
+    case "fn":
+      return {
+        kind: "fn",
+        params: t.params.map((p) => instantiateWith(p, paramVars)),
+        ret: instantiateWith(t.ret, paramVars),
+      };
+    case "linear":
+      return { kind: "linear", inner: instantiateWith(t.inner, paramVars) };
+    case "affine":
+      return { kind: "affine", inner: instantiateWith(t.inner, paramVars) };
+    case "variant":
+      return {
+        kind: "variant",
+        tag: t.tag,
+        fields: t.fields.map((f) => instantiateWith(f, paramVars)),
+      };
+    case "scheme":
+      return {
+        kind: "scheme",
+        quantified: t.quantified,
+        body: instantiateWith(t.body, paramVars),
+      };
+  }
+}
+
+/**
+ * Infer the type of a `match` expression.
+ *
+ * Form: ["match", scrut, [pattern1, body1], [pattern2, body2], ...]
+ *
+ * Patterns:
+ *   - ["Tag", binding1, ...] — variant pattern; bindings receive field types
+ *   - "_"                    — wildcard
+ *   - lowercase name         — variable binding (binds scrutinee)
+ *   - literal int/string/bool — literal pattern (matches when equal)
+ *
+ * Exhaustiveness: if scrutinee resolves to a `named<...>` type, all variants of
+ * that type must be covered (or a wildcard / variable pattern present).
+ */
+function inferMatch(arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
+  const state = ctx.state;
+  if (arr.length < 3) {
+    addError(ctx, "ARITY_ERROR", "match requires a scrutinee and at least 1 clause");
+    return state.freshVar();
+  }
+  const scrutT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+  const result = state.freshVar();
+
+  /** Tags covered by an exact tag pattern. */
+  const coveredTags = new Set<string>();
+  /** Whether some clause covers everything (wildcard / var pattern). */
+  let sawCatchAll = false;
+
+  for (let i = 2; i < arr.length; i++) {
+    const clause = arr[i];
+    if (!Array.isArray(clause) || clause.length !== 2) {
+      withPath(ctx, i, (sub) =>
+        addError(sub, "TYPE_MISMATCH", "match clause must be [pattern, body]"),
+      );
+      continue;
+    }
+    const pattern = clause[0];
+    const body = clause[1] as Expr;
+
+    let clauseEnv = env;
+
+    if (pattern === "_") {
+      sawCatchAll = true;
+    } else if (typeof pattern === "string") {
+      // Variable binding (any lowercase string acts as a fresh binding to scrutinee type)
+      // or a string literal pattern (matches when scrutinee is a string).
+      // Spec doesn't have a separate var-binding form; we treat lowercase identifiers as bindings.
+      if (pattern.length > 0 && !isUpperCase(pattern)) {
+        clauseEnv = env.extend({ [pattern]: scrutT });
+        sawCatchAll = true;
+      } else {
+        // Treat as string literal — unify scrutinee with string.
+        withPath(ctx, i, (sub) =>
+          withPath(sub, 0, (sub2) =>
+            unifyOrError(sub2, STRING, scrutT, "match: string literal pattern"),
+          ),
+        );
+      }
+    } else if (typeof pattern === "number") {
+      const litT = Number.isInteger(pattern) ? INT : FLOAT;
+      withPath(ctx, i, (sub) =>
+        withPath(sub, 0, (sub2) => unifyOrError(sub2, litT, scrutT, "match: numeric literal")),
+      );
+    } else if (typeof pattern === "boolean") {
+      withPath(ctx, i, (sub) =>
+        withPath(sub, 0, (sub2) => unifyOrError(sub2, BOOL, scrutT, "match: bool literal")),
+      );
+    } else if (Array.isArray(pattern) && pattern.length >= 1 && typeof pattern[0] === "string") {
+      const tag = pattern[0];
+      const bindings = pattern.slice(1);
+      const typeName_ = ctx.ctors.get(tag);
+      if (typeName_ === undefined) {
+        withPath(ctx, i, (sub) =>
+          withPath(sub, 0, (sub2) =>
+            addError(sub2, "UNKNOWN_VARIANT", "unknown variant constructor in pattern: " + tag),
+          ),
+        );
+        continue;
+      }
+      const def = ctx.typeDefs.get(typeName_) as TypeDefInfo;
+      const paramVars = new Map<string, MType>();
+      const paramArgs: MType[] = [];
+      for (const p of def.params) {
+        const v = state.freshVar();
+        paramVars.set(p, v);
+        paramArgs.push(v);
+      }
+      const fieldTypes = (def.variants.get(tag) as MType[]).map((ft) =>
+        instantiateWith(ft, paramVars),
+      );
+      // Unify scrutinee with named<...> for this DU.
+      const expectedScrut: MType = {
+        kind: "named",
+        name: typeName_,
+        args: paramArgs,
+      };
+      withPath(ctx, i, (sub) =>
+        withPath(sub, 0, (sub2) =>
+          unifyOrError(sub2, expectedScrut, scrutT, "match: scrutinee type"),
+        ),
+      );
+      // Check binding count. Wildcards "_" allowed.
+      if (bindings.length !== fieldTypes.length) {
+        withPath(ctx, i, (sub) =>
+          withPath(sub, 0, (sub2) =>
+            addError(
+              sub2,
+              "ARITY_ERROR",
+              tag +
+                " pattern: expected " +
+                String(fieldTypes.length) +
+                " bindings, got " +
+                String(bindings.length),
+            ),
+          ),
+        );
+      }
+      const newBindings: Record<string, MType> = {};
+      const n = Math.min(bindings.length, fieldTypes.length);
+      for (let j = 0; j < n; j++) {
+        const b = bindings[j];
+        if (typeof b !== "string") {
+          withPath(ctx, i, (sub) =>
+            withPath(sub, 0, (sub2) =>
+              addError(sub2, "TYPE_MISMATCH", "match binding name must be a string"),
+            ),
+          );
+          continue;
+        }
+        if (b !== "_") newBindings[b] = fieldTypes[j] as MType;
+      }
+      clauseEnv = env.extend(newBindings);
+      coveredTags.add(tag);
+    } else {
+      withPath(ctx, i, (sub) =>
+        withPath(sub, 0, (sub2) => addError(sub2, "TYPE_MISMATCH", "match: invalid pattern")),
+      );
+      continue;
+    }
+
+    const bodyT = withPath(ctx, i, (sub) =>
+      withPath(sub, 1, (sub2) => infer(body, clauseEnv, sub2)),
+    );
+    withPath(ctx, i, (sub) =>
+      withPath(sub, 1, (sub2) => unifyOrError(sub2, result, bodyT, "match: branch result type")),
+    );
+  }
+
+  // Exhaustiveness check.
+  if (!sawCatchAll) {
+    const resolved = find(scrutT, ctx.state.subst);
+    if (resolved.kind === "named") {
+      const def = ctx.typeDefs.get(resolved.name);
+      if (def !== undefined) {
+        const missing: string[] = [];
+        for (const tag of def.variants.keys()) {
+          if (!coveredTags.has(tag)) missing.push(tag);
+        }
+        if (missing.length > 0) {
+          addError(
+            ctx,
+            "NON_EXHAUSTIVE_MATCH",
+            "non-exhaustive match on " +
+              resolved.name +
+              ": missing variant(s) " +
+              missing.join(", "),
+          );
+        }
+      }
+    }
+  }
+
+  return result;
 }
 
 function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
@@ -1393,7 +1742,11 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
         );
         // The input record must have all values of type inV.
         const tailIn = state.freshId();
-        const allVRowIn: MType = { kind: "row", fields: new Map(), rest: tailIn };
+        const allVRowIn: MType = {
+          kind: "row",
+          fields: new Map(),
+          rest: tailIn,
+        };
         // We need all fields to be inV. Walk current row, unify each field with inV.
         const flat = resolveRow(resolved.row, subst);
         if (flat.kind === "row") {
@@ -1407,7 +1760,10 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
         }
         // Fallback: treat as open record with all-inV values.
         void allVRowIn;
-        return { kind: "record", row: { kind: "row", fields: new Map(), rest: state.freshId() } };
+        return {
+          kind: "record",
+          row: { kind: "row", fields: new Map(), rest: state.freshId() },
+        };
       }
       const inElem = state.freshVar();
       const outElem = state.freshVar();
@@ -1532,7 +1888,11 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       withPath(ctx, 1, (sub) =>
         unifyOrError(
           sub,
-          { kind: "fn", params: [inElem], ret: { kind: "array", elem: outElem } },
+          {
+            kind: "fn",
+            params: [inElem],
+            ret: { kind: "array", elem: outElem },
+          },
           fT,
           "array-flat-map: expected fn(_) -> array",
         ),
@@ -1964,7 +2324,10 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
         }
       }
       // Fallback: fully open record.
-      return { kind: "record", row: { kind: "row", fields: new Map(), rest: state.freshId() } };
+      return {
+        kind: "record",
+        row: { kind: "row", fields: new Map(), rest: state.freshId() },
+      };
     }
 
     case "keys":
@@ -2015,8 +2378,12 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       return BOOL;
     }
 
-    // -------------------- Phase 3+ ops --------------------
-    case "match":
+    // -------------------- match (DU pattern matching) --------------------
+    case "match": {
+      return inferMatch(arr, env, ctx);
+    }
+
+    // -------------------- Phase 3+ ops (still TBD) --------------------
     case "perform":
     case "handle":
     case "call.method":
@@ -2040,7 +2407,10 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
 
 export function typecheck(expr: Expr, env?: TypeEnv): TypecheckResult {
   const state = new State();
-  const ctx: Ctx = { errors: [], path: [], state };
+  // Standalone typecheck still gets the std DUs (option/result) so that bare
+  // expressions referencing Some/None/Ok/Err typecheck without a module wrapper.
+  const { typeDefs, ctors } = makeStdTypeDefs();
+  const ctx: Ctx = { errors: [], path: [], state, typeDefs, ctors };
   const t = infer(expr, env ?? EMPTY_TYPE_ENV, ctx);
   if (ctx.errors.length > 0) {
     return { ok: false, errors: ctx.errors };
@@ -2052,49 +2422,64 @@ export function typecheck(expr: Expr, env?: TypeEnv): TypecheckResult {
 // Module typechecking
 // ---------------------------------------------------------------------------
 
-const STD_TYPE_BINDINGS: Record<string, MType> = {
-  None: { kind: "variant", tag: "None", fields: [] },
-  Some: { kind: "variant", tag: "Some", fields: [UNKNOWN] },
-  Ok: { kind: "variant", tag: "Ok", fields: [UNKNOWN] },
-  Err: { kind: "variant", tag: "Err", fields: [UNKNOWN] },
-};
+/**
+ * Build the standard `option<T>` and `result<T, E>` type definitions.
+ * Field types use `{kind:"named", name:"<paramName>", args:[]}` as
+ * placeholders for the type parameters; these are replaced by fresh vars
+ * at each constructor / pattern instantiation site.
+ */
+function makeStdTypeDefs(): {
+  typeDefs: Map<string, TypeDefInfo>;
+  ctors: Map<string, string>;
+} {
+  const typeDefs = new Map<string, TypeDefInfo>();
+  const ctors = new Map<string, string>();
 
-function typeDefsToBindings(defs: TypeDef[]): Record<string, MType> {
-  const bindings: Record<string, MType> = {};
-  for (const def of defs) {
-    for (const variant of def.variants) {
-      const fields: MType[] = (variant.fields ?? []).map(([, typeName_]) =>
-        parseTypeAnnotation(typeName_),
-      );
-      bindings[variant.tag] = { kind: "variant", tag: variant.tag, fields };
-    }
-  }
-  return bindings;
+  const optionVariants = new Map<string, MType[]>();
+  optionVariants.set("None", []);
+  optionVariants.set("Some", [{ kind: "named", name: "T", args: [] }]);
+  typeDefs.set("option", { params: ["T"], variants: optionVariants });
+  ctors.set("None", "option");
+  ctors.set("Some", "option");
+
+  const resultVariants = new Map<string, MType[]>();
+  resultVariants.set("Ok", [{ kind: "named", name: "T", args: [] }]);
+  resultVariants.set("Err", [{ kind: "named", name: "E", args: [] }]);
+  typeDefs.set("result", { params: ["T", "E"], variants: resultVariants });
+  ctors.set("Ok", "result");
+  ctors.set("Err", "result");
+
+  return { typeDefs, ctors };
 }
 
-function resolveImportBindings(imports: Module["imports"]): Record<string, MType> {
-  const bindings: Record<string, MType> = {};
-  for (const imp of imports ?? []) {
-    if (imp.from === "lib:std") {
-      for (const name of imp.import) {
-        const t = STD_TYPE_BINDINGS[name];
-        bindings[name] = t ?? UNKNOWN;
-      }
-    } else {
-      for (const name of imp.import) {
-        bindings[name] = UNKNOWN;
-      }
+/**
+ * Convert module type definitions into TypeDefInfo entries. For Phase 3 we do
+ * not yet have a syntax for declaring type parameters — DUs declared in a
+ * module are monomorphic. Field type strings resolve via parseTypeAnnotation;
+ * unknown names become `unknown`.
+ */
+function registerModuleTypeDefs(
+  defs: TypeDef[],
+  typeDefs: Map<string, TypeDefInfo>,
+  ctors: Map<string, string>,
+): void {
+  for (const def of defs) {
+    const variants = new Map<string, MType[]>();
+    for (const variant of def.variants) {
+      const fields: MType[] = (variant.fields ?? []).map(([, t]) => parseTypeAnnotation(t));
+      variants.set(variant.tag, fields);
+      ctors.set(variant.tag, def.name);
     }
+    typeDefs.set(def.name, { params: [], variants });
   }
-  return bindings;
 }
 
 export function typecheckModule(module: Module): TypecheckResult {
   const state = new State();
-  const ctx: Ctx = { errors: [], path: [], state };
-  const importBindings = resolveImportBindings(module.imports);
-  const typeDefBindings = typeDefsToBindings(module.types ?? []);
-  const moduleEnv = EMPTY_TYPE_ENV.extend({ ...importBindings, ...typeDefBindings });
+  const { typeDefs, ctors } = makeStdTypeDefs();
+  registerModuleTypeDefs(module.types ?? [], typeDefs, ctors);
+  const ctx: Ctx = { errors: [], path: [], state, typeDefs, ctors };
+  const moduleEnv = EMPTY_TYPE_ENV;
   const t = infer(module.main, moduleEnv, ctx);
   if (ctx.errors.length > 0) {
     return { ok: false, errors: ctx.errors };

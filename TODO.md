@@ -1,5 +1,21 @@
 # TODO
 
+### [ ] Marinada: implement linearity enforcement
+
+Type representation (`{ kind: "linear"; inner: MType }`) exists in typecheck.ts:17 but has zero enforcement. No use-once validation, no affine/linear distinction, no destructor mechanism. Spec: docs/marinada.md lines 507-551.
+
+### [x] Marinada: add perform/handle cases to typechecker
+
+`perform` and `handle` are fully implemented in the evaluator (evaluate.ts:1357-1432) including multi-shot continuations, but typecheck.ts has no cases for them — they fall through to UNKNOWN_OP. Any effectful code fails typecheck unless wrapped in `["untyped", ...]`.
+
+### [ ] Marinada: implement local: and https: module import schemes
+
+module.ts:25 skips all non-lib:std imports. `local:` and `https:` schemes parse without error but names stay unbound. typecheck.ts:1373 types all such imports as UNKNOWN. Only `lib:std` is functional.
+
+### [x] Marinada: add `cond` to evaluator
+
+`cond` is handled in typecheck.ts but has no case in evaluate.ts — inverse of the perform/handle gap.
+
 ### [ ] Marinada: consider `$` prefix for pattern bindings (from defocus)
 
 Lowercase-string-as-binding in `match` has a latent bug: `["match", x, ["friendly", body]]` binds `"friendly"` as a variable instead of matching the literal string. This hasn't surfaced in Dusklight because variant tags are uppercase, but defocus hit it immediately when matching plain string payloads.
