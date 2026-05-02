@@ -280,6 +280,17 @@ export type TypecheckResult = { ok: true; type: MType } | { ok: false; errors: T
 /** Signature for an algebraic effect: payload type and resume type. */
 export type EffectSig = { payload: MType; resume: MType };
 
+/**
+ * Method signature on a capability. Built-in caps (Network, Storage) have
+ * fully-typed methods; plugin-defined caps are unknown to the type checker
+ * and fall back to `unknown` returns. Each method declares an effect tag
+ * that gets added to the ambient effect row at the call site.
+ *
+ * NOTE: capabilities are `linear` by default per spec — but linearity is
+ * not enforced here. Phase 6 will add the linearity checker.
+ */
+export type CapMethodSig = { params: MType[]; ret: MType; effect: string };
+
 type Ctx = {
   errors: TypecheckError[];
   path: number[];
@@ -290,6 +301,12 @@ type Ctx = {
   ctors: Map<string, string>;
   /** Effect signatures table — keyed by effect tag (e.g. "Error", "Async"). */
   effectSigs: Map<string, EffectSig>;
+  /**
+   * Capability method tables — keyed by cap-interface name (e.g. "Network",
+   * "Storage"). Each entry maps method name → signature. Plugin-defined caps
+   * not present here fall back to `unknown` returns.
+   */
+  capMethods: Map<string, Map<string, CapMethodSig>>;
   /**
    * The effect row that the currently-being-inferred expression contributes
    * to. `perform` and `call` extend this; `fn` saves/restores it; `handle`
@@ -319,6 +336,7 @@ function withPath<T>(ctx: Ctx, idx: number, fn: (sub: Ctx) => T): T {
     typeDefs: ctx.typeDefs,
     ctors: ctx.ctors,
     effectSigs: ctx.effectSigs,
+    capMethods: ctx.capMethods,
     currentEffects: ctx.currentEffects,
   };
   return fn(sub);
@@ -1509,6 +1527,143 @@ function inferHandle(arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
   }
 
   return resultT;
+}
+
+/**
+ * Infer the type of `["call.method", cap, "methodName", ...args]`.
+ *
+ * Resolves the cap's type. If it's `Cap<T>` where `T` is a known cap-interface
+ * name (e.g. `Network`, `Storage`), look up the method, unify args against the
+ * registered param types, add the method's effect to the ambient effect row,
+ * and return the method's return type. If `T` is `unknown` or a plugin-defined
+ * cap not in the table, fall back to `unknown` (gradual escape). If the cap
+ * isn't a `Cap<_>` type at all, raise TYPE_MISMATCH.
+ *
+ * Capabilities are `linear` by default per spec — Phase 6 will enforce that.
+ */
+function inferCallMethod(arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
+  const state = ctx.state;
+  if (arr.length < 3) {
+    addError(ctx, "ARITY_ERROR", "call.method requires a cap and a method name");
+    // Still infer subexpressions so inner errors surface.
+    for (let i = 1; i < arr.length; i++) {
+      withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
+    }
+    return state.freshVar();
+  }
+  const capT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+  const methodExpr = arr[2];
+  if (typeof methodExpr !== "string") {
+    withPath(ctx, 2, (sub) =>
+      addError(sub, "TYPE_MISMATCH", "call.method: method name must be a string literal"),
+    );
+    for (let i = 3; i < arr.length; i++) {
+      withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
+    }
+    return state.freshVar();
+  }
+  const argTypes: MType[] = [];
+  for (let i = 3; i < arr.length; i++) {
+    argTypes.push(withPath(ctx, i, (sub) => infer(at(arr, i), env, sub)));
+  }
+
+  const resolved = find(capT, state.subst);
+
+  // Gradual escape: unknown cap → unknown result.
+  if (resolved.kind === "unknown") return UNKNOWN;
+
+  // Must be a Cap<_> named type. If it's a free var, leave it polymorphic
+  // by returning unknown — without further info we can't pick a method.
+  if (resolved.kind === "var") {
+    // Constrain shape: must be a Cap<_> when ever resolved. We don't bind
+    // it to anything concrete here — but we can't pick a method without
+    // knowing the interface. Treat as unknown gradual escape.
+    return UNKNOWN;
+  }
+
+  if (resolved.kind !== "named" || resolved.name !== "Cap" || resolved.args.length !== 1) {
+    withPath(ctx, 1, (sub) =>
+      addError(sub, "TYPE_MISMATCH", "call.method: expected Cap<_>, got " + typeName(resolved), {
+        expected: "Cap<_>",
+        got: typeName(resolved),
+      }),
+    );
+    return state.freshVar();
+  }
+
+  const inner = find(resolved.args[0] as MType, state.subst);
+
+  // Plugin-defined or unknown cap interface → gradual escape.
+  if (inner.kind === "unknown" || inner.kind === "var") return UNKNOWN;
+
+  if (inner.kind !== "named") {
+    withPath(ctx, 1, (sub) =>
+      addError(
+        sub,
+        "TYPE_MISMATCH",
+        "call.method: Cap argument must be a named cap interface, got " + typeName(inner),
+      ),
+    );
+    return state.freshVar();
+  }
+
+  const methods = ctx.capMethods.get(inner.name);
+  if (methods === undefined) {
+    // Unknown cap interface: plugin-defined, not registered. Gradual escape.
+    return UNKNOWN;
+  }
+  const sig = methods.get(methodExpr);
+  if (sig === undefined) {
+    withPath(ctx, 2, (sub) =>
+      addError(
+        sub,
+        "TYPE_MISMATCH",
+        "call.method: " + inner.name + " has no method '" + methodExpr + "'",
+        { expected: [...methods.keys()].join(" | "), got: methodExpr },
+      ),
+    );
+    return state.freshVar();
+  }
+
+  if (argTypes.length !== sig.params.length) {
+    addError(
+      ctx,
+      "ARITY_ERROR",
+      "call.method: " +
+        inner.name +
+        "." +
+        methodExpr +
+        " expects " +
+        String(sig.params.length) +
+        " args, got " +
+        String(argTypes.length),
+    );
+    return sig.ret;
+  }
+
+  for (let i = 0; i < argTypes.length; i++) {
+    withPath(ctx, i + 3, (sub) =>
+      unifyOrError(
+        sub,
+        sig.params[i] as MType,
+        argTypes[i] as MType,
+        "call.method: " + inner.name + "." + methodExpr + " arg " + String(i),
+      ),
+    );
+  }
+
+  // Add the method's effect tag to the ambient effect row.
+  const sigForEffect = lookupOrAllocEffectSig(sig.effect, ctx);
+  const r = addEffectToRow(ctx.currentEffects, sig.effect, sigForEffect.payload, ctx.state);
+  if (!r.ok) {
+    addError(
+      ctx,
+      "TYPE_MISMATCH",
+      "call.method: cannot extend effect row with " + sig.effect + ": " + r.reason,
+    );
+  }
+
+  return sig.ret;
 }
 
 function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
@@ -2765,8 +2920,12 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       return inferHandle(arr, env, ctx);
     }
 
-    // -------------------- Phase 3+ ops (still TBD) --------------------
-    case "call.method":
+    // -------------------- capabilities --------------------
+    case "call.method": {
+      return inferCallMethod(arr, env, ctx);
+    }
+
+    // -------------------- Phase 6+ ops (still TBD) --------------------
     case "?": {
       for (let i = 1; i < arr.length; i++) {
         withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
@@ -2798,6 +2957,7 @@ export function typecheck(expr: Expr, env?: TypeEnv): TypecheckResult {
     typeDefs,
     ctors,
     effectSigs,
+    capMethods: makeBuiltinCapMethods(),
     currentEffects: freshEffectsRow(state),
   };
   const t = infer(expr, env ?? EMPTY_TYPE_ENV, ctx);
@@ -2851,6 +3011,48 @@ function makeStdTypeDefs(): {
  * Unknown tags are not pre-registered: `perform` allocates fresh signatures
  * on first use, so users (and plugins) can introduce new effects ad hoc.
  */
+/**
+ * Build the built-in capability method tables.
+ *
+ * Per spec (marinada.md §Capabilities):
+ *   Cap<Network> — get, post, put, delete, ws
+ *   Cap<Storage> — get, set, delete, list
+ *
+ * Plugin-defined caps (e.g. `LocalAgent`) are not registered here — they
+ * fall back to `unknown` returns at the call site. Each method declares an
+ * effect tag that gets added to the ambient row at the call site.
+ */
+function makeBuiltinCapMethods(): Map<string, Map<string, CapMethodSig>> {
+  const stringArr: MType = { kind: "array", elem: STRING };
+
+  const network = new Map<string, CapMethodSig>();
+  // get(url) -> string  ! Network
+  network.set("get", { params: [STRING], ret: STRING, effect: "Network" });
+  // post(url, body) -> string  ! Network
+  network.set("post", { params: [STRING, STRING], ret: STRING, effect: "Network" });
+  // put(url, body) -> string  ! Network
+  network.set("put", { params: [STRING, STRING], ret: STRING, effect: "Network" });
+  // delete(url) -> string  ! Network
+  network.set("delete", { params: [STRING], ret: STRING, effect: "Network" });
+  // ws(url) -> unknown  ! Network — websocket handle is opaque
+  network.set("ws", { params: [STRING], ret: UNKNOWN, effect: "Network" });
+
+  const storage = new Map<string, CapMethodSig>();
+  // get(key) -> string | null — modelled as `unknown` until DU narrowing
+  storage.set("get", { params: [STRING], ret: UNKNOWN, effect: "Storage" });
+  // set(key, value) -> null
+  storage.set("set", { params: [STRING, STRING], ret: NULL_T, effect: "Storage" });
+  // delete(key) -> null
+  storage.set("delete", { params: [STRING], ret: NULL_T, effect: "Storage" });
+  // list(prefix) -> array<string>
+  storage.set("list", { params: [STRING], ret: stringArr, effect: "Storage" });
+
+  const out = new Map<string, Map<string, CapMethodSig>>();
+  out.set("Network", network);
+  out.set("Storage", storage);
+  return out;
+}
+
 function makeStdEffectSigs(state: State): Map<string, EffectSig> {
   const sigs = new Map<string, EffectSig>();
   for (const tag of ["Error", "Async", "Yield"]) {
@@ -2893,6 +3095,7 @@ export function typecheckModule(module: Module): TypecheckResult {
     typeDefs,
     ctors,
     effectSigs,
+    capMethods: makeBuiltinCapMethods(),
     currentEffects: freshEffectsRow(state),
   };
   const moduleEnv = EMPTY_TYPE_ENV;

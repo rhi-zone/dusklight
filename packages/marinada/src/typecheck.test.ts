@@ -1199,3 +1199,104 @@ describe("Phase 3: match", () => {
     if (result.ok) expect(prettyType(result.type)).toBe("int");
   });
 });
+
+// --- Phase 5: capabilities and call.method ---
+
+const CAP_NETWORK: MType = {
+  kind: "named",
+  name: "Cap",
+  args: [{ kind: "named", name: "Network", args: [] }],
+};
+const CAP_STORAGE: MType = {
+  kind: "named",
+  name: "Cap",
+  args: [{ kind: "named", name: "Storage", args: [] }],
+};
+const CAP_PLUGIN: MType = {
+  kind: "named",
+  name: "Cap",
+  args: [{ kind: "named", name: "LocalAgent", args: [] }],
+};
+
+describe("Phase 5: capabilities and call.method", () => {
+  it("call.method on Cap<Network> 'get' → string", () => {
+    const env = EMPTY_TYPE_ENV.extend({ net: CAP_NETWORK, url: STRING });
+    const result = typecheck(["call.method", "net", "get", "url"], env);
+    expect(result).toEqual(ok(STRING));
+  });
+
+  it("call.method on Cap<Storage> 'list' → array<string>", () => {
+    const env = EMPTY_TYPE_ENV.extend({ st: CAP_STORAGE, prefix: STRING });
+    const result = typecheck(["call.method", "st", "list", "prefix"], env);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("array<string>");
+  });
+
+  it("call.method on Cap<Storage> 'set' → null", () => {
+    const env = EMPTY_TYPE_ENV.extend({ st: CAP_STORAGE, k: STRING, v: STRING });
+    const result = typecheck(["call.method", "st", "set", "k", "v"], env);
+    expect(result).toEqual(ok(NULL_T));
+  });
+
+  it("call.method on plugin-defined cap → unknown (gradual escape)", () => {
+    const env = EMPTY_TYPE_ENV.extend({ cap: CAP_PLUGIN, x: STRING });
+    const result = typecheck(["call.method", "cap", "anything", "x"], env);
+    expect(result).toEqual(ok(UNKNOWN));
+  });
+
+  it("call.method on unknown cap → unknown", () => {
+    const env = EMPTY_TYPE_ENV.extend({ cap: UNKNOWN, x: STRING });
+    const result = typecheck(["call.method", "cap", "get", "x"], env);
+    expect(result).toEqual(ok(UNKNOWN));
+  });
+
+  it("call.method with unknown method name on known cap → TYPE_MISMATCH", () => {
+    const env = EMPTY_TYPE_ENV.extend({ net: CAP_NETWORK, x: STRING });
+    expect(typecheck(["call.method", "net", "fly", "x"], env)).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("call.method with arity mismatch → ARITY_ERROR", () => {
+    const env = EMPTY_TYPE_ENV.extend({ net: CAP_NETWORK, url: STRING });
+    // post takes (url, body) — calling with one arg is an arity error
+    expect(typecheck(["call.method", "net", "post", "url"], env)).toEqual(err("ARITY_ERROR"));
+  });
+
+  it("call.method with wrong arg type → TYPE_MISMATCH", () => {
+    const env = EMPTY_TYPE_ENV.extend({ net: CAP_NETWORK });
+    expect(typecheck(["call.method", "net", "get", 42], env)).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("call.method on non-Cap value → TYPE_MISMATCH", () => {
+    const env = EMPTY_TYPE_ENV.extend({ x: INT, url: STRING });
+    expect(typecheck(["call.method", "x", "get", "url"], env)).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("call.method adds the method's effect to the ambient row", () => {
+    const env = EMPTY_TYPE_ENV.extend({ net: CAP_NETWORK, url: STRING });
+    const result = typecheck(["fn", [], ["call.method", "net", "get", "url"]], env);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const s = prettyType(result.type);
+      expect(s).toContain("Network");
+      expect(s).toContain("!");
+    }
+  });
+
+  it("prettyType for Cap<Network> renders as Cap<Network>", () => {
+    const env = EMPTY_TYPE_ENV.extend({ net: CAP_NETWORK });
+    const result = typecheck("net", env);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("Cap<Network>");
+  });
+
+  it("call.method requires method name as a string literal", () => {
+    const env = EMPTY_TYPE_ENV.extend({ net: CAP_NETWORK, m: STRING });
+    // Method name is a variable reference, not a literal — should error.
+    expect(typecheck(["call.method", "net", ["+", 1, 2], "x"], env)).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("call.method missing method name → ARITY_ERROR", () => {
+    const env = EMPTY_TYPE_ENV.extend({ net: CAP_NETWORK });
+    expect(typecheck(["call.method", "net"], env)).toEqual(err("ARITY_ERROR"));
+  });
+});
