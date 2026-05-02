@@ -319,13 +319,10 @@ describe("fn", () => {
 
   it("fn with annotated params infers return type", () => {
     const result = typecheck(["fn", [["x", "int"]], ["+", "x", 1]]);
-    expect(result).toEqual(
-      ok({
-        kind: "fn",
-        params: [INT],
-        ret: INT,
-      }),
-    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toBe("fn(int) -> int");
+    }
   });
 
   it("fn body type errors are reported", () => {
@@ -548,14 +545,6 @@ describe("string ops", () => {
 // --- Phase 4+ ops are not-yet-implemented ---
 
 describe("Phase 4+ ops fail loudly", () => {
-  it("perform → NOT_YET_IMPLEMENTED", () => {
-    expect(typecheck(["perform", "Async", null])).toEqual(err("NOT_YET_IMPLEMENTED"));
-  });
-
-  it("handle → NOT_YET_IMPLEMENTED", () => {
-    expect(typecheck(["handle", null])).toEqual(err("NOT_YET_IMPLEMENTED"));
-  });
-
   it("unregistered variant constructor → UNKNOWN_VARIANT", () => {
     expect(typecheck(["Circle", 1.5])).toEqual(err("UNKNOWN_VARIANT"));
   });
@@ -563,6 +552,142 @@ describe("Phase 4+ ops fail loudly", () => {
   it("match on unregistered variant → UNKNOWN_VARIANT", () => {
     const env = EMPTY_TYPE_ENV.extend({ v: UNKNOWN });
     expect(typecheck(["match", "v", [["Tag"], 42]], env)).toEqual(err("UNKNOWN_VARIANT"));
+  });
+});
+
+// --- Phase 4: algebraic effects ---
+
+describe("Phase 4: perform", () => {
+  it("perform Async with int payload → resume type", () => {
+    // Inside a handle so the effect is in scope; the resume type is fresh,
+    // but the perform expression's type must equal the resume var.
+    const result = typecheck([
+      "handle",
+      ["perform", "Async", 42],
+      [
+        ["Async", "v", "k"],
+        ["call", "k", "v"],
+      ],
+    ]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("perform unifies payload type — wrong type errors", () => {
+    // Two performs of the same tag with conflicting payload types.
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    const result = typecheck(
+      [
+        "handle",
+        ["do", ["perform", "MyEff", 1], ["perform", "MyEff", "s"]],
+        [
+          ["MyEff", "v", "k"],
+          ["call", "k", "v"],
+        ],
+      ],
+      env,
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it("unhandled perform propagates effect through fn into outer type", () => {
+    // A function that performs an effect carries it in its effect row.
+    const result = typecheck(["fn", ["x"], ["perform", "Log", "x"]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const s = prettyType(result.type);
+      expect(s).toContain("Log");
+      expect(s).toContain("!");
+    }
+  });
+
+  it("pure function has no `!` annotation", () => {
+    const result = typecheck(["fn", ["x"], ["+", "x", 1]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).not.toContain("!");
+    }
+  });
+});
+
+describe("Phase 4: handle", () => {
+  it("handle return clause yields its body's type", () => {
+    // Body returns int; return clause maps x → str-len(to-string(x)) (string).
+    // Without the return clause the result would be int; with it, it's int.
+    const result = typecheck([
+      "handle",
+      ["+", 1, 2],
+      [
+        ["return", "x"],
+        ["*", "x", 2],
+      ],
+    ]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("handle without return clause returns body type", () => {
+    const result = typecheck(["handle", ["+", 1, 2]]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("handle binds k as fn(R) -> resultType", () => {
+    // Inside the clause, k must be callable with the resume type.
+    // Ask returns whatever k is called with; the handler resumes k with 10.
+    const result = typecheck([
+      "handle",
+      ["+", ["perform", "Ask", null], 5],
+      [
+        ["Ask", "_", "k"],
+        ["call", "k", 10],
+      ],
+      [["return", "x"], "x"],
+    ]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("handled effect is removed from the result expression's effect row", () => {
+    // A pure outer scope: the handle expression as a whole has no effect rows.
+    // We test this by putting the handle inside a fn — the fn must remain pure.
+    const result = typecheck([
+      "fn",
+      ["x"],
+      [
+        "handle",
+        ["perform", "Local", "x"],
+        [
+          ["Local", "v", "k"],
+          ["call", "k", "v"],
+        ],
+        [["return", "y"], "y"],
+      ],
+    ]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // The fn is pure — Local is fully handled internally.
+      expect(prettyType(result.type)).not.toContain("Local");
+    }
+  });
+
+  it("unhandled effect propagates through function boundary", () => {
+    // A fn calls perform on Custom; without a handle, the fn's effect row
+    // contains Custom.
+    const result = typecheck(["fn", [], ["perform", "Custom", null]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toContain("Custom");
+    }
+  });
+
+  it("call propagates callee's effects to caller", () => {
+    // f performs Foo; calling f from g should give g the Foo effect.
+    const result = typecheck([
+      "let",
+      [["f", ["fn", [], ["perform", "Foo", null]]]],
+      ["fn", [], ["call", "f"]],
+    ]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toContain("Foo");
+    }
   });
 });
 

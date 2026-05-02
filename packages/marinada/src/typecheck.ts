@@ -16,7 +16,7 @@ export type MType =
   | { kind: "array"; elem: MType }
   | { kind: "row"; fields: Map<string, MType>; rest: number | "empty" }
   | { kind: "record"; row: MType }
-  | { kind: "fn"; params: MType[]; ret: MType }
+  | { kind: "fn"; params: MType[]; ret: MType; effects?: MType }
   | { kind: "linear"; inner: MType }
   | { kind: "affine"; inner: MType }
   | { kind: "variant"; tag: string; fields: MType[] }
@@ -131,6 +131,7 @@ function zonk(t: MType, subst: Substitution): MType {
         kind: "fn",
         params: r.params.map((p) => zonk(p, subst)),
         ret: zonk(r.ret, subst),
+        effects: zonk(fnEffects(r), subst),
       };
     case "linear":
       return { kind: "linear", inner: zonk(r.inner, subst) };
@@ -197,6 +198,7 @@ function ftv(t: MType, subst: Substitution, out: Set<number>): void {
     case "fn":
       for (const p of r.params) ftv(p, subst, out);
       ftv(r.ret, subst, out);
+      ftv(fnEffects(r), subst, out);
       return;
     case "linear":
     case "affine":
@@ -275,6 +277,9 @@ export type TypecheckError = {
 
 export type TypecheckResult = { ok: true; type: MType } | { ok: false; errors: TypecheckError[] };
 
+/** Signature for an algebraic effect: payload type and resume type. */
+export type EffectSig = { payload: MType; resume: MType };
+
 type Ctx = {
   errors: TypecheckError[];
   path: number[];
@@ -283,6 +288,18 @@ type Ctx = {
   typeDefs: Map<string, TypeDefInfo>;
   /** Constructor index: tag → declaring type name. */
   ctors: Map<string, string>;
+  /** Effect signatures table — keyed by effect tag (e.g. "Error", "Async"). */
+  effectSigs: Map<string, EffectSig>;
+  /**
+   * The effect row that the currently-being-inferred expression contributes
+   * to. `perform` and `call` extend this; `fn` saves/restores it; `handle`
+   * pops handled tags off the inner row and propagates the rest.
+   *
+   * Always a row type. When a sub-expression's effects need to be added, we
+   * unify the sub-effect row with this row (sharing tails so accumulation
+   * works).
+   */
+  currentEffects: MType;
 };
 
 function addError(
@@ -301,6 +318,8 @@ function withPath<T>(ctx: Ctx, idx: number, fn: (sub: Ctx) => T): T {
     state: ctx.state,
     typeDefs: ctx.typeDefs,
     ctors: ctx.ctors,
+    effectSigs: ctx.effectSigs,
+    currentEffects: ctx.currentEffects,
   };
   return fn(sub);
 }
@@ -341,8 +360,13 @@ function typeName(t: MType): string {
     }
     case "record":
       return "record" + typeName(t.row);
-    case "fn":
-      return "fn(" + t.params.map(typeName).join(", ") + ") -> " + typeName(t.ret);
+    case "fn": {
+      const base = "fn(" + t.params.map(typeName).join(", ") + ") -> " + typeName(t.ret);
+      const eff = t.effects;
+      if (eff === undefined) return base;
+      if (eff.kind === "row" && eff.fields.size === 0 && eff.rest === "empty") return base;
+      return base + " ! " + typeName(eff);
+    }
     case "linear":
       return "linear " + typeName(t.inner);
     case "affine":
@@ -403,8 +427,20 @@ export function prettyType(t: MType): string {
       }
       case "record":
         return go(t.row);
-      case "fn":
-        return "fn(" + t.params.map(go).join(", ") + ") -> " + go(t.ret);
+      case "fn": {
+        const base = "fn(" + t.params.map(go).join(", ") + ") -> " + go(t.ret);
+        const eff = t.effects;
+        if (eff === undefined) return base;
+        // Suppress the effect annotation when the row is statically pure
+        // (closed and empty). Open rows with no fields are also suppressed —
+        // they add no information beyond what a pure function already implies
+        // for HM unification at use-sites.
+        if (eff.kind === "row" && eff.fields.size === 0) {
+          if (eff.rest === "empty") return base;
+          return base;
+        }
+        return base + " ! " + go(eff);
+      }
       case "linear":
         return "linear " + go(t.inner);
       case "affine":
@@ -457,7 +493,8 @@ function occurs(id: number, t: MType, subst: Substitution): boolean {
       return occurs(id, r.row, subst);
     case "fn":
       for (const p of r.params) if (occurs(id, p, subst)) return true;
-      return occurs(id, r.ret, subst);
+      if (occurs(id, r.ret, subst)) return true;
+      return occurs(id, fnEffects(r), subst);
     case "linear":
     case "affine":
       return occurs(id, r.inner, subst);
@@ -526,7 +563,7 @@ function unify(a: MType, b: MType, subst: Substitution, state: State): UnifyResu
     case "array":
       return unify(ra.elem, (rb as { kind: "array"; elem: MType }).elem, subst, state);
     case "fn": {
-      const fb = rb as { kind: "fn"; params: MType[]; ret: MType };
+      const fb = rb as Extract<MType, { kind: "fn" }>;
       if (ra.params.length !== fb.params.length) {
         return {
           ok: false,
@@ -537,7 +574,9 @@ function unify(a: MType, b: MType, subst: Substitution, state: State): UnifyResu
         const r = unify(ra.params[i] as MType, fb.params[i] as MType, subst, state);
         if (!r.ok) return r;
       }
-      return unify(ra.ret, fb.ret, subst, state);
+      const retR = unify(ra.ret, fb.ret, subst, state);
+      if (!retR.ok) return retR;
+      return unify(fnEffects(ra), fnEffects(fb), subst, state);
     }
     case "record":
       return unify(ra.row, (rb as { kind: "record"; row: MType }).row, subst, state);
@@ -736,12 +775,15 @@ function substVars(t: MType, mapping: Map<number, MType>): MType {
     }
     case "record":
       return { kind: "record", row: substVars(t.row, mapping) };
-    case "fn":
-      return {
+    case "fn": {
+      const out: Extract<MType, { kind: "fn" }> = {
         kind: "fn",
         params: t.params.map((p) => substVars(p, mapping)),
         ret: substVars(t.ret, mapping),
       };
+      if (t.effects !== undefined) out.effects = substVars(t.effects, mapping);
+      return out;
+    }
     case "linear":
       return { kind: "linear", inner: substVars(t.inner, mapping) };
     case "affine":
@@ -843,6 +885,93 @@ function openRecordWithField(state: State, key: string, fieldT: MType): MType {
 /** Build a record type out of explicit row pieces. */
 function recordOf(fields: Map<string, MType>, rest: number | "empty"): MType {
   return { kind: "record", row: { kind: "row", fields, rest } };
+}
+
+/** Empty closed row — used as the default "pure" effect row. */
+function emptyEffects(): MType {
+  return { kind: "row", fields: new Map(), rest: "empty" };
+}
+
+/** Open empty row — used as a fresh effect row var to be filled in. */
+function freshEffectsRow(state: State): MType {
+  return { kind: "row", fields: new Map(), rest: state.freshId() };
+}
+
+/**
+ * Get the effects row of a fn type, defaulting to the empty closed row when
+ * absent. Function literals constructed without an `effects` field are treated
+ * as pure.
+ */
+function fnEffects(fn: Extract<MType, { kind: "fn" }>): MType {
+  return fn.effects ?? emptyEffects();
+}
+
+/**
+ * Add a single effect tag to a row, returning the extended row. The original
+ * row's tail var is bound (via substitution) to a new row that contains the
+ * tag plus a fresh tail. This is the same trick used to extend record rows.
+ */
+function addEffectToRow(row: MType, tag: string, payload: MType, state: State): UnifyResult {
+  const target: MType = {
+    kind: "row",
+    fields: new Map([[tag, payload]]),
+    rest: state.freshId(),
+  };
+  return unify(row, target, state.subst, state);
+}
+
+/**
+ * Absorb a (callee's) effect row into the current ambient effect row. This
+ * gives subset semantics — any tags concrete in `source` are added to
+ * `ctx.currentEffects`, and if the source has an open tail, that tail is
+ * unified with current's tail so further extensions to either propagate.
+ *
+ * If the source is closed-empty, this is a no-op (pure functions add no
+ * effects).
+ */
+function absorbEffects(source: MType, ctx: Ctx): void {
+  const flat = resolveRow(source, ctx.state.subst);
+  if (flat.kind !== "row") {
+    // Source isn't a row — leave the substitution to handle it. Treat as no-op.
+    return;
+  }
+  for (const [tag, payload] of flat.fields) {
+    const r = addEffectToRow(ctx.currentEffects, tag, payload, ctx.state);
+    if (!r.ok) {
+      addError(ctx, "TYPE_MISMATCH", "effect row mismatch for " + tag + ": " + r.reason);
+    }
+  }
+  // If source has an open tail, bind it to a row that mirrors the current
+  // effect row's *fields* with current's tail. This makes the source row
+  // structurally equal to current (so subsequent unifications can't fail
+  // due to the source row missing fields that current has gained).
+  if (typeof flat.rest === "number") {
+    const tailVar: MType = { kind: "var", id: flat.rest };
+    const curFlat = resolveRow(ctx.currentEffects, ctx.state.subst);
+    if (curFlat.kind === "row") {
+      // Only mirror fields that aren't already in source — otherwise we'd
+      // duplicate. The source already absorbed its own fields above; the
+      // tail should carry the *rest* (current's exclusive fields) plus
+      // current's tail.
+      const mirror = new Map<string, MType>();
+      for (const [k, v] of curFlat.fields) {
+        if (!flat.fields.has(k)) mirror.set(k, v);
+      }
+      const tailRest: number | "empty" = typeof curFlat.rest === "number" ? curFlat.rest : "empty";
+      const tr = find(tailVar, ctx.state.subst);
+      if (tr.kind === "var") {
+        // Avoid binding to ourselves (would create a cycle).
+        if (typeof tailRest !== "number" || tr.id !== tailRest) {
+          const mirrorRow: MType = {
+            kind: "row",
+            fields: mirror,
+            rest: tailRest,
+          };
+          ctx.state.subst.set(tr.id, mirrorRow);
+        }
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -967,12 +1096,15 @@ function instantiateWith(t: MType, paramVars: Map<string, MType>): MType {
     }
     case "record":
       return { kind: "record", row: instantiateWith(t.row, paramVars) };
-    case "fn":
-      return {
+    case "fn": {
+      const out: Extract<MType, { kind: "fn" }> = {
         kind: "fn",
         params: t.params.map((p) => instantiateWith(p, paramVars)),
         ret: instantiateWith(t.ret, paramVars),
       };
+      if (t.effects !== undefined) out.effects = instantiateWith(t.effects, paramVars);
+      return out;
+    }
     case "linear":
       return { kind: "linear", inner: instantiateWith(t.inner, paramVars) };
     case "affine":
@@ -1167,6 +1299,218 @@ function inferMatch(arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
   return result;
 }
 
+/**
+ * Look up the effect signature for `tag`, allocating a fresh one (with fresh
+ * payload/resume vars) on the first reference. This matches the spec's
+ * "user-defined effects" model — unknown tags become typed on demand rather
+ * than erroring.
+ */
+function lookupOrAllocEffectSig(tag: string, ctx: Ctx): EffectSig {
+  let sig = ctx.effectSigs.get(tag);
+  if (sig === undefined) {
+    sig = { payload: ctx.state.freshVar(), resume: ctx.state.freshVar() };
+    ctx.effectSigs.set(tag, sig);
+  }
+  return sig;
+}
+
+/**
+ * Infer the type of `["perform", "Tag", payload]`.
+ *
+ * Adds the tag to the ambient effect row (`ctx.currentEffects`), unifies
+ * the payload expression's type against the tag's registered payload type,
+ * and returns the tag's resume type (the value the continuation receives).
+ */
+function inferPerform(arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
+  if (!expectArity(ctx, "perform", arr, 2)) return ctx.state.freshVar();
+  const tagExpr = arr[1];
+  if (typeof tagExpr !== "string") {
+    withPath(ctx, 1, (sub) =>
+      addError(sub, "TYPE_MISMATCH", "perform: effect tag must be a string"),
+    );
+    return ctx.state.freshVar();
+  }
+  const sig = lookupOrAllocEffectSig(tagExpr, ctx);
+  const payloadT = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
+  withPath(ctx, 2, (sub) =>
+    unifyOrError(sub, sig.payload, payloadT, "perform: payload type for " + tagExpr),
+  );
+  const r = addEffectToRow(ctx.currentEffects, tagExpr, sig.payload, ctx.state);
+  if (!r.ok) {
+    addError(ctx, "TYPE_MISMATCH", "perform: cannot extend effect row with " + tagExpr);
+  }
+  return sig.resume;
+}
+
+/**
+ * Infer the type of `["handle", body, clause1, ...]`.
+ *
+ * Each clause is `[pattern, clauseBody]`. Patterns are either an effect-tag
+ * pattern `["Tag", payloadBinding, kBinding]` or a return pattern
+ * `["return", xBinding]`.
+ *
+ * Strategy:
+ *  - Allocate an inner effect row (the body is inferred against this).
+ *  - Allocate a result type for the whole `handle` expression.
+ *  - For each effect clause, register the tag as "handled": its bindings see
+ *    `payloadBinding: P` and `kBinding: fn(R) -> resultType` where R is the
+ *    resume type. The clause body must unify to `resultType`. The handled
+ *    tag is recorded so we can subtract it from the inner row.
+ *  - The return clause binds `x: bodyT` and its body must unify to
+ *    `resultType`. Without a return clause, `resultType` defaults to the
+ *    body's type.
+ *  - Finally, unify the inner effect row with `{handled tags... | outerEffects}`,
+ *    so the outer row is extended with any unhandled tags from the body.
+ */
+function inferHandle(arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
+  const state = ctx.state;
+  if (arr.length < 2) {
+    addError(ctx, "ARITY_ERROR", "handle requires at least a body");
+    return state.freshVar();
+  }
+
+  // Save outer effects, install fresh inner effects row that the body
+  // accumulates into.
+  const outerEffects = ctx.currentEffects;
+  const innerEffects = freshEffectsRow(state);
+
+  ctx.currentEffects = innerEffects;
+  const bodyT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+  ctx.currentEffects = outerEffects;
+
+  // The overall result type. Either inferred from a return clause or, when no
+  // return clause is present, defaults to the body type.
+  const resultT = state.freshVar();
+  let sawReturnClause = false;
+
+  // Tags handled by clauses, with their payload types. These are subtracted
+  // from the inner row when computing what propagates to the outer row.
+  const handledTags = new Map<string, MType>();
+
+  for (let i = 2; i < arr.length; i++) {
+    const clause = arr[i];
+    if (!Array.isArray(clause) || clause.length !== 2) {
+      withPath(ctx, i, (sub) =>
+        addError(sub, "TYPE_MISMATCH", "handle clause must be [pattern, body]"),
+      );
+      continue;
+    }
+    const pattern = clause[0];
+    const clauseBody = clause[1] as Expr;
+    if (!Array.isArray(pattern) || pattern.length < 1 || typeof pattern[0] !== "string") {
+      withPath(ctx, i, (sub) =>
+        withPath(sub, 0, (sub2) =>
+          addError(sub2, "TYPE_MISMATCH", "handle clause pattern must be [tag, ...bindings]"),
+        ),
+      );
+      continue;
+    }
+    const tag = pattern[0];
+
+    if (tag === "return") {
+      if (pattern.length !== 2 || typeof pattern[1] !== "string") {
+        withPath(ctx, i, (sub) =>
+          withPath(sub, 0, (sub2) =>
+            addError(sub2, "TYPE_MISMATCH", 'handle return clause must be ["return", binding]'),
+          ),
+        );
+        continue;
+      }
+      sawReturnClause = true;
+      const xBinding = pattern[1];
+      const clauseEnv = env.extend({ [xBinding]: bodyT });
+      const cT = withPath(ctx, i, (sub) =>
+        withPath(sub, 1, (sub2) => infer(clauseBody, clauseEnv, sub2)),
+      );
+      withPath(ctx, i, (sub) =>
+        withPath(sub, 1, (sub2) =>
+          unifyOrError(sub2, resultT, cT, "handle: return clause body type"),
+        ),
+      );
+      continue;
+    }
+
+    // Effect clause: [Tag, payloadBinding, kBinding]
+    if (pattern.length !== 3 || typeof pattern[1] !== "string" || typeof pattern[2] !== "string") {
+      withPath(ctx, i, (sub) =>
+        withPath(sub, 0, (sub2) =>
+          addError(
+            sub2,
+            "TYPE_MISMATCH",
+            "handle effect clause must be [Tag, payloadBinding, kBinding]",
+          ),
+        ),
+      );
+      continue;
+    }
+    const payloadBinding = pattern[1];
+    const kBinding = pattern[2];
+    const sig = lookupOrAllocEffectSig(tag, ctx);
+    handledTags.set(tag, sig.payload);
+    // k receives a value of type `resume` and produces the handle's result.
+    // Its effect row is the outer effect row — calling k re-enters the
+    // handled context, but any further effects propagate to the outer scope.
+    const kType: MType = {
+      kind: "fn",
+      params: [sig.resume],
+      ret: resultT,
+      effects: outerEffects,
+    };
+    const clauseEnv = env.extend({
+      [payloadBinding]: sig.payload,
+      [kBinding]: kType,
+    });
+    const cT = withPath(ctx, i, (sub) =>
+      withPath(sub, 1, (sub2) => infer(clauseBody, clauseEnv, sub2)),
+    );
+    withPath(ctx, i, (sub) =>
+      withPath(sub, 1, (sub2) =>
+        unifyOrError(sub2, resultT, cT, "handle: " + tag + " clause body type"),
+      ),
+    );
+  }
+
+  // If there's no return clause, the body's type IS the result type.
+  if (!sawReturnClause) {
+    unifyOrError(ctx, resultT, bodyT, "handle: body type (no return clause)");
+  }
+
+  // Unify the inner effect row with `{handledTags... | outerEffects}` — the
+  // body's effects are the handled set plus whatever propagates outward.
+  // We accomplish this by building a row of handled fields with a tail that
+  // is the outer row (resolved to its tail var if possible).
+  const outerFlat = resolveRow(outerEffects, state.subst);
+  let tailRest: number | "empty";
+  if (outerFlat.kind === "row" && typeof outerFlat.rest === "number") {
+    tailRest = outerFlat.rest;
+  } else if (outerFlat.kind === "row" && outerFlat.rest === "empty") {
+    tailRest = "empty";
+  } else {
+    tailRest = state.freshId();
+  }
+  // Add any concrete fields the outer row already has so they're visible in
+  // the inner row's view (they could also be absorbed via the tail var, but
+  // mirroring them keeps the rows symmetric).
+  const innerExpected: Map<string, MType> = new Map();
+  if (outerFlat.kind === "row") {
+    for (const [k, v] of outerFlat.fields) innerExpected.set(k, v);
+  }
+  for (const [tag, payload] of handledTags) {
+    if (!innerExpected.has(tag)) innerExpected.set(tag, payload);
+  }
+  const innerExpectedRow: MType = {
+    kind: "row",
+    fields: innerExpected,
+    rest: tailRest,
+  };
+  const u = unify(innerEffects, innerExpectedRow, state.subst, state);
+  if (!u.ok) {
+    addError(ctx, "TYPE_MISMATCH", "handle: effect row mismatch: " + u.reason);
+  }
+
+  return resultT;
+}
+
 function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
   const state = ctx.state;
   const subst = state.subst;
@@ -1324,12 +1668,22 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
     // -------------------- functions --------------------
     case "fn": {
       if (!expectArity(ctx, "fn", arr, 2)) {
-        return { kind: "fn", params: [], ret: state.freshVar() };
+        return {
+          kind: "fn",
+          params: [],
+          ret: state.freshVar(),
+          effects: emptyEffects(),
+        };
       }
       const paramsExpr = arr[1];
       if (!Array.isArray(paramsExpr)) {
         withPath(ctx, 1, (sub) => addError(sub, "TYPE_MISMATCH", "fn params must be an array"));
-        return { kind: "fn", params: [], ret: state.freshVar() };
+        return {
+          kind: "fn",
+          params: [],
+          ret: state.freshVar(),
+          effects: emptyEffects(),
+        };
       }
       const paramTypes: MType[] = [];
       const paramBindings: Record<string, MType> = {};
@@ -1357,8 +1711,18 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
         }
       }
       const fnEnv = env.extend(paramBindings);
+      // Save outer effects, install a fresh row that the body accumulates into.
+      const outerEffects = ctx.currentEffects;
+      const bodyEffects = freshEffectsRow(state);
+      ctx.currentEffects = bodyEffects;
       const retT = withPath(ctx, 2, (sub) => infer(at(arr, 2), fnEnv, sub));
-      return { kind: "fn", params: paramTypes, ret: retT };
+      ctx.currentEffects = outerEffects;
+      return {
+        kind: "fn",
+        params: paramTypes,
+        ret: retT,
+        effects: bodyEffects,
+      };
     }
 
     case "call": {
@@ -1372,7 +1736,15 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
         argTypes.push(withPath(ctx, i, (sub) => infer(at(arr, i), env, sub)));
       }
       const ret = state.freshVar();
-      const expected: MType = { kind: "fn", params: argTypes, ret };
+      // Allocate a fresh effect row for the callee — we'll absorb its
+      // contents into currentEffects after unification (subset semantics).
+      const calleeEffects: MType = freshEffectsRow(state);
+      const expected: MType = {
+        kind: "fn",
+        params: argTypes,
+        ret,
+        effects: calleeEffects,
+      };
       const resolved = find(fnT, subst);
       if (resolved.kind === "fn" && resolved.params.length !== argTypes.length) {
         addError(
@@ -1385,6 +1757,8 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       withPath(ctx, 1, (sub) =>
         unifyOrError(sub, expected, fnT, "call: function/argument mismatch"),
       );
+      // Absorb the callee's concrete effect tags into the caller's row.
+      absorbEffects(calleeEffects, ctx);
       return ret;
     }
 
@@ -2383,9 +2757,15 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       return inferMatch(arr, env, ctx);
     }
 
+    // -------------------- algebraic effects --------------------
+    case "perform": {
+      return inferPerform(arr, env, ctx);
+    }
+    case "handle": {
+      return inferHandle(arr, env, ctx);
+    }
+
     // -------------------- Phase 3+ ops (still TBD) --------------------
-    case "perform":
-    case "handle":
     case "call.method":
     case "?": {
       for (let i = 1; i < arr.length; i++) {
@@ -2410,7 +2790,16 @@ export function typecheck(expr: Expr, env?: TypeEnv): TypecheckResult {
   // Standalone typecheck still gets the std DUs (option/result) so that bare
   // expressions referencing Some/None/Ok/Err typecheck without a module wrapper.
   const { typeDefs, ctors } = makeStdTypeDefs();
-  const ctx: Ctx = { errors: [], path: [], state, typeDefs, ctors };
+  const effectSigs = makeStdEffectSigs(state);
+  const ctx: Ctx = {
+    errors: [],
+    path: [],
+    state,
+    typeDefs,
+    ctors,
+    effectSigs,
+    currentEffects: freshEffectsRow(state),
+  };
   const t = infer(expr, env ?? EMPTY_TYPE_ENV, ctx);
   if (ctx.errors.length > 0) {
     return { ok: false, errors: ctx.errors };
@@ -2453,6 +2842,24 @@ function makeStdTypeDefs(): {
 }
 
 /**
+ * Build the standard effect signatures (`Error`, `Async`, `Yield`).
+ *
+ * The spec does not pin payload/resume types, so each gets fresh vars at
+ * program scope. Within a single typecheck run, all uses of e.g. `Error`
+ * unify against the same payload/resume — across runs they are independent.
+ *
+ * Unknown tags are not pre-registered: `perform` allocates fresh signatures
+ * on first use, so users (and plugins) can introduce new effects ad hoc.
+ */
+function makeStdEffectSigs(state: State): Map<string, EffectSig> {
+  const sigs = new Map<string, EffectSig>();
+  for (const tag of ["Error", "Async", "Yield"]) {
+    sigs.set(tag, { payload: state.freshVar(), resume: state.freshVar() });
+  }
+  return sigs;
+}
+
+/**
  * Convert module type definitions into TypeDefInfo entries. For Phase 3 we do
  * not yet have a syntax for declaring type parameters — DUs declared in a
  * module are monomorphic. Field type strings resolve via parseTypeAnnotation;
@@ -2478,7 +2885,16 @@ export function typecheckModule(module: Module): TypecheckResult {
   const state = new State();
   const { typeDefs, ctors } = makeStdTypeDefs();
   registerModuleTypeDefs(module.types ?? [], typeDefs, ctors);
-  const ctx: Ctx = { errors: [], path: [], state, typeDefs, ctors };
+  const effectSigs = makeStdEffectSigs(state);
+  const ctx: Ctx = {
+    errors: [],
+    path: [],
+    state,
+    typeDefs,
+    ctors,
+    effectSigs,
+    currentEffects: freshEffectsRow(state),
+  };
   const moduleEnv = EMPTY_TYPE_ENV;
   const t = infer(module.main, moduleEnv, ctx);
   if (ctx.errors.length > 0) {
