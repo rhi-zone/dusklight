@@ -1300,3 +1300,669 @@ describe("Phase 5: capabilities and call.method", () => {
     expect(typecheck(["call.method", "net"], env)).toEqual(err("ARITY_ERROR"));
   });
 });
+
+// ===========================================================================
+// Comprehensive HM-stress tests below this line.
+// These exercise inference depth, unification edge cases, gradual boundaries,
+// let-generalisation, row polymorphism, variants/match, effects, capabilities,
+// and error quality.
+// ===========================================================================
+
+describe("HM: inference depth", () => {
+  it("deeply nested lets propagate inner type from outer context", () => {
+    const result = typecheck([
+      "let",
+      [["a", 1]],
+      ["let", [["b", "a"]], ["let", [["c", "b"]], ["let", [["d", "c"]], ["+", "d", 1]]]],
+    ]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("fn parameter type only constrained at deeply nested use site", () => {
+    // x is used inside two `if`s plus an arithmetic op — must be int.
+    const result = typecheck(["fn", ["x"], ["if", true, ["if", true, ["+", "x", 1], 0], 0]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("fn(int) -> int");
+  });
+
+  it("polymorphic function used at two different types in same let body", () => {
+    // id used at int and string in the same expression.
+    const env = EMPTY_TYPE_ENV.extend({ hi: STRING });
+    const result = typecheck(
+      [
+        "let",
+        [["id", ["fn", ["x"], "x"]]],
+        ["array", ["to-string", ["call", "id", 1]], ["call", "id", "hi"]],
+      ],
+      env,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("array<string>");
+  });
+
+  it("nested fn captures outer type variable", () => {
+    // mk : fn(a) -> fn(b) -> a   (Church-style const).
+    const env = EMPTY_TYPE_ENV.extend({ ig: STRING });
+    const result = typecheck(
+      ["let", [["mk", ["fn", ["x"], ["fn", ["y"], "x"]]]], ["call", ["call", "mk", 1], "ig"]],
+      env,
+    );
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("letrec mutual recursion infers both function types", () => {
+    const result = typecheck([
+      "letrec",
+      [
+        ["even", ["fn", ["n"], ["if", ["==", "n", 0], true, ["call", "odd", ["-", "n", 1]]]]],
+        ["odd", ["fn", ["n"], ["if", ["==", "n", 0], false, ["call", "even", ["-", "n", 1]]]]],
+      ],
+      ["call", "even", 4],
+    ]);
+    expect(result).toEqual(ok(BOOL));
+  });
+});
+
+describe("HM: unification edge cases", () => {
+  it("occurs check: x applied to itself errors", () => {
+    expect(typecheck(["fn", ["x"], ["call", "x", "x"]])).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("occurs check: cyclic record set with self errors", () => {
+    expect(typecheck(["fn", ["r"], ["set", "r", "self", "r"]])).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("two closed records with disjoint field sets fail to unify", () => {
+    // Forced into same array.
+    const result = typecheck(["array", ["record", ["a", 1]], ["record", ["b", 2]]]);
+    expect(result).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("closed record absorbed into closed record with same fields", () => {
+    const result = typecheck([
+      "array",
+      ["record", ["x", 1], ["y", 2]],
+      ["record", ["x", 3], ["y", 4]],
+    ]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("array<{x: int, y: int}>");
+  });
+
+  it("open record absorbs missing field via outer fn (row poly)", () => {
+    // f reads x and y; passed a record with x,y,z extra — works.
+    const result = typecheck([
+      "let",
+      [["f", ["fn", ["r"], ["+", ["get", "r", "x"], ["get", "r", "y"]]]]],
+      ["call", "f", ["record", ["x", 1], ["y", 2], ["z", 3]]],
+    ]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("set adding a brand-new field to a closed record is a TYPE_MISMATCH", () => {
+    // The spec leaves this open; the implementation chose: closed records
+    // cannot be extended (set on a missing field of a closed record errors).
+    expect(typecheck(["set", ["record", ["x", 1]], "newfield", 2])).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("type mismatch deep inside nested let reports a path", () => {
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    const result = typecheck(
+      ["let", [["a", 1]], ["let", [["b", "a"]], ["let", [["c", "s"]], ["+", "c", 1]]]],
+      env,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors[0]?.code).toBe("TYPE_MISMATCH");
+      expect(result.errors[0]?.path.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("two row types sharing some fields, differing in others, both open — unifies", () => {
+    // Both fns read 'x' from their args; param rows have shared 'x' fields
+    // and independent open tails.
+    const result = typecheck(["fn", ["a", "b"], ["+", ["get", "a", "x"], ["get", "b", "x"]]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // Each parameter has its own open tail; the shared field 'x' has
+      // a single unified element type that becomes the return type.
+      const s = prettyType(result.type);
+      expect(s).toContain("x: ");
+      // The two open tails are independent (different vars).
+      expect(s).toMatch(/x: a \| [a-z]\d*}, \{x: a \| [a-z]\d*}/);
+    }
+  });
+});
+
+describe("HM: gradual typing boundary", () => {
+  it("unknown in one branch of if does not infect the other branch", () => {
+    const env = EMPTY_TYPE_ENV.extend({ u: UNKNOWN });
+    // Then branch is unknown, else branch is concrete int.
+    const result = typecheck(["if", true, "u", 1], env);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("unknown function arg does not collapse fn return type", () => {
+    // Function ignores its arg and returns a literal — return is concrete int.
+    const env = EMPTY_TYPE_ENV.extend({ any: STRING });
+    const result = typecheck(["call", ["fn", [["x", "unknown"]], 42], "any"], env);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("untyped → unknown; as int narrows it for arithmetic", () => {
+    const result = typecheck(["+", ["as", "int", ["untyped", "anything"]], 1]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("fn declared with unknown param accepts a concretely-typed arg", () => {
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    const result = typecheck(
+      ["let", [["f", ["fn", [["x", "unknown"]], ["+", 1, 2]]]], ["call", "f", "s"]],
+      env,
+    );
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("untyped silences all inner errors", () => {
+    // Inner expression has UNDEFINED_VAR + arity, but untyped suppresses.
+    const result = typecheck(["untyped", ["+", "no", "such", "var"]]);
+    expect(result).toEqual(ok(UNKNOWN));
+  });
+});
+
+describe("HM: let-generalisation", () => {
+  it("identity function generalises and is callable at int and bool", () => {
+    const result = typecheck([
+      "let",
+      [["id", ["fn", ["x"], "x"]]],
+      ["if", ["call", "id", true], ["call", "id", 1], 0],
+    ]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("generalised fn stored in record field is polymorphic at retrieval", () => {
+    // Retrieve id from rec, call with int and string in the same expr.
+    const env = EMPTY_TYPE_ENV.extend({ hi: STRING });
+    const result = typecheck(
+      [
+        "let",
+        [["rec", ["record", ["id", ["fn", ["x"], "x"]]]]],
+        [
+          "array",
+          ["to-string", ["call", ["get", "rec", "id"], 1]],
+          ["call", ["get", "rec", "id"], "hi"],
+        ],
+      ],
+      env,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("array<string>");
+  });
+
+  it("const fn generalises and is callable with two arg-type pairings", () => {
+    const env = EMPTY_TYPE_ENV.extend({ ig: STRING });
+    const result = typecheck(
+      [
+        "let",
+        [["k", ["fn", ["x", "y"], "x"]]],
+        ["array", ["call", "k", 1, true], ["call", "k", 2, "ig"]],
+      ],
+      env,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("array<int>");
+  });
+
+  it("non-generalised vars don't escape: lambda parameter is not polymorphic", () => {
+    // Inside a fn, x's type is a single fresh var — using it at incompatible
+    // types in the body must fail. (Compare against `let`, which generalises.)
+    const result = typecheck(["fn", ["id"], ["if", ["call", "id", true], ["call", "id", 1], 0]]);
+    // First call fixes id's param to bool; second call requires bool but
+    // gets int → TYPE_MISMATCH.
+    expect(result).toEqual(err("TYPE_MISMATCH"));
+  });
+});
+
+describe("HM: row polymorphism", () => {
+  it("get-field fn applied to records with disjoint extra fields", () => {
+    const env = EMPTY_TYPE_ENV.extend({
+      a: STRING,
+      b: STRING,
+      addr: STRING,
+    });
+    const result = typecheck(
+      [
+        "let",
+        [["getName", ["fn", ["r"], ["get", "r", "name"]]]],
+        [
+          "array",
+          ["call", "getName", ["record", ["name", "a"], ["age", 30]]],
+          ["call", "getName", ["record", ["name", "b"], ["email", "addr"]]],
+        ],
+      ],
+      env,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("array<string>");
+  });
+
+  it("merge open + closed: open absorbs the closed fields", () => {
+    // fn takes open r, merges with {extra: int} — result includes extra.
+    const result = typecheck(["fn", ["r"], ["merge", "r", ["record", ["extra", 42]]]]);
+    expect(result.ok).toBe(true);
+  });
+
+  it("get-in two levels works on literal nested records", () => {
+    const env = EMPTY_TYPE_ENV.extend({ alice: STRING });
+    const result = typecheck(
+      ["get-in", ["record", ["user", ["record", ["name", "alice"]]]], ["array", "user", "name"]],
+      env,
+    );
+    expect(result).toEqual(ok(STRING));
+  });
+
+  it("calling row-poly fn on a record missing required field errors", () => {
+    expect(typecheck(["call", ["fn", ["r"], ["get", "r", "x"]], ["record", ["y", 1]]])).toEqual(
+      err("TYPE_MISMATCH"),
+    );
+  });
+});
+
+describe("HM: variants and DUs", () => {
+  it("constructor with too few args → ARITY_ERROR", () => {
+    expect(typecheck(["Some"])).toEqual(err("ARITY_ERROR"));
+  });
+
+  it("constructor with too many args → ARITY_ERROR", () => {
+    expect(typecheck(["None", 1])).toEqual(err("ARITY_ERROR"));
+  });
+
+  it("constructor field types inferred from outer match context", () => {
+    // x is `Some 1` so v is bound to int; the body adds 1.
+    const result = typecheck([
+      "let",
+      [["x", ["Some", 1]]],
+      [
+        "match",
+        "x",
+        [
+          ["Some", "v"],
+          ["+", "v", 1],
+        ],
+        [["None"], 0],
+      ],
+    ]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("match scrutinee type inferred purely from patterns", () => {
+    // Param type isn't declared — inferred to option<int> from patterns.
+    const result = typecheck(["fn", ["o"], ["match", "o", [["Some", "x"], "x"], [["None"], 0]]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toBe("fn(option<int>) -> int");
+  });
+
+  it("non-exhaustive match on option<T> missing None", () => {
+    expect(
+      typecheckModule({
+        main: ["match", ["Some", 1], [["Some", "x"], "x"]],
+      }),
+    ).toEqual(err("NON_EXHAUSTIVE_MATCH"));
+  });
+
+  it("non-exhaustive match with wildcard passes", () => {
+    const result = typecheckModule({
+      main: ["match", ["Some", 1], [["Some", "x"], "x"], ["_", 0]],
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  it("match with wildcard binding inside a variant pattern passes", () => {
+    const result = typecheck(["match", ["Some", 1], [["Some", "_"], 42], [["None"], 0]]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("match arm types must agree across branches", () => {
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    expect(typecheck(["match", ["Some", 1], [["Some", "x"], "x"], [["None"], "s"]], env)).toEqual(
+      err("TYPE_MISMATCH"),
+    );
+  });
+
+  it("match with wrong pattern arity → ARITY_ERROR", () => {
+    expect(typecheck(["match", ["Some", 1], [["Some", "x", "y"], "x"], [["None"], 0]])).toEqual(
+      err("ARITY_ERROR"),
+    );
+  });
+
+  it("nested patterns: inner match on Some(Ok)/Err inside outer Some/None", () => {
+    const result = typecheck([
+      "match",
+      ["Some", ["Ok", 1]],
+      [
+        ["Some", "x"],
+        ["match", "x", [["Ok", "v"], "v"], [["Err", "_"], 0]],
+      ],
+      [["None"], 0],
+    ]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("match on unrelated scrutinee type with variant pattern → TYPE_MISMATCH", () => {
+    expect(typecheck(["match", 1, [["Some", "x"], "x"], [["None"], 0]])).toEqual(
+      err("TYPE_MISMATCH"),
+    );
+  });
+
+  it("match clause is not [pattern, body] → TYPE_MISMATCH", () => {
+    expect(typecheck(["match", 1, "notarray"])).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("match arity error: no clauses", () => {
+    expect(typecheck(["match", 1])).toEqual(err("ARITY_ERROR"));
+  });
+
+  it("nominal types are not structural — Foo and Bar with same shape don't unify", () => {
+    expect(
+      typecheckModule({
+        types: [
+          { name: "A", variants: [{ tag: "FooA" }] },
+          { name: "B", variants: [{ tag: "FooB" }] },
+        ],
+        main: ["array", ["FooA"], ["FooB"]],
+      }),
+    ).toEqual(err("TYPE_MISMATCH"));
+  });
+});
+
+describe("HM: effects", () => {
+  it("perform inside fn — fn's effect row includes performed tag", () => {
+    const result = typecheck(["fn", [], ["perform", "Foo", null]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toContain("Foo");
+  });
+
+  it("handle removes the tag from the outer effect row", () => {
+    // Inner fn fully handles Local; outer fn must be pure.
+    const result = typecheck([
+      "fn",
+      ["x"],
+      [
+        "handle",
+        ["perform", "Local", "x"],
+        [
+          ["Local", "v", "k"],
+          ["call", "k", "v"],
+        ],
+        [["return", "y"], "y"],
+      ],
+    ]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).not.toContain("Local");
+  });
+
+  it("nested handle: inner handles E1, outer leaks E2", () => {
+    const result = typecheck([
+      "fn",
+      [],
+      [
+        "handle",
+        ["do", ["perform", "E1", 1], ["perform", "E2", 2]],
+        [
+          ["E1", "v", "k"],
+          ["call", "k", "v"],
+        ],
+      ],
+    ]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const s = prettyType(result.type);
+      expect(s).not.toContain("E1");
+      expect(s).toContain("E2");
+    }
+  });
+
+  it("unhandled effect propagates through multiple call frames", () => {
+    const result = typecheck([
+      "let",
+      [
+        ["g", ["fn", [], ["perform", "Foo", null]]],
+        ["h", ["fn", [], ["call", "g"]]],
+      ],
+      ["fn", [], ["call", "h"]],
+    ]);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(prettyType(result.type)).toContain("Foo");
+  });
+
+  it("k binding type: calling k with wrong arg type → TYPE_MISMATCH", () => {
+    // Body performs Ask on null, then adds resume to int — so resume is int.
+    // Handler tries to call k with a string — mismatch.
+    const env = EMPTY_TYPE_ENV.extend({ wrong: STRING });
+    const result = typecheck(
+      [
+        "handle",
+        ["+", ["perform", "Ask", null], 1],
+        [
+          ["Ask", "_", "k"],
+          ["call", "k", "wrong"],
+        ],
+      ],
+      env,
+    );
+    expect(result).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("k called with wrong arity → ARITY_ERROR", () => {
+    expect(
+      typecheck([
+        "handle",
+        ["perform", "Ask", null],
+        [
+          ["Ask", "_", "k"],
+          ["call", "k"],
+        ],
+      ]),
+    ).toEqual(err("ARITY_ERROR"));
+  });
+
+  it("handle with no clauses (no return clause) returns body type", () => {
+    expect(typecheck(["handle", 42])).toEqual(ok(INT));
+  });
+
+  it("multi-shot continuation: k can be called twice (no error)", () => {
+    // The type system shouldn't reject calling k more than once — multi-shot
+    // is a runtime property. (Linearity is not yet enforced.)
+    const result = typecheck([
+      "handle",
+      ["perform", "Yield", 1],
+      [
+        ["Yield", "v", "k"],
+        ["+", ["call", "k", "v"], ["call", "k", "v"]],
+      ],
+    ]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("perform unifies payload type across multiple uses of same tag", () => {
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    expect(
+      typecheck(
+        [
+          "handle",
+          ["do", ["perform", "MyEff", 1], ["perform", "MyEff", "s"]],
+          [
+            ["MyEff", "v", "k"],
+            ["call", "k", "v"],
+          ],
+        ],
+        env,
+      ).ok,
+    ).toBe(false);
+  });
+
+  it("perform tag not a string → TYPE_MISMATCH", () => {
+    expect(typecheck(["perform", 42, 1])).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("handle clause not array → TYPE_MISMATCH", () => {
+    expect(typecheck(["handle", 1, "notarray"])).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("handle clause pattern arity wrong (only Tag, no bindings)", () => {
+    expect(typecheck(["handle", ["perform", "X", null], [["X"], 1]])).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("handle return clause with bad shape → TYPE_MISMATCH", () => {
+    expect(typecheck(["handle", 1, [["return"], 1]])).toEqual(err("TYPE_MISMATCH"));
+  });
+});
+
+describe("HM: capabilities", () => {
+  const CAP_NETWORK_LOCAL: MType = {
+    kind: "named",
+    name: "Cap",
+    args: [{ kind: "named", name: "Network", args: [] }],
+  };
+  const CAP_STORAGE_LOCAL: MType = {
+    kind: "named",
+    name: "Cap",
+    args: [{ kind: "named", name: "Storage", args: [] }],
+  };
+
+  it("Network.get result feeds str-len (used in arithmetic)", () => {
+    const env = EMPTY_TYPE_ENV.extend({
+      net: CAP_NETWORK_LOCAL,
+      url: STRING,
+    });
+    expect(typecheck(["str-len", ["call.method", "net", "get", "url"]], env)).toEqual(ok(INT));
+  });
+
+  it("two cap methods in sequence — both effects appear in the row", () => {
+    const env = EMPTY_TYPE_ENV.extend({
+      net: CAP_NETWORK_LOCAL,
+      st: CAP_STORAGE_LOCAL,
+      url: STRING,
+      k: STRING,
+      v: STRING,
+    });
+    const result = typecheck(
+      [
+        "fn",
+        [],
+        ["do", ["call.method", "net", "get", "url"], ["call.method", "st", "set", "k", "v"]],
+      ],
+      env,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const s = prettyType(result.type);
+      expect(s).toContain("Network");
+      expect(s).toContain("Storage");
+    }
+  });
+
+  it("capability passed as an unknown-typed function arg threads through", () => {
+    // c is unknown — call.method on it gradually escapes to unknown.
+    const env = EMPTY_TYPE_ENV.extend({
+      net: CAP_NETWORK_LOCAL,
+      url: STRING,
+    });
+    const result = typecheck(
+      [
+        "let",
+        [["use", ["fn", [["c", "unknown"]], ["call.method", "c", "get", "url"]]]],
+        ["call", "use", "net"],
+      ],
+      env,
+    );
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe("HM: error quality", () => {
+  it("UNDEFINED_VAR carries a path", () => {
+    const result = typecheck(["+", "missing", 1]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      const e = result.errors.find((x) => x.code === "UNDEFINED_VAR");
+      expect(e).toBeDefined();
+      expect(e?.path).toEqual([1]);
+    }
+  });
+
+  it("ARITY_ERROR for wrong number of args", () => {
+    expect(typecheck(["+", 1])).toEqual(err("ARITY_ERROR"));
+  });
+
+  it("UNKNOWN_OP for non-string head", () => {
+    expect(typecheck([1, 2, 3] as unknown as Expr)).toEqual(err("UNKNOWN_OP"));
+  });
+
+  it("UNKNOWN_OP for a totally unknown op name", () => {
+    expect(typecheck(["zzz-no-op", 1])).toEqual(err("UNKNOWN_OP"));
+  });
+
+  it("UNKNOWN_VARIANT for a Tag-cased op with no registered DU", () => {
+    expect(typecheck(["NoSuchTag", 1])).toEqual(err("UNKNOWN_VARIANT"));
+  });
+
+  it("NON_EXHAUSTIVE_MATCH when only None covered for option<T>", () => {
+    expect(typecheck(["fn", ["o"], ["match", "o", [["None"], 0]]])).toEqual(
+      err("NON_EXHAUSTIVE_MATCH"),
+    );
+  });
+
+  it("NOT_YET_IMPLEMENTED for `?` op", () => {
+    expect(typecheck(["?", 1])).toEqual(err("NOT_YET_IMPLEMENTED"));
+  });
+
+  it("nested error inside fn body has a nested path", () => {
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    const result = typecheck(["fn", [["x", "int"]], ["+", "x", "s"]], env);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      // The body is at index 2 of the fn expr; the bad arg is at [2, 2].
+      const e = result.errors[0];
+      expect(e?.path?.length).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  it("malformed let bindings → TYPE_MISMATCH at the bindings position", () => {
+    const result = typecheck(["let", "notarray", 1]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors[0]?.code).toBe("TYPE_MISMATCH");
+      expect(result.errors[0]?.path).toEqual([1]);
+    }
+  });
+
+  it("malformed letrec bindings → TYPE_MISMATCH", () => {
+    expect(typecheck(["letrec", "notarray", 1])).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("malformed fn params → TYPE_MISMATCH", () => {
+    expect(typecheck(["fn", "notarray", 1])).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("error has expected/got fields populated", () => {
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    const result = typecheck(["+", "s", 1], env);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      const e = result.errors[0];
+      expect(e?.expected).toBeDefined();
+      expect(e?.got).toBeDefined();
+    }
+  });
+
+  it("multiple errors are collected, not short-circuited", () => {
+    // Two unrelated errors: undefined var and arity error.
+    const result = typecheck(["if", "undef1", ["+", 1], 2]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      const codes = new Set(result.errors.map((e) => e.code));
+      expect(codes.has("UNDEFINED_VAR")).toBe(true);
+      expect(codes.has("ARITY_ERROR")).toBe(true);
+    }
+  });
+});
