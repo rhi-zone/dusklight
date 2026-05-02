@@ -1353,6 +1353,31 @@ function* evalGen(expr: Expr, env: Env): EvalGen {
       return err("NON_EXHAUSTIVE_MATCH", [], "non-exhaustive match: no clause matched");
     }
 
+    case "cond": {
+      // ["cond", [test1, expr1], [test2, expr2], ..., ["else", exprN]]
+      if (arr.length < 2) return err("ARITY_ERROR", [], "cond requires at least 1 clause");
+      for (let i = 1; i < arr.length; i++) {
+        const clause = arr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          return err("TYPE_ERROR", [i], "cond clause must be [test, expr]");
+        }
+        const test = clause[0];
+        const body = clause[1] as Expr;
+        if (test === "else") {
+          return prependPath(yield* evalGen(body, env), i);
+        }
+        const testR = prependPath(yield* evalGen(test as Expr, env), i);
+        if (!testR.ok) return testR;
+        if (testR.value.kind !== "bool") {
+          return err("TYPE_ERROR", [i, 0], "cond test must be bool, got " + typeName(testR.value));
+        }
+        if (testR.value.value) {
+          return prependPath(yield* evalGen(body, env), i);
+        }
+      }
+      return err("NON_EXHAUSTIVE_COND", [], "non-exhaustive cond: no clause matched");
+    }
+
     // --- Effects ---
     case "perform": {
       // ["perform", tag, payload]
