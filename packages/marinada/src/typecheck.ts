@@ -1313,6 +1313,69 @@ function inferType(expr: Expr, env: TypeEnv, ctx: Ctx): MType {
       return resultType ?? UNKNOWN;
     }
 
+    // --- Effects ---
+    case "perform": {
+      if (arr.length !== 3) {
+        addError(
+          ctx,
+          "ARITY_ERROR",
+          "perform requires 2 args (tag, payload), got " + String(arr.length - 1),
+        );
+        return UNKNOWN;
+      }
+      const tag = arr[1];
+      if (typeof tag !== "string") {
+        withPath(ctx, 1, (sub) =>
+          addError(sub, "TYPE_MISMATCH", "perform effect tag must be a string"),
+        );
+      }
+      withPath(ctx, 2, (sub) => inferType(at(arr, 2), env, sub));
+      return UNKNOWN;
+    }
+
+    case "handle": {
+      if (arr.length < 2) {
+        addError(ctx, "ARITY_ERROR", "handle requires at least 1 arg (body)");
+        return UNKNOWN;
+      }
+      withPath(ctx, 1, (sub) => inferType(at(arr, 1), env, sub));
+      for (let i = 2; i < arr.length; i++) {
+        const clause = arr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          withPath(ctx, i, (sub) =>
+            addError(sub, "TYPE_MISMATCH", "handle clause must be [pattern, body]"),
+          );
+          continue;
+        }
+        const pattern = clause[0];
+        if (!Array.isArray(pattern) || pattern.length < 1) {
+          withPath(ctx, i, (sub) =>
+            withPath(sub, 0, (sub2) =>
+              addError(
+                sub2,
+                "TYPE_MISMATCH",
+                "handle clause pattern must be an array starting with a tag",
+              ),
+            ),
+          );
+          continue;
+        }
+        // Bind pattern variables (tag bindings + optional continuation k) as unknown
+        const patternBindings: Record<string, MType> = {};
+        for (let j = 1; j < pattern.length; j++) {
+          const bName = pattern[j];
+          if (typeof bName === "string") {
+            patternBindings[bName] = UNKNOWN;
+          }
+        }
+        const branchEnv = env.extend(patternBindings);
+        withPath(ctx, i, (sub) =>
+          withPath(sub, 1, (sub2) => inferType(clause[1] as Expr, branchEnv, sub2)),
+        );
+      }
+      return UNKNOWN;
+    }
+
     default:
       addError(ctx, "UNKNOWN_OP", "unknown op: " + op);
       return UNKNOWN;
