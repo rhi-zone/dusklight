@@ -20,6 +20,17 @@ Dusklight is data-format agnostic, and so is its control plane. You can:
 
 This makes Dusklight the "Project Hub" for RHI - viewing world state, triggering extractions, monitoring pipelines, all through format-agnostic adapters.
 
+### Expression Language
+
+**Marinada** (`packages/marinada`) is the core expression language and reactive computation model for Dusklight. It is not a utility library — it is the engine that powers all dynamic layout properties, data traversals, and optic bindings. Read `docs/marinada.md` before forming any opinion about it.
+
+Key facts to anchor a new session:
+- Expressions are JSON arrays (s-expressions as data); no custom parser
+- Two backends: JS JIT (browser, owns reactive graph) and Rust/WASM (binary/heavy computation)
+- Algebraic effects, linear types, discriminated unions — all **intentional spec features**, not overengineering
+- `lib:std` (map, filter, reduce, option, result, etc.) is implemented as ordinary Marinada expressions, not hardcoded primitives
+- `LayoutOptic` in `core/src/types.ts` is an `Expr` that evaluates to a Lens or Traversal at runtime
+
 ## Core Rules
 
 **Note things down immediately — no deferral:**
