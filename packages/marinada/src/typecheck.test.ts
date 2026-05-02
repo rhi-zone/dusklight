@@ -537,24 +537,9 @@ describe("string ops", () => {
   });
 });
 
-// --- Phase 2+ ops are not-yet-implemented ---
+// --- Phase 3+ ops are not-yet-implemented ---
 
-describe("Phase 2+ ops fail loudly", () => {
-  it("get → NOT_YET_IMPLEMENTED", () => {
-    const env = EMPTY_TYPE_ENV.extend({ r: UNKNOWN });
-    expect(typecheck(["get", "r", "key"], env)).toEqual(err("NOT_YET_IMPLEMENTED"));
-  });
-
-  it("merge → NOT_YET_IMPLEMENTED", () => {
-    const env = EMPTY_TYPE_ENV.extend({ r1: UNKNOWN, r2: UNKNOWN });
-    expect(typecheck(["merge", "r1", "r2"], env)).toEqual(err("NOT_YET_IMPLEMENTED"));
-  });
-
-  it("keys → NOT_YET_IMPLEMENTED", () => {
-    const env = EMPTY_TYPE_ENV.extend({ r: UNKNOWN });
-    expect(typecheck(["keys", "r"], env)).toEqual(err("NOT_YET_IMPLEMENTED"));
-  });
-
+describe("Phase 3+ ops fail loudly", () => {
   it("match → NOT_YET_IMPLEMENTED", () => {
     const env = EMPTY_TYPE_ENV.extend({ v: UNKNOWN });
     expect(typecheck(["match", "v", [["Tag"], 42]], env)).toEqual(err("NOT_YET_IMPLEMENTED"));
@@ -571,6 +556,163 @@ describe("Phase 2+ ops fail loudly", () => {
   it("variant constructor → NOT_YET_IMPLEMENTED", () => {
     // Phase 2 will introduce variant constructor schemes from type defs.
     expect(typecheck(["Circle", 1.5])).toEqual(err("NOT_YET_IMPLEMENTED"));
+  });
+});
+
+// --- Records and row polymorphism (Phase 2) ---
+
+describe("records", () => {
+  it("record literal → closed record type", () => {
+    const env = EMPTY_TYPE_ENV.extend({ hello: STRING });
+    const result = typecheck(["record", ["x", 1], ["y", "hello"]], env);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toBe("{x: int, y: string}");
+    }
+  });
+
+  it("{} literal works as record literal", () => {
+    const result = typecheck(["{}", ["a", true]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toBe("{a: bool}");
+    }
+  });
+
+  it("get on closed record returns field type", () => {
+    const result = typecheck(["get", ["record", ["x", 1], ["y", 2.5]], "x"]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("get on missing field of closed record → TYPE_MISMATCH", () => {
+    const result = typecheck(["get", ["record", ["x", 1]], "missing"]);
+    expect(result).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("get with non-string key still typechecks but loses precision", () => {
+    const env = EMPTY_TYPE_ENV.extend({ r: UNKNOWN, k: STRING });
+    const result = typecheck(["get", "r", "k"], env);
+    expect(result.ok).toBe(true);
+  });
+
+  it("set on closed record returns same record type", () => {
+    const result = typecheck(["set", ["record", ["x", 1]], "x", 2]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toBe("{x: int}");
+    }
+  });
+
+  it("set with wrong value type for existing key → TYPE_MISMATCH", () => {
+    const result = typecheck(["set", ["record", ["x", 1]], "x", "wrong"]);
+    expect(result).toEqual(err("UNDEFINED_VAR"));
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    expect(typecheck(["set", ["record", ["x", 1]], "x", "s"], env)).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("merge of two closed records produces closed merged record", () => {
+    const env = EMPTY_TYPE_ENV.extend({ hi: STRING });
+    const result = typecheck(["merge", ["record", ["x", 1]], ["record", ["y", "hi"]]], env);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toBe("{x: int, y: string}");
+    }
+  });
+
+  it("merge: b shadows a on conflict", () => {
+    const env = EMPTY_TYPE_ENV.extend({ s: STRING });
+    const result = typecheck(["merge", ["record", ["x", 1]], ["record", ["x", "s"]]], env);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toBe("{x: string}");
+    }
+  });
+
+  it("keys on record → array<string>", () => {
+    const result = typecheck(["keys", ["record", ["x", 1], ["y", 2]]]);
+    expect(result).toEqual(ok({ kind: "array", elem: STRING }));
+  });
+
+  it("vals on homogeneous record → array<T>", () => {
+    const result = typecheck(["vals", ["record", ["x", 1], ["y", 2]]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toBe("array<int>");
+    }
+  });
+
+  it("count on record → int", () => {
+    const result = typecheck(["count", ["record", ["x", 1], ["y", 2]]]);
+    expect(result).toEqual(ok(INT));
+  });
+
+  it("record-has → bool", () => {
+    const result = typecheck(["record-has", ["record", ["x", 1]], "x"]);
+    expect(result).toEqual(ok(BOOL));
+  });
+
+  it("record-del returns record", () => {
+    const result = typecheck(["record-del", ["record", ["x", 1], ["y", 2]], "x"]);
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe("row polymorphism", () => {
+  it("function that gets `name` field works on any record with name", () => {
+    // (fn (r) (get r "name"))
+    const result = typecheck(["fn", ["r"], ["get", "r", "name"]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // Should be: fn({name: a | b}) -> a
+      const s = prettyType(result.type);
+      expect(s).toContain("name:");
+      expect(s).toContain("->");
+    }
+  });
+
+  it("polymorphic get-name applied to records with extra fields", () => {
+    const env = EMPTY_TYPE_ENV.extend({ alice: STRING, bob: STRING, addr: STRING });
+    const result = typecheck(
+      [
+        "let",
+        [["getName", ["fn", ["r"], ["get", "r", "name"]]]],
+        [
+          "array",
+          ["call", "getName", ["record", ["name", "alice"], ["age", 30]]],
+          ["call", "getName", ["record", ["name", "bob"], ["email", "addr"]]],
+        ],
+      ],
+      env,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(prettyType(result.type)).toBe("array<string>");
+    }
+  });
+
+  it("get-in nested path", () => {
+    const env = EMPTY_TYPE_ENV.extend({ alice: STRING });
+    const inner: Expr = ["record", ["name", "alice"]];
+    const outer: Expr = ["record", ["user", inner]];
+    const result = typecheck(["get-in", outer, ["array", "user", "name"]], env);
+    expect(result).toEqual(ok(STRING));
+  });
+
+  it("closed record cannot be unified with record requiring missing field", () => {
+    // get "missing" on a closed record literal {x: int}
+    const result = typecheck(["get", ["record", ["x", 1]], "missing"]);
+    expect(result).toEqual(err("TYPE_MISMATCH"));
+  });
+
+  it("fn that calls get and uses field as int constrains row field type", () => {
+    const result = typecheck(["fn", ["r"], ["+", ["get", "r", "n"], 1]]);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const s = prettyType(result.type);
+      // Result type should be int and parameter row should mention n: int
+      expect(s).toContain("n: int");
+      expect(s).toContain("-> int");
+    }
   });
 });
 

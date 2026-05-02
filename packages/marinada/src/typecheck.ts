@@ -14,7 +14,8 @@ export type MType =
   | { kind: "string" }
   | { kind: "bytes" }
   | { kind: "array"; elem: MType }
-  | { kind: "record"; fields: Map<string, MType> }
+  | { kind: "row"; fields: Map<string, MType>; rest: number | "empty" }
+  | { kind: "record"; row: MType }
   | { kind: "fn"; params: MType[]; ret: MType }
   | { kind: "linear"; inner: MType }
   | { kind: "affine"; inner: MType }
@@ -59,6 +60,26 @@ function find(t: MType, subst: Substitution): MType {
   return cur;
 }
 
+/** Resolve a row's tail through the substitution. Used when iterating row fields. */
+function resolveRow(t: MType, subst: Substitution): MType {
+  let cur = find(t, subst);
+  while (cur.kind === "row" && typeof cur.rest === "number") {
+    const next = subst.get(cur.rest);
+    if (next === undefined) return cur;
+    const nextR = find(next, subst);
+    if (nextR.kind !== "row") {
+      // tail bound to a non-row (e.g. another var) — leave as is
+      return cur;
+    }
+    // Merge: combine fields with tail's fields. Local wins in case of duplicates
+    // (caller must ensure no duplicates via row unification).
+    const merged = new Map<string, MType>(nextR.fields);
+    for (const [k, v] of cur.fields) merged.set(k, v);
+    cur = { kind: "row", fields: merged, rest: nextR.rest };
+  }
+  return cur;
+}
+
 /** Fully resolve type by substituting recursively. Pure; does not mutate. */
 function zonk(t: MType, subst: Substitution): MType {
   const r = find(t, subst);
@@ -75,11 +96,15 @@ function zonk(t: MType, subst: Substitution): MType {
       return r;
     case "array":
       return { kind: "array", elem: zonk(r.elem, subst) };
-    case "record": {
+    case "row": {
+      const flat = resolveRow(r, subst);
+      if (flat.kind !== "row") return zonk(flat, subst);
       const fields = new Map<string, MType>();
-      for (const [k, v] of r.fields) fields.set(k, zonk(v, subst));
-      return { kind: "record", fields };
+      for (const [k, v] of flat.fields) fields.set(k, zonk(v, subst));
+      return { kind: "row", fields, rest: flat.rest };
     }
+    case "record":
+      return { kind: "record", row: zonk(r.row, subst) };
     case "fn":
       return {
         kind: "fn",
@@ -123,8 +148,24 @@ function ftv(t: MType, subst: Substitution, out: Set<number>): void {
     case "array":
       ftv(r.elem, subst, out);
       return;
+    case "row": {
+      const flat = resolveRow(r, subst);
+      if (flat.kind !== "row") {
+        ftv(flat, subst, out);
+        return;
+      }
+      for (const v of flat.fields.values()) ftv(v, subst, out);
+      if (typeof flat.rest === "number") {
+        // The tail var, if unbound, is free.
+        const tailVar: MType = { kind: "var", id: flat.rest };
+        const tr = find(tailVar, subst);
+        if (tr.kind === "var") out.add(tr.id);
+        else ftv(tr, subst, out);
+      }
+      return;
+    }
     case "record":
-      for (const v of r.fields.values()) ftv(v, subst, out);
+      ftv(r.row, subst, out);
       return;
     case "fn":
       for (const p of r.params) ftv(p, subst, out);
@@ -154,7 +195,7 @@ function ftvOfEnv(env: TypeEnv, subst: Substitution): Set<number> {
 }
 
 // ---------------------------------------------------------------------------
-// TypeEnv (stores schemes — mono types are degenerate schemes with no quantifiers)
+// TypeEnv
 // ---------------------------------------------------------------------------
 
 export class TypeEnv {
@@ -180,7 +221,6 @@ export class TypeEnv {
     this.bindings.set(name, t);
   }
 
-  /** All bindings reachable via parent chain (for ftv computation). */
   *allBindings(): IterableIterator<MType> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     let e: TypeEnv | null = this;
@@ -256,8 +296,14 @@ function typeName(t: MType): string {
       return "bytes";
     case "array":
       return "array<" + typeName(t.elem) + ">";
+    case "row": {
+      const parts: string[] = [];
+      for (const [k, v] of t.fields) parts.push(k + ": " + typeName(v));
+      if (typeof t.rest === "number") parts.push("...r" + String(t.rest));
+      return "{" + parts.join(", ") + "}";
+    }
     case "record":
-      return "record";
+      return "record" + typeName(t.row);
     case "fn":
       return "fn(" + t.params.map(typeName).join(", ") + ") -> " + typeName(t.ret);
     case "linear":
@@ -275,20 +321,13 @@ function typeName(t: MType): string {
   }
 }
 
-/**
- * Pretty-print a type for stable test assertions.
- *
- * Zonks the type via the resolution layer (callers pass already-zonked types
- * normally), then alpha-renames any remaining free type variables to a, b, c,
- * ... in left-to-right encounter order.
- */
+/** Pretty-print a type for stable test assertions. */
 export function prettyType(t: MType): string {
   const seen = new Map<number, string>();
   let nextChar = 0;
   function name(id: number): string {
     const existing = seen.get(id);
     if (existing !== undefined) return existing;
-    // a..z, then a1, b1, ...
     const n = nextChar++;
     const letter = String.fromCharCode("a".charCodeAt(0) + (n % 26));
     const suffix = n >= 26 ? String(Math.floor(n / 26)) : "";
@@ -316,8 +355,17 @@ export function prettyType(t: MType): string {
         return "bytes";
       case "array":
         return "array<" + go(t.elem) + ">";
+      case "row": {
+        const parts: string[] = [];
+        const sortedKeys = [...t.fields.keys()].sort();
+        for (const k of sortedKeys) parts.push(k + ": " + go(t.fields.get(k) as MType));
+        if (typeof t.rest === "number") {
+          return "{" + parts.join(", ") + " | " + name(t.rest) + "}";
+        }
+        return "{" + parts.join(", ") + "}";
+      }
       case "record":
-        return "record";
+        return go(t.row);
       case "fn":
         return "fn(" + t.params.map(go).join(", ") + ") -> " + go(t.ret);
       case "linear":
@@ -355,9 +403,19 @@ function occurs(id: number, t: MType, subst: Substitution): boolean {
       return false;
     case "array":
       return occurs(id, r.elem, subst);
-    case "record":
-      for (const v of r.fields.values()) if (occurs(id, v, subst)) return true;
+    case "row": {
+      const flat = resolveRow(r, subst);
+      if (flat.kind !== "row") return occurs(id, flat, subst);
+      for (const v of flat.fields.values()) if (occurs(id, v, subst)) return true;
+      if (typeof flat.rest === "number") {
+        if (flat.rest === id) return true;
+        const tr = find({ kind: "var", id: flat.rest }, subst);
+        if (tr.kind !== "var") return occurs(id, tr, subst);
+      }
       return false;
+    }
+    case "record":
+      return occurs(id, r.row, subst);
     case "fn":
       for (const p of r.params) if (occurs(id, p, subst)) return true;
       return occurs(id, r.ret, subst);
@@ -368,7 +426,6 @@ function occurs(id: number, t: MType, subst: Substitution): boolean {
       for (const f of r.fields) if (occurs(id, f, subst)) return true;
       return false;
     case "scheme":
-      // schemes shouldn't appear inside monotypes during unification, but be safe
       return occurs(id, r.body, subst);
   }
 }
@@ -378,28 +435,22 @@ type UnifyResult = { ok: true } | { ok: false; reason: string };
 /**
  * Unify two types eagerly. Mutates the substitution.
  *
- * Gradual typing: `unknown` consistent-unifies with anything silently. It does
- * NOT bind any vars and does NOT propagate — the other side keeps its shape.
+ * Gradual typing: `unknown` consistent-unifies with anything silently.
  */
-function unify(a: MType, b: MType, subst: Substitution): UnifyResult {
+function unify(a: MType, b: MType, subst: Substitution, state: State): UnifyResult {
   const ra = find(a, subst);
   const rb = find(b, subst);
 
-  // Consistent-unify with unknown — succeed silently, bind nothing.
   if (ra.kind === "unknown" || rb.kind === "unknown") return { ok: true };
 
   if (ra.kind === "var") {
     if (rb.kind === "var" && ra.id === rb.id) return { ok: true };
-    if (occurs(ra.id, rb, subst)) {
-      return { ok: false, reason: "occurs check failed" };
-    }
+    if (occurs(ra.id, rb, subst)) return { ok: false, reason: "occurs check failed" };
     subst.set(ra.id, rb);
     return { ok: true };
   }
   if (rb.kind === "var") {
-    if (occurs(rb.id, ra, subst)) {
-      return { ok: false, reason: "occurs check failed" };
-    }
+    if (occurs(rb.id, ra, subst)) return { ok: false, reason: "occurs check failed" };
     subst.set(rb.id, ra);
     return { ok: true };
   }
@@ -420,7 +471,7 @@ function unify(a: MType, b: MType, subst: Substitution): UnifyResult {
       if (ra.name === (rb as { kind: "named"; name: string }).name) return { ok: true };
       return { ok: false, reason: ra.name + " vs " + (rb as { name: string }).name };
     case "array":
-      return unify(ra.elem, (rb as { kind: "array"; elem: MType }).elem, subst);
+      return unify(ra.elem, (rb as { kind: "array"; elem: MType }).elem, subst, state);
     case "fn": {
       const fb = rb as { kind: "fn"; params: MType[]; ret: MType };
       if (ra.params.length !== fb.params.length) {
@@ -430,35 +481,26 @@ function unify(a: MType, b: MType, subst: Substitution): UnifyResult {
         };
       }
       for (let i = 0; i < ra.params.length; i++) {
-        const r = unify(ra.params[i] as MType, fb.params[i] as MType, subst);
+        const r = unify(ra.params[i] as MType, fb.params[i] as MType, subst, state);
         if (!r.ok) return r;
       }
-      return unify(ra.ret, fb.ret, subst);
+      return unify(ra.ret, fb.ret, subst, state);
     }
-    case "record": {
-      const rbR = rb as { kind: "record"; fields: Map<string, MType> };
-      if (ra.fields.size !== rbR.fields.size) {
-        return { ok: false, reason: "record field count differs" };
-      }
-      for (const [k, v] of ra.fields) {
-        const bv = rbR.fields.get(k);
-        if (bv === undefined) return { ok: false, reason: "missing field " + k };
-        const r = unify(v, bv, subst);
-        if (!r.ok) return r;
-      }
-      return { ok: true };
-    }
+    case "record":
+      return unify(ra.row, (rb as { kind: "record"; row: MType }).row, subst, state);
+    case "row":
+      return unifyRows(ra, rb as Extract<MType, { kind: "row" }>, subst, state);
     case "linear":
-      return unify(ra.inner, (rb as { kind: "linear"; inner: MType }).inner, subst);
+      return unify(ra.inner, (rb as { kind: "linear"; inner: MType }).inner, subst, state);
     case "affine":
-      return unify(ra.inner, (rb as { kind: "affine"; inner: MType }).inner, subst);
+      return unify(ra.inner, (rb as { kind: "affine"; inner: MType }).inner, subst, state);
     case "variant": {
       const vb = rb as { kind: "variant"; tag: string; fields: MType[] };
       if (ra.tag !== vb.tag || ra.fields.length !== vb.fields.length) {
         return { ok: false, reason: "variant " + ra.tag + " vs " + vb.tag };
       }
       for (let i = 0; i < ra.fields.length; i++) {
-        const r = unify(ra.fields[i] as MType, vb.fields[i] as MType, subst);
+        const r = unify(ra.fields[i] as MType, vb.fields[i] as MType, subst, state);
         if (!r.ok) return r;
       }
       return { ok: true };
@@ -469,10 +511,111 @@ function unify(a: MType, b: MType, subst: Substitution): UnifyResult {
 }
 
 /**
- * Unify and emit an error if it fails. Returns whether unification succeeded.
+ * Unify two row types (Leijen-style). Align field labels:
+ *  - field in both: unify field types
+ *  - field only in a: extend b's tail (or error if b closed)
+ *  - field only in b: extend a's tail (or error if a closed)
+ *  - tails: closed/closed must both be empty; open/closed binds open tail to closed empty;
+ *    open/open binds both tails to a fresh shared row var.
  */
+function unifyRows(
+  a: Extract<MType, { kind: "row" }>,
+  b: Extract<MType, { kind: "row" }>,
+  subst: Substitution,
+  state: State,
+): UnifyResult {
+  const flatA = resolveRow(a, subst);
+  const flatB = resolveRow(b, subst);
+  if (flatA.kind !== "row") return unify(flatA, b, subst, state);
+  if (flatB.kind !== "row") return unify(a, flatB, subst, state);
+
+  const onlyA = new Map<string, MType>();
+  const onlyB = new Map<string, MType>(flatB.fields);
+  for (const [k, va] of flatA.fields) {
+    const vb = onlyB.get(k);
+    if (vb === undefined) {
+      onlyA.set(k, va);
+    } else {
+      const r = unify(va, vb, subst, state);
+      if (!r.ok) return { ok: false, reason: "field " + k + ": " + r.reason };
+      onlyB.delete(k);
+    }
+  }
+
+  const aClosed = flatA.rest === "empty";
+  const bClosed = flatB.rest === "empty";
+
+  if (onlyA.size > 0) {
+    // a has fields b doesn't — extend b's tail
+    if (bClosed) {
+      return {
+        ok: false,
+        reason: "closed record missing field(s): " + [...onlyA.keys()].join(","),
+      };
+    }
+  }
+  if (onlyB.size > 0) {
+    if (aClosed) {
+      return {
+        ok: false,
+        reason: "closed record missing field(s): " + [...onlyB.keys()].join(","),
+      };
+    }
+  }
+
+  // Now build tails.
+  // Case: both closed, no extras → done
+  if (aClosed && bClosed) {
+    if (onlyA.size === 0 && onlyB.size === 0) return { ok: true };
+    return { ok: false, reason: "closed rows differ" };
+  }
+
+  // a open: bind a.rest to a row containing onlyB + new shared tail (or empty if b closed)
+  // b open: bind b.rest to a row containing onlyA + new shared tail (or empty if a closed)
+  const aRest = flatA.rest;
+  const bRest = flatB.rest;
+
+  if (!aClosed && !bClosed) {
+    if (typeof aRest === "number" && typeof bRest === "number" && aRest === bRest) {
+      // same tail var — must have no extras
+      if (onlyA.size === 0 && onlyB.size === 0) return { ok: true };
+      return { ok: false, reason: "row tail aliasing prevents extension" };
+    }
+    // Fresh shared tail.
+    const sharedId = state.freshId();
+    const sharedTail: MType = { kind: "var", id: sharedId };
+    if (typeof aRest === "number") {
+      if (occurs(aRest, sharedTail, subst)) return { ok: false, reason: "occurs in row" };
+      const newARow: MType = { kind: "row", fields: onlyB, rest: sharedId };
+      subst.set(aRest, newARow);
+    }
+    if (typeof bRest === "number") {
+      if (occurs(bRest, sharedTail, subst)) return { ok: false, reason: "occurs in row" };
+      const newBRow: MType = { kind: "row", fields: onlyA, rest: sharedId };
+      subst.set(bRest, newBRow);
+    }
+    return { ok: true };
+  }
+
+  if (!aClosed && bClosed) {
+    // bind a.rest to closed row of onlyB
+    if (typeof aRest === "number") {
+      const newARow: MType = { kind: "row", fields: onlyB, rest: "empty" };
+      subst.set(aRest, newARow);
+    }
+    return { ok: true };
+  }
+
+  // aClosed && !bClosed
+  if (typeof bRest === "number") {
+    const newBRow: MType = { kind: "row", fields: onlyA, rest: "empty" };
+    subst.set(bRest, newBRow);
+  }
+  return { ok: true };
+}
+
 function unifyOrError(ctx: Ctx, expected: MType, got: MType, message: string): boolean {
-  const r = unify(expected, got, ctx.state.subst);
+  const r = unify(expected, got, ctx.state.subst, ctx.state);
   if (r.ok) return true;
   const ze = zonk(expected, ctx.state.subst);
   const zg = zonk(got, ctx.state.subst);
@@ -487,9 +630,6 @@ function unifyOrError(ctx: Ctx, expected: MType, got: MType, message: string): b
 // Generalization + instantiation
 // ---------------------------------------------------------------------------
 
-/**
- * Generalize: quantify over free vars in `t` that are NOT free in the env.
- */
 function generalize(t: MType, env: TypeEnv, subst: Substitution): MType {
   const tVars = new Set<number>();
   ftv(t, subst, tVars);
@@ -501,9 +641,6 @@ function generalize(t: MType, env: TypeEnv, subst: Substitution): MType {
   return { kind: "scheme", quantified, body: zonk(t, subst) };
 }
 
-/**
- * Instantiate a scheme with fresh type vars. Non-schemes pass through unchanged.
- */
 function instantiate(t: MType, state: State): MType {
   const r = t.kind === "scheme" ? t : null;
   if (r === null) return t;
@@ -512,7 +649,6 @@ function instantiate(t: MType, state: State): MType {
   return substVars(r.body, mapping);
 }
 
-/** Substitute a mapping of var-id → MType through a type. Used by instantiate. */
 function substVars(t: MType, mapping: Map<number, MType>): MType {
   switch (t.kind) {
     case "var": {
@@ -530,11 +666,18 @@ function substVars(t: MType, mapping: Map<number, MType>): MType {
       return t;
     case "array":
       return { kind: "array", elem: substVars(t.elem, mapping) };
-    case "record": {
+    case "row": {
       const fields = new Map<string, MType>();
       for (const [k, v] of t.fields) fields.set(k, substVars(v, mapping));
-      return { kind: "record", fields };
+      let rest = t.rest;
+      if (typeof rest === "number") {
+        const m = mapping.get(rest);
+        if (m !== undefined && m.kind === "var") rest = m.id;
+      }
+      return { kind: "row", fields, rest };
     }
+    case "record":
+      return { kind: "record", row: substVars(t.row, mapping) };
     case "fn":
       return {
         kind: "fn",
@@ -552,7 +695,6 @@ function substVars(t: MType, mapping: Map<number, MType>): MType {
         fields: t.fields.map((f) => substVars(f, mapping)),
       };
     case "scheme": {
-      // shadow quantified vars
       const innerMap = new Map(mapping);
       for (const q of t.quantified) innerMap.delete(q);
       return { kind: "scheme", quantified: t.quantified, body: substVars(t.body, innerMap) };
@@ -561,7 +703,7 @@ function substVars(t: MType, mapping: Map<number, MType>): MType {
 }
 
 // ---------------------------------------------------------------------------
-// Type annotation parsing (very small grammar — Phase 1)
+// Type annotation parsing
 // ---------------------------------------------------------------------------
 
 function parseTypeAnnotation(s: string): MType {
@@ -582,7 +724,6 @@ function parseTypeAnnotation(s: string): MType {
     case "unknown":
       return UNKNOWN;
     default:
-      // Phase 1: unrecognized annotations fall back to unknown
       return UNKNOWN;
   }
 }
@@ -592,17 +733,13 @@ function isUpperCase(s: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers for emitting NOT_YET_IMPLEMENTED
+// Helpers
 // ---------------------------------------------------------------------------
 
 function notYetImplemented(ctx: Ctx, op: string): MType {
-  addError(ctx, "NOT_YET_IMPLEMENTED", "op not yet implemented in Phase 1: " + op);
+  addError(ctx, "NOT_YET_IMPLEMENTED", "op not yet implemented: " + op);
   return ctx.state.freshVar();
 }
-
-// ---------------------------------------------------------------------------
-// Op signature helpers
-// ---------------------------------------------------------------------------
 
 function expectArity(ctx: Ctx, op: string, arr: Expr[], n: number): boolean {
   if (arr.length !== n + 1) {
@@ -629,12 +766,23 @@ function expectArityRange(ctx: Ctx, op: string, arr: Expr[], min: number, max: n
   return true;
 }
 
+/** Build an open record type with one known field, used for `get`/`set` constraints. */
+function openRecordWithField(state: State, key: string, fieldT: MType): MType {
+  const tailId = state.freshId();
+  const fields = new Map<string, MType>([[key, fieldT]]);
+  return { kind: "record", row: { kind: "row", fields, rest: tailId } };
+}
+
+/** Build a record type out of explicit row pieces. */
+function recordOf(fields: Map<string, MType>, rest: number | "empty"): MType {
+  return { kind: "record", row: { kind: "row", fields, rest } };
+}
+
 // ---------------------------------------------------------------------------
 // Inference (Algorithm W)
 // ---------------------------------------------------------------------------
 
 function infer(expr: Expr, env: TypeEnv, ctx: Ctx): MType {
-  // Atoms
   if (expr === null) return NULL_T;
   if (typeof expr === "boolean") return BOOL;
   if (typeof expr === "number") return Number.isInteger(expr) ? INT : FLOAT;
@@ -660,7 +808,6 @@ function infer(expr: Expr, env: TypeEnv, ctx: Ctx): MType {
   }
   const op = opExpr;
 
-  // Variant constructor (uppercase tag) — Phase 2 territory; check args, return fresh var.
   if (isUpperCase(op)) {
     for (let i = 1; i < arr.length; i++) {
       withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
@@ -676,9 +823,7 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
   const subst = state.subst;
 
   switch (op) {
-    // -------------------- bytes literal --------------------
     case "bytes": {
-      // Phase 1: ["bytes", ...args] is a bytes literal. Args (if any) are not type-checked deeply.
       return BYTES;
     }
 
@@ -790,7 +935,6 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
         );
         return state.freshVar();
       }
-      // 1) Pre-bind every name to a fresh type var.
       const placeholders: Record<string, MType> = {};
       const names: string[] = [];
       const vars: MType[] = [];
@@ -805,7 +949,6 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
         vars.push(v);
       }
       const recEnv = env.extend(placeholders);
-      // 2) Infer each body and unify with its placeholder.
       for (let i = 0; i < bindings.length; i++) {
         const binding = bindings[i];
         if (!Array.isArray(binding) || binding.length !== 2) continue;
@@ -821,7 +964,6 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
           ),
         );
       }
-      // 3) Generalize all bindings together against the OUTER env.
       const finalEnv = env.extend(
         Object.fromEntries(
           names.map((n, i) => [n, generalize(vars[i] as MType, env, subst)] as const),
@@ -882,8 +1024,6 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       }
       const ret = state.freshVar();
       const expected: MType = { kind: "fn", params: argTypes, ret };
-      // If the resolved fn is a known fn type, check arity explicitly so we get
-      // ARITY_ERROR (not TYPE_MISMATCH) when arities differ.
       const resolved = find(fnT, subst);
       if (resolved.kind === "fn" && resolved.params.length !== argTypes.length) {
         addError(
@@ -923,7 +1063,6 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       if (!expectArity(ctx, op, arr, 2)) return BOOL;
       const ta = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
       const tb = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
-      // Both sides must have the same type, but any type.
       withPath(ctx, 2, (sub) => unifyOrError(sub, ta, tb, op + " requires same-typed operands"));
       return BOOL;
     }
@@ -935,11 +1074,7 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       if (!expectArity(ctx, op, arr, 2)) return BOOL;
       const ta = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
       const tb = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
-      // Numeric: must unify with same numeric type (no widening).
-      // Allow either int or float; both sides must agree.
       withPath(ctx, 2, (sub) => unifyOrError(sub, ta, tb, op + " requires matching numeric types"));
-      // ta must be numeric (int or float). We can't enforce via unification of
-      // a sum type, but we can require the resolved type to be int/float/var/unknown.
       const rta = find(ta, subst);
       if (
         rta.kind !== "int" &&
@@ -964,7 +1099,6 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
     case "/":
     case "%":
     case "**": {
-      // Unary minus is handled with one arg.
       if (op === "-" && arr.length === 2) {
         const ta = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
         const rta = find(ta, subst);
@@ -987,9 +1121,7 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       if (!expectArity(ctx, op, arr, 2)) return state.freshVar();
       const ta = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
       const tb = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
-      // Both operands must be the same numeric type (no widening).
       withPath(ctx, 2, (sub) => unifyOrError(sub, ta, tb, op + " requires matching numeric types"));
-      // Check resolved type is numeric.
       const rta = find(ta, subst);
       const rtb = find(tb, subst);
       const aOk =
@@ -1012,7 +1144,6 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
           }),
         );
       }
-      // Prefer the more concrete side: if one operand is unknown, return the other.
       if (rta.kind === "unknown") return tb;
       return ta;
     }
@@ -1041,7 +1172,6 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       if (arr.length !== 2) {
         addError(ctx, "ARITY_ERROR", "untyped requires 1 arg");
       }
-      // Skip type-checking the inner expr entirely.
       return UNKNOWN;
     }
 
@@ -1113,6 +1243,22 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       withPath(ctx, 2, (sub) => unifyOrError(sub, STRING, a, "str-replace requires string"));
       withPath(ctx, 3, (sub) => unifyOrError(sub, STRING, b, "str-replace requires string"));
       return STRING;
+    }
+    case "str-get": {
+      if (!expectArity(ctx, "str-get", arr, 2)) return INT;
+      const s = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const i = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
+      withPath(ctx, 1, (sub) => unifyOrError(sub, STRING, s, "str-get requires string"));
+      withPath(ctx, 2, (sub) => unifyOrError(sub, INT, i, "str-get index must be int"));
+      return INT;
+    }
+    case "str-cmp": {
+      if (!expectArity(ctx, "str-cmp", arr, 2)) return INT;
+      const a = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const b = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
+      withPath(ctx, 1, (sub) => unifyOrError(sub, STRING, a, "str-cmp requires string"));
+      withPath(ctx, 2, (sub) => unifyOrError(sub, STRING, b, "str-cmp requires string"));
+      return INT;
     }
 
     // -------------------- array ops --------------------
@@ -1191,27 +1337,91 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       withPath(ctx, 2, (sub) => unifyOrError(sub, arrT, t2, "array-concat requires array"));
       return arrT;
     }
-    case "array-map": {
-      if (!expectArity(ctx, "array-map", arr, 2)) return state.freshVar();
+    case "concat": {
+      if (!expectArity(ctx, "concat", arr, 2)) return state.freshVar();
+      const t1 = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const t2 = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
+      // Polymorphic over array<T> or string
+      const r1 = find(t1, subst);
+      if (r1.kind === "string") {
+        withPath(ctx, 2, (sub) => unifyOrError(sub, STRING, t2, "concat requires string"));
+        return STRING;
+      }
+      if (r1.kind === "array") {
+        withPath(ctx, 2, (sub) => unifyOrError(sub, t1, t2, "concat: element type mismatch"));
+        return t1;
+      }
+      // Default: arrays.
+      const elem = state.freshVar();
+      const arrT: MType = { kind: "array", elem };
+      withPath(ctx, 1, (sub) => unifyOrError(sub, arrT, t1, "concat requires array or string"));
+      withPath(ctx, 2, (sub) => unifyOrError(sub, arrT, t2, "concat requires array or string"));
+      return arrT;
+    }
+    case "slice": {
+      if (!expectArityRange(ctx, "slice", arr, 2, 3)) return state.freshVar();
+      const t = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const a = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
+      withPath(ctx, 2, (sub) => unifyOrError(sub, INT, a, "slice index must be int"));
+      if (arr.length === 4) {
+        const b = withPath(ctx, 3, (sub) => infer(at(arr, 3), env, sub));
+        withPath(ctx, 3, (sub) => unifyOrError(sub, INT, b, "slice index must be int"));
+      }
+      const r = find(t, subst);
+      if (r.kind === "string") return STRING;
+      if (r.kind === "array") return t;
+      // var/unknown: assume array<a>.
+      const elem = state.freshVar();
+      const arrT: MType = { kind: "array", elem };
+      withPath(ctx, 1, (sub) => unifyOrError(sub, arrT, t, "slice requires array or string"));
+      return arrT;
+    }
+    case "array-map":
+    case "map": {
+      if (!expectArity(ctx, op, arr, 2)) return state.freshVar();
+      // map can apply to array or record.
+      // We pick array by default; record support: detect resolved input type.
       const fT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
       const aT = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
+      const resolved = find(aT, subst);
+      if (op === "map" && resolved.kind === "record") {
+        // map over record: fn(v) -> v', preserves keys, all values become v'.
+        const inV = state.freshVar();
+        const outV = state.freshVar();
+        withPath(ctx, 1, (sub) =>
+          unifyOrError(sub, { kind: "fn", params: [inV], ret: outV }, fT, op + ": expected fn"),
+        );
+        // The input record must have all values of type inV.
+        const tailIn = state.freshId();
+        const allVRowIn: MType = { kind: "row", fields: new Map(), rest: tailIn };
+        // We need all fields to be inV. Walk current row, unify each field with inV.
+        const flat = resolveRow(resolved.row, subst);
+        if (flat.kind === "row") {
+          for (const [, v] of flat.fields) {
+            withPath(ctx, 2, (sub) => unifyOrError(sub, inV, v, op + ": record field type"));
+          }
+          // Build output record with same keys but value type outV.
+          const outFields = new Map<string, MType>();
+          for (const [k] of flat.fields) outFields.set(k, outV);
+          return recordOf(outFields, flat.rest);
+        }
+        // Fallback: treat as open record with all-inV values.
+        void allVRowIn;
+        return { kind: "record", row: { kind: "row", fields: new Map(), rest: state.freshId() } };
+      }
       const inElem = state.freshVar();
       const outElem = state.freshVar();
       withPath(ctx, 1, (sub) =>
-        unifyOrError(
-          sub,
-          { kind: "fn", params: [inElem], ret: outElem },
-          fT,
-          "array-map: expected fn",
-        ),
+        unifyOrError(sub, { kind: "fn", params: [inElem], ret: outElem }, fT, op + ": expected fn"),
       );
       withPath(ctx, 2, (sub) =>
-        unifyOrError(sub, { kind: "array", elem: inElem }, aT, "array-map: expected array"),
+        unifyOrError(sub, { kind: "array", elem: inElem }, aT, op + ": expected array"),
       );
       return { kind: "array", elem: outElem };
     }
-    case "array-filter": {
-      if (!expectArity(ctx, "array-filter", arr, 2)) return state.freshVar();
+    case "array-filter":
+    case "filter": {
+      if (!expectArity(ctx, op, arr, 2)) return state.freshVar();
       const fT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
       const aT = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
       const elem = state.freshVar();
@@ -1220,32 +1430,33 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
           sub,
           { kind: "fn", params: [elem], ret: BOOL },
           fT,
-          "array-filter: expected fn(_) -> bool",
+          op + ": expected fn(_) -> bool",
         ),
       );
       withPath(ctx, 2, (sub) =>
-        unifyOrError(sub, { kind: "array", elem }, aT, "array-filter: expected array"),
+        unifyOrError(sub, { kind: "array", elem }, aT, op + ": expected array"),
       );
       return { kind: "array", elem };
     }
-    case "array-reduce": {
-      if (!expectArity(ctx, "array-reduce", arr, 3)) return state.freshVar();
+    case "array-reduce":
+    case "reduce": {
+      if (!expectArity(ctx, op, arr, 3)) return state.freshVar();
       const fT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
       const initT = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
       const aT = withPath(ctx, 3, (sub) => infer(at(arr, 3), env, sub));
       const acc = state.freshVar();
       const elem = state.freshVar();
-      withPath(ctx, 2, (sub) => unifyOrError(sub, acc, initT, "array-reduce init type"));
+      withPath(ctx, 2, (sub) => unifyOrError(sub, acc, initT, op + " init type"));
       withPath(ctx, 1, (sub) =>
         unifyOrError(
           sub,
           { kind: "fn", params: [acc, elem], ret: acc },
           fT,
-          "array-reduce: expected fn(acc, elem) -> acc",
+          op + ": expected fn(acc, elem) -> acc",
         ),
       );
       withPath(ctx, 3, (sub) =>
-        unifyOrError(sub, { kind: "array", elem }, aT, "array-reduce: expected array"),
+        unifyOrError(sub, { kind: "array", elem }, aT, op + ": expected array"),
       );
       return acc;
     }
@@ -1265,7 +1476,6 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       withPath(ctx, 2, (sub) =>
         unifyOrError(sub, { kind: "array", elem }, aT, "array-find: expected array"),
       );
-      // Phase 1: returns elem (Option<T> is a Phase 2 concern).
       return elem;
     }
     case "array-index-of": {
@@ -1376,10 +1586,8 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
         );
         return state.freshVar();
       }
-      // floor/ceil/round of int = int, of float = int.
       if (r.kind === "int") return INT;
       if (r.kind === "float") return INT;
-      // var/unknown: return INT (these ops produce int in standard semantics).
       return INT;
     }
     case "abs": {
@@ -1469,14 +1677,19 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
     case "count": {
       if (!expectArity(ctx, "count", arr, 1)) return INT;
       const t = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
-      // Accept array<_>; record support deferred to Phase 2.
       const r = find(t, subst);
-      if (r.kind === "array" || r.kind === "var" || r.kind === "unknown") {
+      if (
+        r.kind === "array" ||
+        r.kind === "record" ||
+        r.kind === "var" ||
+        r.kind === "unknown" ||
+        r.kind === "string"
+      ) {
         return INT;
       }
       withPath(ctx, 1, (sub) =>
-        addError(sub, "TYPE_MISMATCH", "count requires array, got " + typeName(r), {
-          expected: "array",
+        addError(sub, "TYPE_MISMATCH", "count requires array/record/string, got " + typeName(r), {
+          expected: "array | record | string",
           got: typeName(r),
         }),
       );
@@ -1514,6 +1727,24 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       withPath(ctx, 1, (sub) => unifyOrError(sub, STRING, t, "parse-float requires string"));
       return FLOAT;
     }
+    case "parse-number": {
+      if (!expectArity(ctx, "parse-number", arr, 1)) return FLOAT;
+      const t = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      withPath(ctx, 1, (sub) => unifyOrError(sub, STRING, t, "parse-number requires string"));
+      return FLOAT;
+    }
+    case "int->float": {
+      if (!expectArity(ctx, "int->float", arr, 1)) return FLOAT;
+      const t = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      withPath(ctx, 1, (sub) => unifyOrError(sub, INT, t, "int->float requires int"));
+      return FLOAT;
+    }
+    case "float->int": {
+      if (!expectArity(ctx, "float->int", arr, 1)) return INT;
+      const t = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      withPath(ctx, 1, (sub) => unifyOrError(sub, FLOAT, t, "float->int requires float"));
+      return INT;
+    }
 
     // -------------------- bitwise ops --------------------
     case "bit-and":
@@ -1536,36 +1767,260 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       return INT;
     }
 
-    // -------------------- Phase 2+ ops --------------------
+    // -------------------- record / row ops --------------------
+    case "record":
+    case "{}": {
+      // ["record", [k1, v1], [k2, v2], ...] or ["{}", ...] — closed record literal.
+      const fields = new Map<string, MType>();
+      for (let i = 1; i < arr.length; i++) {
+        const pair = arr[i];
+        if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "string") {
+          withPath(ctx, i, (sub) =>
+            addError(sub, "TYPE_MISMATCH", "record entry must be [key, value] with string key"),
+          );
+          continue;
+        }
+        const key = pair[0];
+        const valT = withPath(ctx, i, (sub) =>
+          withPath(sub, 1, (sub2) => infer(pair[1] as Expr, env, sub2)),
+        );
+        if (fields.has(key)) {
+          withPath(ctx, i, (sub) =>
+            addError(sub, "TYPE_MISMATCH", "duplicate field in record literal: " + key),
+          );
+        }
+        fields.set(key, valT);
+      }
+      return recordOf(fields, "empty");
+    }
+
     case "get":
-    case "get-in":
+    case "record-get": {
+      if (!expectArity(ctx, op, arr, 2)) return state.freshVar();
+      const rT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const keyExpr = arr[2];
+      // Allow string literal key for static row constraint.
+      if (typeof keyExpr !== "string") {
+        // Evaluate the key (must be string), but cannot constrain the row type.
+        const kT = withPath(ctx, 2, (sub) => infer(keyExpr as Expr, env, sub));
+        withPath(ctx, 2, (sub) => unifyOrError(sub, STRING, kT, op + " key must be string"));
+        // Without a static key, just require a record and return unknown.
+        const row = state.freshVar();
+        withPath(ctx, 1, (sub) =>
+          unifyOrError(sub, { kind: "record", row }, rT, op + " requires record"),
+        );
+        return state.freshVar();
+      }
+      const fieldT = state.freshVar();
+      const expected = openRecordWithField(state, keyExpr, fieldT);
+      withPath(ctx, 1, (sub) =>
+        unifyOrError(sub, expected, rT, op + " requires record with key " + keyExpr),
+      );
+      return fieldT;
+    }
+
     case "set":
-    case "set-in":
+    case "record-set": {
+      if (!expectArity(ctx, op, arr, 3)) return state.freshVar();
+      const rT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const keyExpr = arr[2];
+      const valT = withPath(ctx, 3, (sub) => infer(at(arr, 3), env, sub));
+      if (typeof keyExpr !== "string") {
+        withPath(ctx, 2, (sub) =>
+          addError(sub, "TYPE_MISMATCH", op + " key must be a string literal"),
+        );
+        return rT;
+      }
+      const fieldT = state.freshVar();
+      const expected = openRecordWithField(state, keyExpr, fieldT);
+      withPath(ctx, 1, (sub) =>
+        unifyOrError(sub, expected, rT, op + " requires record with key " + keyExpr),
+      );
+      withPath(ctx, 3, (sub) =>
+        unifyOrError(sub, fieldT, valT, op + ": value type mismatch for key " + keyExpr),
+      );
+      return rT;
+    }
+
+    case "record-del": {
+      if (!expectArity(ctx, "record-del", arr, 2)) return state.freshVar();
+      const rT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const keyExpr = arr[2];
+      // Just require record; deletion of an unknown key returns the same row (open).
+      const row = state.freshVar();
+      withPath(ctx, 1, (sub) =>
+        unifyOrError(sub, { kind: "record", row }, rT, "record-del requires record"),
+      );
+      if (typeof keyExpr !== "string") {
+        withPath(ctx, 2, (sub) =>
+          addError(sub, "TYPE_MISMATCH", "record-del key must be a string literal"),
+        );
+      }
+      return rT;
+    }
+
+    case "get-in": {
+      if (!expectArity(ctx, "get-in", arr, 2)) return state.freshVar();
+      const rT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const pathExpr = arr[2];
+      // Must be array of string|int. We can't constrain row types deeply unless
+      // path is a literal array of string literals.
+      if (!Array.isArray(pathExpr)) {
+        withPath(ctx, 2, (sub) =>
+          addError(sub, "TYPE_MISMATCH", "get-in path must be an array literal"),
+        );
+        return state.freshVar();
+      }
+      // If the path is a literal array (["array", k1, k2, ...] or just a JSON array literal in spec),
+      // walk it. Spec uses array<string|number>. If first elem is "array", treat it like such.
+      let segments: Expr[] = pathExpr;
+      if (segments.length > 0 && segments[0] === "array") segments = segments.slice(1);
+      // Walk through the row.
+      let cur: MType = rT;
+      for (const seg of segments) {
+        if (typeof seg === "string") {
+          const fieldT = state.freshVar();
+          const expected = openRecordWithField(state, seg, fieldT);
+          withPath(ctx, 1, (sub) => unifyOrError(sub, expected, cur, "get-in: missing key " + seg));
+          cur = fieldT;
+        } else if (typeof seg === "number") {
+          const elem = state.freshVar();
+          withPath(ctx, 1, (sub) =>
+            unifyOrError(sub, { kind: "array", elem }, cur, "get-in: index requires array"),
+          );
+          cur = elem;
+        } else {
+          // dynamic path segment — give up structurally
+          return state.freshVar();
+        }
+      }
+      return cur;
+    }
+
+    case "set-in": {
+      if (!expectArity(ctx, "set-in", arr, 3)) return state.freshVar();
+      const rT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const pathExpr = arr[2];
+      const valT = withPath(ctx, 3, (sub) => infer(at(arr, 3), env, sub));
+      if (!Array.isArray(pathExpr)) {
+        withPath(ctx, 2, (sub) =>
+          addError(sub, "TYPE_MISMATCH", "set-in path must be an array literal"),
+        );
+        return rT;
+      }
+      let segments: Expr[] = pathExpr;
+      if (segments.length > 0 && segments[0] === "array") segments = segments.slice(1);
+      let cur: MType = rT;
+      for (let si = 0; si < segments.length; si++) {
+        const seg = segments[si];
+        const isLast = si === segments.length - 1;
+        if (typeof seg === "string") {
+          const fieldT = isLast ? valT : state.freshVar();
+          const expected = openRecordWithField(state, seg, fieldT);
+          withPath(ctx, 1, (sub) => unifyOrError(sub, expected, cur, "set-in: missing key " + seg));
+          cur = fieldT;
+        } else if (typeof seg === "number") {
+          const elem = isLast ? valT : state.freshVar();
+          withPath(ctx, 1, (sub) =>
+            unifyOrError(sub, { kind: "array", elem }, cur, "set-in: index requires array"),
+          );
+          cur = elem;
+        } else {
+          return rT;
+        }
+      }
+      return rT;
+    }
+
     case "merge":
+    case "record-merge": {
+      if (!expectArity(ctx, op, arr, 2)) return state.freshVar();
+      const aT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const bT = withPath(ctx, 2, (sub) => infer(at(arr, 2), env, sub));
+      // Both must be records. Result is a closed record with all keys from both,
+      // b winning on conflict.
+      const rowA = state.freshVar();
+      const rowB = state.freshVar();
+      withPath(ctx, 1, (sub) =>
+        unifyOrError(sub, { kind: "record", row: rowA }, aT, op + ": expected record"),
+      );
+      withPath(ctx, 2, (sub) =>
+        unifyOrError(sub, { kind: "record", row: rowB }, bT, op + ": expected record"),
+      );
+      // Try to compute merged row from zonked sides.
+      const za = zonk(aT, subst);
+      const zb = zonk(bT, subst);
+      if (za.kind === "record" && zb.kind === "record") {
+        const ra = resolveRow(za.row, subst);
+        const rb = resolveRow(zb.row, subst);
+        if (ra.kind === "row" && rb.kind === "row") {
+          const merged = new Map<string, MType>(ra.fields);
+          for (const [k, v] of rb.fields) merged.set(k, v);
+          // If both closed, result is closed; else open with fresh tail.
+          if (ra.rest === "empty" && rb.rest === "empty") {
+            return recordOf(merged, "empty");
+          }
+          return recordOf(merged, state.freshId());
+        }
+      }
+      // Fallback: fully open record.
+      return { kind: "record", row: { kind: "row", fields: new Map(), rest: state.freshId() } };
+    }
+
     case "keys":
+    case "record-keys": {
+      if (!expectArity(ctx, op, arr, 1)) return { kind: "array", elem: STRING };
+      const rT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const row = state.freshVar();
+      withPath(ctx, 1, (sub) =>
+        unifyOrError(sub, { kind: "record", row }, rT, op + ": expected record"),
+      );
+      return { kind: "array", elem: STRING };
+    }
+
     case "vals":
-    case "record-get":
-    case "record-set":
-    case "record-del":
-    case "record-keys":
-    case "record-vals":
-    case "record-merge":
+    case "record-vals": {
+      if (!expectArity(ctx, op, arr, 1)) return state.freshVar();
+      const rT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const elem = state.freshVar();
+      const row = state.freshVar();
+      withPath(ctx, 1, (sub) =>
+        unifyOrError(sub, { kind: "record", row }, rT, op + ": expected record"),
+      );
+      // Walk current fields and unify each with elem (consistent unification).
+      const z = zonk(rT, subst);
+      if (z.kind === "record") {
+        const flat = resolveRow(z.row, subst);
+        if (flat.kind === "row") {
+          for (const [, v] of flat.fields) {
+            withPath(ctx, 1, (sub) => unifyOrError(sub, elem, v, op + ": value type"));
+          }
+        }
+      }
+      return { kind: "array", elem };
+    }
+
+    case "record-has": {
+      if (!expectArity(ctx, "record-has", arr, 2)) return BOOL;
+      const rT = withPath(ctx, 1, (sub) => infer(at(arr, 1), env, sub));
+      const row = state.freshVar();
+      withPath(ctx, 1, (sub) =>
+        unifyOrError(sub, { kind: "record", row }, rT, "record-has: expected record"),
+      );
+      const keyExpr = arr[2];
+      if (typeof keyExpr !== "string") {
+        const kT = withPath(ctx, 2, (sub) => infer(keyExpr as Expr, env, sub));
+        withPath(ctx, 2, (sub) => unifyOrError(sub, STRING, kT, "record-has: key must be string"));
+      }
+      return BOOL;
+    }
+
+    // -------------------- Phase 3+ ops --------------------
     case "match":
     case "perform":
     case "handle":
     case "call.method":
-    case "?":
-    case "map":
-    case "filter":
-    case "reduce":
-    case "concat":
-    case "slice":
-    case "str-get":
-    case "str-cmp":
-    case "parse-number":
-    case "int->float":
-    case "float->int": {
-      // Still type-check sub-exprs to collect useful errors, but flag this op as not-yet-impl.
+    case "?": {
       for (let i = 1; i < arr.length; i++) {
         withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
       }
@@ -1594,11 +2049,10 @@ export function typecheck(expr: Expr, env?: TypeEnv): TypecheckResult {
 }
 
 // ---------------------------------------------------------------------------
-// Module typechecking (Phase 1: minimal — main expression with import stubs).
+// Module typechecking
 // ---------------------------------------------------------------------------
 
 const STD_TYPE_BINDINGS: Record<string, MType> = {
-  // Phase 2 will replace these with proper polymorphic schemes.
   None: { kind: "variant", tag: "None", fields: [] },
   Some: { kind: "variant", tag: "Some", fields: [UNKNOWN] },
   Ok: { kind: "variant", tag: "Ok", fields: [UNKNOWN] },
