@@ -178,6 +178,177 @@ export const STD_BINDINGS: StdBinding[] = [
   // --- String helpers ---
   { name: "str-empty?", expr: ["fn", ["s"], ["==", ["str-len", "s"], 0]] },
   { name: "bool->str", expr: ["fn", ["b"], ["to-string", "b"]] },
+
+  // --- Higher-order collection functions ---
+  // map, filter, reduce delegate to primitives of the same name.
+  { name: "map", expr: ["fn", ["f", "xs"], ["map", "f", "xs"]] },
+  { name: "filter", expr: ["fn", ["f", "xs"], ["filter", "f", "xs"]] },
+  { name: "reduce", expr: ["fn", ["f", "init", "xs"], ["reduce", "f", "init", "xs"]] },
+
+  // find: return first element matching predicate, or null.
+  {
+    name: "find",
+    expr: [
+      "letrec",
+      [
+        [
+          "go",
+          [
+            "fn",
+            ["f", "xs", "i"],
+            [
+              "if",
+              ["==", "i", ["count", "xs"]],
+              null,
+              [
+                "if",
+                ["call", "f", ["array-get", "xs", "i"]],
+                ["array-get", "xs", "i"],
+                ["call", "go", "f", "xs", ["+", "i", 1]],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["f", "xs"], ["call", "go", "f", "xs", 0]],
+    ],
+  },
+
+  // every: true if predicate holds for all elements.
+  {
+    name: "every",
+    expr: [
+      "letrec",
+      [
+        [
+          "go",
+          [
+            "fn",
+            ["f", "xs", "i"],
+            [
+              "if",
+              ["==", "i", ["count", "xs"]],
+              true,
+              [
+                "if",
+                ["call", "f", ["array-get", "xs", "i"]],
+                ["call", "go", "f", "xs", ["+", "i", 1]],
+                false,
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["f", "xs"], ["call", "go", "f", "xs", 0]],
+    ],
+  },
+
+  // any: true if predicate holds for at least one element.
+  // Named "any" to avoid conflict with the option constructor "some".
+  {
+    name: "any",
+    expr: [
+      "letrec",
+      [
+        [
+          "go",
+          [
+            "fn",
+            ["f", "xs", "i"],
+            [
+              "if",
+              ["==", "i", ["count", "xs"]],
+              false,
+              [
+                "if",
+                ["call", "f", ["array-get", "xs", "i"]],
+                true,
+                ["call", "go", "f", "xs", ["+", "i", 1]],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["f", "xs"], ["call", "go", "f", "xs", 0]],
+    ],
+  },
+
+  // flat-map: map then flatten one level.
+  {
+    name: "flat-map",
+    expr: [
+      "fn",
+      ["f", "xs"],
+      [
+        "reduce",
+        [
+          "fn",
+          ["acc", "x"],
+          ["reduce", ["fn", ["a", "y"], ["array-push", "a", "y"]], "acc", ["call", "f", "x"]],
+        ],
+        ["array"],
+        "xs",
+      ],
+    ],
+  },
+
+  // includes: true if value is in array (structural equality).
+  {
+    name: "includes",
+    expr: [
+      "letrec",
+      [
+        [
+          "go",
+          [
+            "fn",
+            ["xs", "v", "i"],
+            [
+              "if",
+              ["==", "i", ["count", "xs"]],
+              false,
+              [
+                "if",
+                ["==", ["array-get", "xs", "i"], "v"],
+                true,
+                ["call", "go", "xs", "v", ["+", "i", 1]],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["xs", "v"], ["call", "go", "xs", "v", 0]],
+    ],
+  },
+
+  // index-of: return index of first occurrence of value, or -1 if not found.
+  {
+    name: "index-of",
+    expr: [
+      "letrec",
+      [
+        [
+          "go",
+          [
+            "fn",
+            ["xs", "v", "i"],
+            [
+              "if",
+              ["==", "i", ["count", "xs"]],
+              -1,
+              [
+                "if",
+                ["==", ["array-get", "xs", "i"], "v"],
+                "i",
+                ["call", "go", "xs", "v", ["+", "i", 1]],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["xs", "v"], ["call", "go", "xs", "v", 0]],
+    ],
+  },
 ];
 
 export const STD_EXPORT_NAMES: string[] = STD_BINDINGS.map((b) => b.name);

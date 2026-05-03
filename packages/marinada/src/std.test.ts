@@ -416,6 +416,221 @@ describe("lib:std", () => {
     });
   });
 
+  describe("Higher-order collection functions", () => {
+    describe("map", () => {
+      it("maps a function over an array", () => {
+        const r = stdModule(
+          ["map"],
+          ["call", "map", ["fn", ["x"], ["+", "x", 1]], ["array", 1, 2, 3]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok)
+          expect(r.value).toMatchObject({
+            kind: "array",
+            value: [
+              { kind: "int", value: 2n },
+              { kind: "int", value: 3n },
+              { kind: "int", value: 4n },
+            ],
+          });
+      });
+
+      it("returns empty array for empty input", () => {
+        const r = stdModule(["map"], ["call", "map", ["fn", ["x"], ["+", "x", 1]], ["array"]]);
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "array", value: [] });
+      });
+    });
+
+    describe("filter", () => {
+      it("keeps only elements matching the predicate", () => {
+        const r = stdModule(
+          ["filter"],
+          ["call", "filter", ["fn", ["x"], [">", "x", 2]], ["array", 1, 2, 3, 4]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok)
+          expect(r.value).toMatchObject({
+            kind: "array",
+            value: [
+              { kind: "int", value: 3n },
+              { kind: "int", value: 4n },
+            ],
+          });
+      });
+
+      it("returns empty array when nothing matches", () => {
+        const r = stdModule(
+          ["filter"],
+          ["call", "filter", ["fn", ["x"], [">", "x", 10]], ["array", 1, 2, 3]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "array", value: [] });
+      });
+    });
+
+    describe("reduce", () => {
+      it("reduces an array to a single value", () => {
+        const r = stdModule(
+          ["reduce"],
+          ["call", "reduce", ["fn", ["acc", "x"], ["+", "acc", "x"]], 0, ["array", 1, 2, 3, 4]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "int", value: 10n });
+      });
+
+      it("returns init for empty array", () => {
+        const r = stdModule(
+          ["reduce"],
+          ["call", "reduce", ["fn", ["acc", "x"], ["+", "acc", "x"]], 99, ["array"]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "int", value: 99n });
+      });
+    });
+
+    describe("find", () => {
+      it("returns first matching element", () => {
+        const r = stdModule(
+          ["find"],
+          ["call", "find", ["fn", ["x"], [">", "x", 2]], ["array", 1, 2, 3, 4]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "int", value: 3n });
+      });
+
+      it("returns null when no element matches", () => {
+        const r = stdModule(
+          ["find"],
+          ["call", "find", ["fn", ["x"], [">", "x", 10]], ["array", 1, 2, 3]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "null" });
+      });
+    });
+
+    describe("every", () => {
+      it("returns true when all elements match", () => {
+        const r = stdModule(
+          ["every"],
+          ["call", "every", ["fn", ["x"], [">", "x", 0]], ["array", 1, 2, 3]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "bool", value: true });
+      });
+
+      it("returns false when any element fails", () => {
+        const r = stdModule(
+          ["every"],
+          ["call", "every", ["fn", ["x"], [">", "x", 1]], ["array", 1, 2, 3]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "bool", value: false });
+      });
+
+      it("returns true for empty array", () => {
+        const r = stdModule(["every"], ["call", "every", ["fn", ["x"], [">", "x", 0]], ["array"]]);
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "bool", value: true });
+      });
+    });
+
+    describe("any", () => {
+      it("returns true when at least one element matches", () => {
+        const r = stdModule(
+          ["any"],
+          ["call", "any", ["fn", ["x"], [">", "x", 2]], ["array", 1, 2, 3]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "bool", value: true });
+      });
+
+      it("returns false when no element matches", () => {
+        const r = stdModule(
+          ["any"],
+          ["call", "any", ["fn", ["x"], [">", "x", 10]], ["array", 1, 2, 3]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "bool", value: false });
+      });
+
+      it("returns false for empty array", () => {
+        const r = stdModule(["any"], ["call", "any", ["fn", ["x"], [">", "x", 0]], ["array"]]);
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "bool", value: false });
+      });
+    });
+
+    describe("flat-map", () => {
+      it("maps and flattens one level", () => {
+        const r = stdModule(
+          ["flat-map"],
+          ["call", "flat-map", ["fn", ["x"], ["array", "x", ["+", "x", 10]]], ["array", 1, 2]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok)
+          expect(r.value).toMatchObject({
+            kind: "array",
+            value: [
+              { kind: "int", value: 1n },
+              { kind: "int", value: 11n },
+              { kind: "int", value: 2n },
+              { kind: "int", value: 12n },
+            ],
+          });
+      });
+
+      it("returns empty array for empty input", () => {
+        const r = stdModule(
+          ["flat-map"],
+          ["call", "flat-map", ["fn", ["x"], ["array", "x"]], ["array"]],
+        );
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "array", value: [] });
+      });
+    });
+
+    describe("includes", () => {
+      it("returns true when value is present", () => {
+        const r = stdModule(["includes"], ["call", "includes", ["array", 1, 2, 3], 2]);
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "bool", value: true });
+      });
+
+      it("returns false when value is absent", () => {
+        const r = stdModule(["includes"], ["call", "includes", ["array", 1, 2, 3], 5]);
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "bool", value: false });
+      });
+
+      it("returns false for empty array", () => {
+        const r = stdModule(["includes"], ["call", "includes", ["array"], 1]);
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "bool", value: false });
+      });
+    });
+
+    describe("index-of", () => {
+      it("returns index of first matching value", () => {
+        const r = stdModule(["index-of"], ["call", "index-of", ["array", 10, 20, 30], 20]);
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "int", value: 1n });
+      });
+
+      it("returns -1 when value is not found", () => {
+        const r = stdModule(["index-of"], ["call", "index-of", ["array", 10, 20, 30], 99]);
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "int", value: -1n });
+      });
+
+      it("returns index of first occurrence for duplicates", () => {
+        const r = stdModule(["index-of"], ["call", "index-of", ["array", 5, 5, 5], 5]);
+        expect(r.ok).toBe(true);
+        if (r.ok) expect(r.value).toMatchObject({ kind: "int", value: 0n });
+      });
+    });
+  });
+
   describe("some / none / ok / err constructors", () => {
     it("some wraps a value in Some", () => {
       const r = callStd("some", 5);
