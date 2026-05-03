@@ -216,6 +216,45 @@ const RUNTIME = {
   },
 };
 
+// --- Natives table ---
+
+const NATIVES = {
+  array_map(xs: unknown, f: unknown): unknown[] {
+    return (xs as unknown[]).map((x) => (f as (v: unknown) => unknown)(x));
+  },
+  array_filter(xs: unknown, f: unknown): unknown[] {
+    return (xs as unknown[]).filter((x) => (f as (v: unknown) => boolean)(x));
+  },
+  array_reduce(xs: unknown, f: unknown, init: unknown): unknown {
+    return (xs as unknown[]).reduce(
+      (a: unknown, b: unknown) => (f as (a: unknown, b: unknown) => unknown)(a, b),
+      init,
+    );
+  },
+  array_find(xs: unknown, f: unknown): unknown {
+    return (xs as unknown[]).find((x) => (f as (v: unknown) => boolean)(x)) ?? null;
+  },
+  array_every(xs: unknown, f: unknown): boolean {
+    return (xs as unknown[]).every((x) => (f as (v: unknown) => boolean)(x));
+  },
+  array_any(xs: unknown, f: unknown): boolean {
+    return (xs as unknown[]).some((x) => (f as (v: unknown) => boolean)(x));
+  },
+  array_flat_map(xs: unknown, f: unknown): unknown[] {
+    return (xs as unknown[]).flatMap((x) => (f as (v: unknown) => unknown[])(x));
+  },
+  array_includes(xs: unknown, v: unknown): boolean {
+    return (xs as unknown[]).some((x) => _eq(x, v));
+  },
+  array_index_of(xs: unknown, v: unknown): bigint {
+    const arr = xs as unknown[];
+    for (let i = 0; i < arr.length; i++) {
+      if (_eq(arr[i], v)) return BigInt(i);
+    }
+    return -1n;
+  },
+};
+
 // --- Compiler ---
 
 // Set of locally-bound variable names that should be referenced directly,
@@ -223,26 +262,49 @@ const RUNTIME = {
 type CompileCtx = {
   path: number[];
   locals: ReadonlySet<string>;
+  /** When inside a __loop body, the loop parameter names for __continue. */
+  loopParams: string[] | null;
 };
 
 function emptyCtx(): CompileCtx {
-  return { path: [], locals: new Set() };
+  return { path: [], locals: new Set(), loopParams: null };
 }
 
 function childCtx(ctx: CompileCtx, i: number): CompileCtx {
-  return { path: [...ctx.path, i], locals: ctx.locals };
+  return { path: [...ctx.path, i], locals: ctx.locals, loopParams: ctx.loopParams };
 }
 
 function withLocals(ctx: CompileCtx, names: string[]): CompileCtx {
   const newLocals = new Set(ctx.locals);
   for (const n of names) newLocals.add(n);
-  return { path: ctx.path, locals: newLocals };
+  return { path: ctx.path, locals: newLocals, loopParams: ctx.loopParams };
 }
 
 // Resolve a variable name — local JS variable or env lookup
 function varRef(name: string, ctx: CompileCtx): string {
   if (ctx.locals.has(name)) return name;
   return `env[${JSON.stringify(name)}]`;
+}
+
+/** Serialize a JS value as a JS literal string, matching the JIT's value representation. */
+function serializeLit(v: unknown): string {
+  if (v === null) return "null";
+  if (typeof v === "boolean") return v ? "true" : "false";
+  if (typeof v === "bigint") return `${v}n`;
+  if (typeof v === "number") return String(v);
+  if (typeof v === "string") return JSON.stringify(v);
+  if (Array.isArray(v)) {
+    return `[${(v as unknown[]).map(serializeLit).join(", ")}]`;
+  }
+  if (typeof v === "object") {
+    // Plain object → JS object literal (JIT record representation)
+    const o = v as Record<string, unknown>;
+    const entries = Object.entries(o).map(
+      ([k, val]) => `${JSON.stringify(k)}: ${serializeLit(val)}`,
+    );
+    return `{${entries.join(", ")}}`;
+  }
+  throw new Error(`serializeLit: unsupported value type: ${typeof v}`);
 }
 
 function compileExpr(expr: Expr, ctx: CompileCtx): string {
@@ -356,6 +418,7 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
         const valCode = compileExpr(binding[1] as Expr, {
           path: childCtx(ctx, i).path,
           locals: currentCtx.locals,
+          loopParams: ctx.loopParams,
         });
         bindingData.push({ name, valCode });
         // After this binding, name is a local
@@ -363,7 +426,11 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
       }
 
       // Compile body with all bindings as locals
-      let bodyCode = compileExpr(body, { path: childCtx(ctx, 2).path, locals: currentCtx.locals });
+      let bodyCode = compileExpr(body, {
+        path: childCtx(ctx, 2).path,
+        locals: currentCtx.locals,
+        loopParams: ctx.loopParams,
+      });
 
       // Wrap from innermost outward
       for (let i = bindingData.length - 1; i >= 0; i--) {
@@ -432,11 +499,13 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
           ]);
         }
       }
-      // fn body: params are locals
+      // fn body: params are locals. fn creates a new scope, so __continue from an outer
+      // loop cannot appear inside fn body — reset loopParams to null.
       const fnCtx = withLocals(ctx, params);
       const bodyCode = compileExpr(arr[2] as Expr, {
         path: childCtx(ctx, 2).path,
         locals: fnCtx.locals,
+        loopParams: null,
       });
       return `((${params.join(", ")}) => ${bodyCode})`;
     }
@@ -634,6 +703,7 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
         const bodyCode = compileExpr(body, {
           path: childCtx(ctx, i + 2).path,
           locals: bodyCtx.locals,
+          loopParams: ctx.loopParams,
         });
         clauseCodes.push(`if($s.$tag===${JSON.stringify(tag)}){${bindings}return ${bodyCode}}`);
       }
@@ -688,6 +758,76 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
     case "handle":
       throw new CompileError("handle cannot be compiled (use interpreter for effects)", ctx.path);
 
+    case "__native": {
+      // ["__native", name, ...args]
+      const name = arr[1];
+      if (typeof name !== "string") {
+        throw new CompileError("__native: first arg must be a function name string", ctx.path);
+      }
+      const argCodes = arr.slice(2).map((e, i) => compileExpr(e as Expr, childCtx(ctx, i + 2)));
+      return `_nat.${name}(${argCodes.join(", ")})`;
+    }
+
+    case "__lit": {
+      // ["__lit", value]
+      if (arr.length !== 2) {
+        throw new CompileError("__lit: requires exactly one argument", ctx.path);
+      }
+      return serializeLit(arr[1]);
+    }
+
+    case "__loop": {
+      // ["__loop", params, initArgs, body]
+      // Uses a sentinel exception (_LoopContinue) so __continue works from any expression depth.
+      // Emits:
+      //   (()=>{ let p1=init1, ...; while(true){ try{ return (body) }catch(_lc){ if(_lc instanceof _LoopContinue){ p1=_lc._v[0]; ...; continue } throw _lc } } })()
+      const params = arr[1];
+      const initArgs = arr[2];
+      const body = arr[3] as Expr;
+      if (!Array.isArray(params) || !Array.isArray(initArgs)) {
+        throw new CompileError("__loop: params and initArgs must be arrays", ctx.path);
+      }
+      if (params.length !== initArgs.length) {
+        throw new CompileError("__loop: params and initArgs must have the same length", ctx.path);
+      }
+      const paramNames: string[] = [];
+      for (let i = 0; i < params.length; i++) {
+        const p = params[i];
+        if (typeof p !== "string") {
+          throw new CompileError("__loop: param names must be strings", ctx.path);
+        }
+        paramNames.push(p);
+      }
+      const initCodes = (initArgs as Expr[]).map((e, i) => compileExpr(e, childCtx(ctx, i + 2)));
+      const decls = paramNames.map((p, i) => `let ${p} = ${initCodes[i] as string}`).join("; ");
+      const bodyCtx: CompileCtx = {
+        path: childCtx(ctx, 3).path,
+        locals: withLocals(ctx, paramNames).locals,
+        loopParams: paramNames,
+      };
+      const bodyCode = compileExpr(body, bodyCtx);
+      const assigns = paramNames.map((p, i) => `${p} = _lc._v[${i}]`).join("; ");
+      return `(()=>{ ${decls}; while(true){ try{ return (${bodyCode}) }catch(_lc){ if(_lc instanceof _LoopContinue){ ${assigns}; continue } throw _lc } } })()`;
+    }
+
+    case "__continue": {
+      // ["__continue", ...newArgs]
+      // Throws a LoopContinue sentinel carrying the new loop variable values.
+      // Only valid inside __loop body.
+      if (ctx.loopParams === null) {
+        throw new CompileError("__continue outside __loop", ctx.path);
+      }
+      const loopParams = ctx.loopParams;
+      const newArgCodes = arr.slice(1).map((e, i) => compileExpr(e as Expr, childCtx(ctx, i + 1)));
+      if (newArgCodes.length !== loopParams.length) {
+        throw new CompileError(
+          `__continue: expected ${loopParams.length} args, got ${newArgCodes.length}`,
+          ctx.path,
+        );
+      }
+      return `(()=>{ throw new _LoopContinue([${newArgCodes.join(", ")}]); })()`;
+    }
+
     default:
       throw new CompileError(`unknown op: ${op}`, ctx.path);
   }
@@ -719,11 +859,16 @@ function compileIsCheck(typStr: string, valExpr: string): string {
   }
 }
 
+// Sentinel class for __loop/__continue: thrown by __continue, caught by __loop.
+class _LoopContinue {
+  constructor(public readonly _v: unknown[]) {}
+}
+
 // Compile a Marinada expression to a native JS function.
 // Throws CompileError if the expression cannot be compiled (e.g. uses effects).
 export function compile(expr: Expr): JitFn {
   const body = compileExpr(expr, emptyCtx());
   // eslint-disable-next-line no-new-func
-  const raw = new Function("env", "_rt", `return (${body})`);
-  return (env: Record<string, unknown>) => raw(env, RUNTIME);
+  const raw = new Function("env", "_rt", "_nat", "_LoopContinue", `return (${body})`);
+  return (env: Record<string, unknown>) => raw(env, RUNTIME, NATIVES, _LoopContinue);
 }

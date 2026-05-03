@@ -317,6 +317,11 @@ type Ctx = {
    * works).
    */
   currentEffects: MType;
+  /**
+   * Optional per-node type index for buildTypeInfo. When present, `infer`
+   * records the inferred type and the effect row snapshot at each path.
+   */
+  typeIndex?: Map<string, { type: MType; effectsRowId: MType }>;
 };
 
 function addError(
@@ -338,6 +343,7 @@ function withPath<T>(ctx: Ctx, idx: number, fn: (sub: Ctx) => T): T {
     effectSigs: ctx.effectSigs,
     capMethods: ctx.capMethods,
     currentEffects: ctx.currentEffects,
+    ...(ctx.typeIndex !== undefined ? { typeIndex: ctx.typeIndex } : {}),
   };
   return fn(sub);
 }
@@ -1005,6 +1011,17 @@ function absorbEffects(source: MType, ctx: Ctx): void {
 // ---------------------------------------------------------------------------
 
 function infer(expr: Expr, env: TypeEnv, ctx: Ctx): MType {
+  const result = _infer(expr, env, ctx);
+  if (ctx.typeIndex !== undefined) {
+    const key = JSON.stringify(ctx.path);
+    if (!ctx.typeIndex.has(key)) {
+      ctx.typeIndex.set(key, { type: result, effectsRowId: ctx.currentEffects });
+    }
+  }
+  return result;
+}
+
+function _infer(expr: Expr, env: TypeEnv, ctx: Ctx): MType {
   if (expr === null) return NULL_T;
   if (typeof expr === "boolean") return BOOL;
   if (typeof expr === "number") return Number.isInteger(expr) ? INT : FLOAT;
@@ -3868,6 +3885,84 @@ function registerModuleTypeDefs(
     }
     typeDefs.set(def.name, { params: [], variants });
   }
+}
+
+// ---------------------------------------------------------------------------
+// TypeInfo — per-subexpression type index
+// ---------------------------------------------------------------------------
+
+/** Query interface for per-node type information after inference. */
+export type TypeInfo = {
+  /** Return the inferred type at the given path, or null if the path is unknown. */
+  typeOf(path: number[]): MType | null;
+  /** Return the effect row type at the given path, or null if not applicable. */
+  effectsOf(path: number[]): MType | null;
+  /** True only when the effect row at the given path is a concretely empty closed row. */
+  isPure(path: number[]): boolean;
+};
+
+/**
+ * Run inference on `expr` and build a TypeInfo index keyed by path.
+ * `typeOf([])` returns the type of the root expression.
+ * `typeOf([1])` returns the type of the first argument.
+ * etc.
+ *
+ * `isPure` returns false for unknown/free rows — conservative.
+ */
+export function buildTypeInfo(expr: Expr, env?: TypeEnv): TypeInfo {
+  const state = new State();
+  const { typeDefs, ctors } = makeStdTypeDefs();
+  const effectSigs = makeStdEffectSigs(state);
+  // typeIndex maps JSON-serialized path → {type, effectsRowId}
+  // effectsRowId is the MType reference of currentEffects at the time infer() was called.
+  const rawIndex = new Map<string, { type: MType; effectsRowId: MType }>();
+
+  const useEnv = env ?? EMPTY_TYPE_ENV;
+  const currentEffects = freshEffectsRow(state);
+
+  const baseCtx: Ctx = {
+    errors: [],
+    path: [],
+    state,
+    typeDefs,
+    ctors,
+    effectSigs,
+    capMethods: makeBuiltinCapMethods(),
+    currentEffects,
+    typeIndex: rawIndex,
+  };
+
+  // Run inference — this populates rawIndex with per-path types and effect row refs.
+  infer(expr, useEnv, baseCtx);
+
+  function pathKey(path: number[]): string {
+    return JSON.stringify(path);
+  }
+
+  function isEmptyClosedRow(t: MType): boolean {
+    const r = zonk(t, state.subst);
+    if (r.kind !== "row") return false;
+    if (r.fields.size !== 0) return false;
+    return r.rest === "empty";
+  }
+
+  return {
+    typeOf(path: number[]): MType | null {
+      const entry = rawIndex.get(pathKey(path));
+      if (!entry) return null;
+      return zonk(entry.type, state.subst);
+    },
+    effectsOf(path: number[]): MType | null {
+      const entry = rawIndex.get(pathKey(path));
+      if (!entry) return null;
+      return zonk(entry.effectsRowId, state.subst);
+    },
+    isPure(path: number[]): boolean {
+      const entry = rawIndex.get(pathKey(path));
+      if (!entry) return false;
+      return isEmptyClosedRow(entry.effectsRowId);
+    },
+  };
 }
 
 export function typecheckModule(module: Module): TypecheckResult {
