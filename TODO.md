@@ -1,6 +1,6 @@
 # TODO
 
-### [ ] Marinada: implement linearity enforcement
+### [x] Marinada: implement linearity enforcement
 
 Type representation (`{ kind: "linear"; inner: MType }`) exists in typecheck.ts:17 but has zero enforcement. No use-once validation, no affine/linear distinction, no destructor mechanism. Spec: docs/marinada.md lines 507-551.
 
@@ -24,15 +24,15 @@ Linear values captured in closures are not checked — the linearity pass counts
 
 Linear values passed across a `letrec` recursion boundary are not modelled — the pass doesn't detect duplication through mutual recursion. Needs either forbidding linear values in recursive bindings or more careful use-count modelling across the SCC.
 
-### [ ] Marinada: error on unhandled effects at module scope
+### [x] Marinada: error on unhandled effects at module scope
 
 `perform` without an enclosing `handle` currently typechecks — the effect row floats up with no top-level constraint. Module-level main expressions should be constrained to a pure (empty) effect row, so unhandled effects are caught at the boundary rather than silently accepted.
 
-### [ ] Marinada: consider `$` prefix for pattern bindings (from defocus)
+### [ ] Marinada: match only works on variants — no literal pattern matching
 
-Lowercase-string-as-binding in `match` has a latent bug: `["match", x, ["friendly", body]]` binds `"friendly"` as a variable instead of matching the literal string. This hasn't surfaced in Dusklight because variant tags are uppercase, but defocus hit it immediately when matching plain string payloads.
+`match` in the evaluator only handles variant destructuring (evaluate.ts:1317 checks `scrutVal.kind !== "variant"`). There is no literal string/int/bool pattern matching. The pattern structure is always `[tag, binding1, binding2, ...]` — the tag is always matched as a variant tag, the rest always bound as variables. No ambiguity exists.
 
-defocus adopted `$`-prefixed bindings (`"$x"`) to resolve the ambiguity. Consider aligning Marinada — `_` for wildcard, `$name` for bindings, everything else is literal. Breaking change: audit existing `match` expressions in Dusklight for lowercase bindings that would need `$` prefix.
+If literal pattern matching is needed (e.g. matching on a plain string payload), `match` needs to be extended — or use `cond` with `==` comparisons instead. The `$` prefix idea from defocus is not applicable here since Marinada's `match` is variant-only.
 
 ### [x] Update CLAUDE.md — corrections as documentation lag (2026-03-29)
 
