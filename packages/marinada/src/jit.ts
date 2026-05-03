@@ -214,7 +214,67 @@ const RUNTIME = {
   _bitNot(a: unknown): bigint {
     return ~(a as bigint);
   },
+  _recordDel(r: unknown, k: unknown): unknown {
+    const o = { ...(r as object) } as Record<string, unknown>;
+    delete o[String(k)];
+    return o;
+  },
+  _floor(x: unknown): unknown {
+    return typeof x === "bigint" ? x : Math.floor(x as number);
+  },
+  _ceil(x: unknown): unknown {
+    return typeof x === "bigint" ? x : Math.ceil(x as number);
+  },
+  _round(x: unknown): unknown {
+    return typeof x === "bigint" ? x : Math.round(x as number);
+  },
+  _abs(x: unknown): unknown {
+    if (typeof x === "bigint") return x < 0n ? -x : x;
+    return Math.abs(x as number);
+  },
+  _min(a: unknown, b: unknown): unknown {
+    if (typeof a === "bigint" && typeof b === "bigint") return a < b ? a : b;
+    return Math.min(Number(a), Number(b));
+  },
+  _max(a: unknown, b: unknown): unknown {
+    if (typeof a === "bigint" && typeof b === "bigint") return a > b ? a : b;
+    return Math.max(Number(a), Number(b));
+  },
+  _asCheck(typ: string, v: unknown): unknown {
+    if (!_isCheck(typ, v)) throw new TypeError(`expected ${typ}`);
+    return v;
+  },
 };
+
+function _isCheck(typ: string, v: unknown): boolean {
+  switch (typ) {
+    case "null":
+      return v === null;
+    case "bool":
+    case "boolean":
+      return typeof v === "boolean";
+    case "int":
+      return typeof v === "bigint";
+    case "float":
+      return typeof v === "number";
+    case "number":
+      return typeof v === "bigint" || typeof v === "number";
+    case "string":
+      return typeof v === "string";
+    case "array":
+      return Array.isArray(v);
+    case "record":
+      return v !== null && typeof v === "object" && !Array.isArray(v);
+    case "variant":
+      return (
+        v !== null &&
+        typeof v === "object" &&
+        typeof (v as Record<string, unknown>)["$tag"] === "string"
+      );
+    default:
+      return false;
+  }
+}
 
 // --- Natives table ---
 
@@ -255,35 +315,265 @@ const NATIVES = {
   },
 };
 
+// --- JS AST IR ---
+
+export type JSExpr =
+  | { t: "lit"; v: string } // pre-serialized literal text
+  | { t: "id"; name: string }
+  | { t: "call"; fn: JSExpr; args: JSExpr[] }
+  | { t: "idx"; obj: JSExpr; key: JSExpr }
+  | { t: "member"; obj: JSExpr; prop: string }
+  | { t: "arrow"; params: string[]; body: JSExpr | { stmts: JSStmt[] } }
+  | { t: "cond"; test: JSExpr; cons: JSExpr; else: JSExpr }
+  | { t: "assign"; lhs: string; rhs: JSExpr }
+  | { t: "seq"; exprs: JSExpr[] }
+  | { t: "iife"; body: JSStmt[] }
+  | { t: "array"; elems: JSExpr[] }
+  | { t: "object"; props: [string, JSExpr][] }
+  | { t: "new"; ctor: JSExpr; args: JSExpr[] }
+  | { t: "unary"; op: string; expr: JSExpr; prefix?: boolean }
+  | { t: "binary"; op: string; left: JSExpr; right: JSExpr };
+
+export type JSStmt =
+  | { t: "expr"; expr: JSExpr }
+  | { t: "return"; expr: JSExpr }
+  | { t: "let"; name: string; init: JSExpr }
+  | { t: "var"; name: string }
+  | { t: "assign-stmt"; lhs: string; rhs: JSExpr }
+  | { t: "while"; label: string; body: JSStmt[] }
+  | { t: "continue"; label: string }
+  | { t: "break"; label: string }
+  | { t: "if-stmt"; test: JSExpr; cons: JSStmt[]; else?: JSStmt[] }
+  | { t: "block"; stmts: JSStmt[] }
+  | { t: "throw"; expr: JSExpr };
+
+// --- Builders ---
+
+const J = {
+  lit: (v: string): JSExpr => ({ t: "lit", v }),
+  id: (name: string): JSExpr => ({ t: "id", name }),
+  call: (fn: JSExpr, args: JSExpr[]): JSExpr => ({ t: "call", fn, args }),
+  idx: (obj: JSExpr, key: JSExpr): JSExpr => ({ t: "idx", obj, key }),
+  member: (obj: JSExpr, prop: string): JSExpr => ({ t: "member", obj, prop }),
+  cond: (test: JSExpr, cons: JSExpr, els: JSExpr): JSExpr => ({
+    t: "cond",
+    test,
+    cons,
+    else: els,
+  }),
+  binary: (op: string, left: JSExpr, right: JSExpr): JSExpr => ({
+    t: "binary",
+    op,
+    left,
+    right,
+  }),
+  unary: (op: string, expr: JSExpr): JSExpr => ({ t: "unary", op, expr }),
+  rt: (method: string): JSExpr => ({
+    t: "member",
+    obj: { t: "id", name: "_rt" },
+    prop: method,
+  }),
+  rtCall: (method: string, args: JSExpr[]): JSExpr => J.call(J.rt(method), args),
+};
+
+// --- Serializer ---
+
+function precedence(e: JSExpr): number {
+  // Higher = tighter binding. Used to decide on parenthesization.
+  switch (e.t) {
+    case "lit":
+    case "id":
+    case "array":
+    case "object":
+    case "iife":
+      return 100;
+    case "member":
+    case "idx":
+    case "call":
+    case "new":
+      return 90;
+    case "unary":
+      return 80;
+    case "binary": {
+      switch (e.op) {
+        case "*":
+        case "/":
+        case "%":
+          return 70;
+        case "+":
+        case "-":
+          return 65;
+        case "<<":
+        case ">>":
+        case ">>>":
+          return 60;
+        case "<":
+        case "<=":
+        case ">":
+        case ">=":
+          return 55;
+        case "==":
+        case "!=":
+        case "===":
+        case "!==":
+          return 50;
+        case "&":
+          return 45;
+        case "^":
+          return 44;
+        case "|":
+          return 43;
+        case "&&":
+          return 40;
+        case "||":
+        case "??":
+          return 35;
+        default:
+          return 30;
+      }
+    }
+    case "cond":
+      return 20;
+    case "assign":
+      return 10;
+    case "arrow":
+      return 10;
+    case "seq":
+      return 1;
+  }
+}
+
+function paren(inner: JSExpr, parentPrec: number): string {
+  const ip = precedence(inner);
+  const s = serializeExpr(inner);
+  if (ip < parentPrec) return `(${s})`;
+  return s;
+}
+
+export function serializeExpr(e: JSExpr): string {
+  switch (e.t) {
+    case "lit":
+      return e.v;
+    case "id":
+      return e.name;
+    case "call": {
+      const fn = paren(e.fn, 90);
+      const args = e.args.map((a) => paren(a, 2)).join(", ");
+      return `${fn}(${args})`;
+    }
+    case "idx":
+      return `${paren(e.obj, 90)}[${serializeExpr(e.key)}]`;
+    case "member":
+      return `${paren(e.obj, 90)}.${e.prop}`;
+    case "arrow": {
+      const params = `(${e.params.join(", ")})`;
+      if ("stmts" in e.body) {
+        return `${params} => { ${e.body.stmts.map(serializeStmt).join(" ")} }`;
+      }
+      // expression body — wrap object literals so they aren't parsed as block
+      const b = e.body;
+      if (b.t === "object") return `${params} => (${serializeExpr(b)})`;
+      return `${params} => ${paren(b, 2)}`;
+    }
+    case "cond":
+      return `${paren(e.test, 21)} ? ${paren(e.cons, 11)} : ${paren(e.else, 11)}`;
+    case "assign":
+      return `${e.lhs} = ${paren(e.rhs, 11)}`;
+    case "seq":
+      return e.exprs.map((x) => paren(x, 2)).join(", ");
+    case "iife": {
+      return `(() => { ${e.body.map(serializeStmt).join(" ")} })()`;
+    }
+    case "array":
+      return `[${e.elems.map((x) => paren(x, 2)).join(", ")}]`;
+    case "object":
+      return `{${e.props.map(([k, v]) => `${JSON.stringify(k)}: ${paren(v, 2)}`).join(", ")}}`;
+    case "new": {
+      const ctor = paren(e.ctor, 90);
+      const args = e.args.map((a) => paren(a, 2)).join(", ");
+      return `new ${ctor}(${args})`;
+    }
+    case "unary":
+      return `${e.op}${paren(e.expr, 80)}`;
+    case "binary": {
+      const p = precedence(e);
+      return `${paren(e.left, p)} ${e.op} ${paren(e.right, p + 1)}`;
+    }
+  }
+}
+
+export function serializeStmt(s: JSStmt): string {
+  switch (s.t) {
+    case "expr":
+      return `${serializeExpr(s.expr)};`;
+    case "return":
+      return `return ${serializeExpr(s.expr)};`;
+    case "let":
+      return `let ${s.name} = ${serializeExpr(s.init)};`;
+    case "var":
+      return `var ${s.name};`;
+    case "assign-stmt":
+      return `${s.lhs} = ${serializeExpr(s.rhs)};`;
+    case "while": {
+      const body = s.body.map(serializeStmt).join(" ");
+      return `${s.label}: while (true) { ${body} }`;
+    }
+    case "continue":
+      return `continue ${s.label};`;
+    case "break":
+      return `break ${s.label};`;
+    case "if-stmt": {
+      const t = s.cons.map(serializeStmt).join(" ");
+      const e = s.else ? ` else { ${s.else.map(serializeStmt).join(" ")} }` : "";
+      return `if (${serializeExpr(s.test)}) { ${t} }${e}`;
+    }
+    case "block":
+      return `{ ${s.stmts.map(serializeStmt).join(" ")} }`;
+    case "throw":
+      return `throw ${serializeExpr(s.expr)};`;
+  }
+}
+
+// --- Sanitization ---
+
+function sanitize(name: string): string {
+  // Replace any character that's not [a-zA-Z0-9_$] with _
+  let safe = name.replace(/[^a-zA-Z0-9_$]/g, "_");
+  // Always prefix with _m_ to avoid colliding with reserved words and our own names.
+  safe = "_m_" + safe;
+  return safe;
+}
+
 // --- Compiler ---
 
-// Set of locally-bound variable names that should be referenced directly,
-// not via env[...]. These are JS local variables in scope at this point.
 type CompileCtx = {
   path: number[];
-  locals: ReadonlySet<string>;
-  /** When inside a __loop body, the loop parameter names for __continue. */
-  loopParams: string[] | null;
+  // Map from Marinada name → sanitized JS identifier, for in-scope locals.
+  locals: ReadonlyMap<string, string>;
+  /** When inside a __loop body, the sanitized loop parameter names + label. */
+  loop: { params: string[]; label: string } | null;
+  /** Counter for generating unique loop labels. */
+  loopCounter: { n: number };
 };
 
 function emptyCtx(): CompileCtx {
-  return { path: [], locals: new Set(), loopParams: null };
+  return { path: [], locals: new Map(), loop: null, loopCounter: { n: 0 } };
 }
 
 function childCtx(ctx: CompileCtx, i: number): CompileCtx {
-  return { path: [...ctx.path, i], locals: ctx.locals, loopParams: ctx.loopParams };
+  return { ...ctx, path: [...ctx.path, i] };
 }
 
-function withLocals(ctx: CompileCtx, names: string[]): CompileCtx {
-  const newLocals = new Set(ctx.locals);
-  for (const n of names) newLocals.add(n);
-  return { path: ctx.path, locals: newLocals, loopParams: ctx.loopParams };
+function withLocals(ctx: CompileCtx, mapping: Iterable<[string, string]>): CompileCtx {
+  const newLocals = new Map(ctx.locals);
+  for (const [k, v] of mapping) newLocals.set(k, v);
+  return { ...ctx, locals: newLocals };
 }
 
-// Resolve a variable name — local JS variable or env lookup
-function varRef(name: string, ctx: CompileCtx): string {
-  if (ctx.locals.has(name)) return name;
-  return `env[${JSON.stringify(name)}]`;
+function varRef(name: string, ctx: CompileCtx): JSExpr {
+  const local = ctx.locals.get(name);
+  if (local !== undefined) return J.id(local);
+  return J.idx(J.id("env"), J.lit(JSON.stringify(name)));
 }
 
 /** Serialize a JS value as a JS literal string, matching the JIT's value representation. */
@@ -297,7 +587,6 @@ function serializeLit(v: unknown): string {
     return `[${(v as unknown[]).map(serializeLit).join(", ")}]`;
   }
   if (typeof v === "object") {
-    // Plain object → JS object literal (JIT record representation)
     const o = v as Record<string, unknown>;
     const entries = Object.entries(o).map(
       ([k, val]) => `${JSON.stringify(k)}: ${serializeLit(val)}`,
@@ -307,27 +596,20 @@ function serializeLit(v: unknown): string {
   throw new Error(`serializeLit: unsupported value type: ${typeof v}`);
 }
 
-function compileExpr(expr: Expr, ctx: CompileCtx): string {
+function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
   // Atoms
-  if (expr === null) return "null";
-  if (typeof expr === "boolean") return expr ? "true" : "false";
+  if (expr === null) return J.lit("null");
+  if (typeof expr === "boolean") return J.lit(expr ? "true" : "false");
   if (typeof expr === "number") {
     if (Number.isInteger(expr) && !Object.is(expr, -0)) {
-      // Distinguish 3.0 from 3: in JS source code, 3.0 and 3 are the same number.
-      // In Marinada JSON: integer literals → bigint, float literals → number.
-      // JSON.parse("3.0") === 3 (JS number), JSON.parse("3") === 3.
-      // There's no way to distinguish 3 from 3.0 at runtime in JSON.
-      // Convention: integer JS numbers → BigInt literals, non-integer → float.
-      return `${expr}n`;
-    } else {
-      return JSON.stringify(expr);
+      return J.lit(`${expr}n`);
     }
+    return J.lit(JSON.stringify(expr));
   }
   if (typeof expr === "string") {
     return varRef(expr, ctx);
   }
 
-  // Array = call
   const arr = expr as Expr[];
   if (arr.length === 0) {
     throw new CompileError("empty expression array", ctx.path);
@@ -341,70 +623,65 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
 
   // Variant constructor: uppercase tag
   if (op.length > 0 && (op[0] as string) >= "A" && (op[0] as string) <= "Z") {
-    const fieldArgs = arr
-      .slice(1)
-      .map((a, i) => compileExpr(a, childCtx(ctx, i + 1)))
-      .join(", ");
-    return `_rt._variant(${JSON.stringify(op)}${fieldArgs.length > 0 ? ", " + fieldArgs : ""})`;
+    const fieldArgs = arr.slice(1).map((a, i) => compileExpr(a, childCtx(ctx, i + 1)));
+    return J.rtCall("_variant", [J.lit(JSON.stringify(op)), ...fieldArgs]);
   }
 
-  const arg = (i: number) => compileExpr(arr[i] as Expr, childCtx(ctx, i));
+  const arg = (i: number): JSExpr => compileExpr(arr[i] as Expr, childCtx(ctx, i));
 
   switch (op) {
     case "+":
-      return `_rt._add(${arg(1)}, ${arg(2)})`;
+      return J.rtCall("_add", [arg(1), arg(2)]);
     case "-":
-      return `_rt._sub(${arg(1)}, ${arg(2)})`;
+      return J.rtCall("_sub", [arg(1), arg(2)]);
     case "*":
-      return `_rt._mul(${arg(1)}, ${arg(2)})`;
+      return J.rtCall("_mul", [arg(1), arg(2)]);
     case "/":
-      return `_rt._div(${arg(1)}, ${arg(2)})`;
+      return J.rtCall("_div", [arg(1), arg(2)]);
     case "%":
-      return `_rt._mod(${arg(1)}, ${arg(2)})`;
+      return J.rtCall("_mod", [arg(1), arg(2)]);
 
     case "==":
-      return `_rt._eq(${arg(1)}, ${arg(2)})`;
+      return J.rtCall("_eq", [arg(1), arg(2)]);
     case "!=":
-      return `(!_rt._eq(${arg(1)}, ${arg(2)}))`;
+      return J.unary("!", J.rtCall("_eq", [arg(1), arg(2)]));
     case "<":
-      return `(Number(${arg(1)}) < Number(${arg(2)}))`;
+      return J.binary("<", J.call(J.id("Number"), [arg(1)]), J.call(J.id("Number"), [arg(2)]));
     case ">":
-      return `(Number(${arg(1)}) > Number(${arg(2)}))`;
+      return J.binary(">", J.call(J.id("Number"), [arg(1)]), J.call(J.id("Number"), [arg(2)]));
     case "<=":
-      return `(Number(${arg(1)}) <= Number(${arg(2)}))`;
+      return J.binary("<=", J.call(J.id("Number"), [arg(1)]), J.call(J.id("Number"), [arg(2)]));
     case ">=":
-      return `(Number(${arg(1)}) >= Number(${arg(2)}))`;
+      return J.binary(">=", J.call(J.id("Number"), [arg(1)]), J.call(J.id("Number"), [arg(2)]));
 
     case "and":
-      return `(${arg(1)} && ${arg(2)})`;
+      return J.binary("&&", arg(1), arg(2));
     case "or":
-      return `(${arg(1)} || ${arg(2)})`;
+      return J.binary("||", arg(1), arg(2));
     case "not":
-      return `(!${arg(1)})`;
+      return J.unary("!", arg(1));
 
     case "if":
-      return `(${arg(1)} ? ${arg(2)} : ${arg(3)})`;
+      return J.cond(arg(1), arg(2), arg(3));
 
     case "do": {
       if (arr.length < 2) throw new CompileError("do requires at least 1 expr", ctx.path);
       const parts = arr.slice(1).map((e, i) => compileExpr(e, childCtx(ctx, i + 1)));
       if (parts.length === 1) return parts[0]!;
-      return `(${parts.join(", ")})`;
+      return { t: "seq", exprs: parts };
     }
 
     case "let": {
-      // ["let", [[name, val], ...], body]
       const bindings = arr[1];
       if (!Array.isArray(bindings)) {
         throw new CompileError("let bindings must be an array", [...ctx.path, 1]);
       }
       const body = arr[2] as Expr;
 
-      // Build nested IIFEs, tracking which names become locals as we go
-      // Process from innermost outward, building up the set of locals
+      // Compile each binding's value in the context with all PRIOR bindings in scope,
+      // then add the new binding to the scope for subsequent bindings and the body.
       let currentCtx = ctx;
-      // First pass: collect binding names and their value expressions
-      const bindingData: Array<{ name: string; valCode: string }> = [];
+      const bindingData: Array<{ jsName: string; valExpr: JSExpr }> = [];
       for (let i = 0; i < bindings.length; i++) {
         const binding = bindings[i];
         if (!Array.isArray(binding) || binding.length !== 2) {
@@ -414,42 +691,35 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
         if (typeof name !== "string") {
           throw new CompileError("let binding name must be a string", [...ctx.path, 1, i, 0]);
         }
-        // Value is compiled in the current context (before this binding is in scope)
-        const valCode = compileExpr(binding[1] as Expr, {
+        const valExpr = compileExpr(binding[1] as Expr, {
+          ...currentCtx,
           path: childCtx(ctx, i).path,
-          locals: currentCtx.locals,
-          loopParams: ctx.loopParams,
         });
-        bindingData.push({ name, valCode });
-        // After this binding, name is a local
-        currentCtx = withLocals(currentCtx, [name]);
+        const jsName = sanitize(name);
+        bindingData.push({ jsName, valExpr });
+        currentCtx = withLocals(currentCtx, [[name, jsName]]);
       }
 
-      // Compile body with all bindings as locals
-      let bodyCode = compileExpr(body, {
+      let bodyExpr = compileExpr(body, {
+        ...currentCtx,
         path: childCtx(ctx, 2).path,
-        locals: currentCtx.locals,
-        loopParams: ctx.loopParams,
       });
 
-      // Wrap from innermost outward
+      // Wrap from innermost outward as IIFEs/arrows
       for (let i = bindingData.length - 1; i >= 0; i--) {
-        const { name, valCode } = bindingData[i]!;
-        bodyCode = `((${name}) => ${bodyCode})(${valCode})`;
+        const { jsName, valExpr } = bindingData[i]!;
+        bodyExpr = J.call({ t: "arrow", params: [jsName], body: bodyExpr }, [valExpr]);
       }
-      return bodyCode;
+      return bodyExpr;
     }
 
     case "letrec": {
-      // ["letrec", [[name, fn], ...], body]
-      // All names are in scope for all values and body
       const bindings = arr[1];
       if (!Array.isArray(bindings)) {
         throw new CompileError("letrec bindings must be an array", [...ctx.path, 1]);
       }
       const body = arr[2] as Expr;
 
-      // Collect all names first
       const names: string[] = [];
       for (let i = 0; i < bindings.length; i++) {
         const binding = bindings[i];
@@ -463,23 +733,25 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
         names.push(name);
       }
 
-      // All names are locals in the recursive context
-      const recCtx = withLocals(ctx, names);
+      const mapping: [string, string][] = names.map((n) => [n, sanitize(n)]);
+      const recCtx = withLocals(ctx, mapping);
 
-      const decls = names.map((n) => `var ${n};`).join(" ");
-      const assigns: string[] = [];
+      const stmts: JSStmt[] = [];
+      for (const [, jsName] of mapping) {
+        stmts.push({ t: "var", name: jsName });
+      }
       for (let i = 0; i < bindings.length; i++) {
         const binding = bindings[i] as Expr[];
-        const name = names[i]!;
-        const valCode = compileExpr(binding[1] as Expr, recCtx);
-        assigns.push(`${name} = ${valCode};`);
+        const jsName = mapping[i]![1];
+        const valExpr = compileExpr(binding[1] as Expr, recCtx);
+        stmts.push({ t: "assign-stmt", lhs: jsName, rhs: valExpr });
       }
-      const bodyCode = compileExpr(body, recCtx);
-      return `(()=>{ ${decls} ${assigns.join(" ")} return ${bodyCode}; })()`;
+      const bodyExpr = compileExpr(body, recCtx);
+      stmts.push({ t: "return", expr: bodyExpr });
+      return { t: "iife", body: stmts };
     }
 
     case "fn": {
-      // ["fn", params, body]
       const paramsExpr = arr[1];
       if (!Array.isArray(paramsExpr)) {
         throw new CompileError("fn params must be an array", [...ctx.path, 1]);
@@ -499,185 +771,152 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
           ]);
         }
       }
-      // fn body: params are locals. fn creates a new scope, so __continue from an outer
-      // loop cannot appear inside fn body — reset loopParams to null.
-      const fnCtx = withLocals(ctx, params);
-      const bodyCode = compileExpr(arr[2] as Expr, {
+      const mapping: [string, string][] = params.map((p) => [p, sanitize(p)]);
+      const fnCtx = withLocals(ctx, mapping);
+      const bodyExpr = compileExpr(arr[2] as Expr, {
+        ...fnCtx,
         path: childCtx(ctx, 2).path,
-        locals: fnCtx.locals,
-        loopParams: null,
+        loop: null,
       });
-      return `((${params.join(", ")}) => ${bodyCode})`;
+      return {
+        t: "arrow",
+        params: mapping.map(([, j]) => j),
+        body: bodyExpr,
+      };
     }
 
     case "call": {
-      // ["call", fn, arg1, arg2, ...]
-      const fnCode = arg(1);
-      const argCodes = arr.slice(2).map((e, i) => compileExpr(e, childCtx(ctx, i + 2)));
-      return `${fnCode}(${argCodes.join(", ")})`;
+      const fnE = arg(1);
+      const argEs = arr.slice(2).map((e, i) => compileExpr(e, childCtx(ctx, i + 2)));
+      return J.call(fnE, argEs);
     }
 
     case "get":
-      return `_rt._get(${arg(1)}, ${arg(2)})`;
-
+      return J.rtCall("_get", [arg(1), arg(2)]);
     case "get-in":
-      return `_rt._getIn(${arg(1)}, ${arg(2)})`;
-
+      return J.rtCall("_getIn", [arg(1), arg(2)]);
     case "set":
-      return `_rt._set(${arg(1)}, ${arg(2)}, ${arg(3)})`;
-
+      return J.rtCall("_set", [arg(1), arg(2), arg(3)]);
     case "set-in":
-      return `_rt._setIn(${arg(1)}, ${arg(2)}, ${arg(3)})`;
-
+      return J.rtCall("_setIn", [arg(1), arg(2), arg(3)]);
     case "count":
-      return `_rt._count(${arg(1)})`;
-
+      return J.rtCall("_count", [arg(1)]);
     case "merge":
-      return `_rt._merge(${arg(1)}, ${arg(2)})`;
-
+      return J.rtCall("_merge", [arg(1), arg(2)]);
     case "keys":
-      return `_rt._keys(${arg(1)})`;
-
+      return J.rtCall("_keys", [arg(1)]);
     case "vals":
-      return `_rt._vals(${arg(1)})`;
+      return J.rtCall("_vals", [arg(1)]);
 
-    // --- Array primitives ---
     case "array": {
       const elems = arr.slice(1).map((e, i) => compileExpr(e, childCtx(ctx, i + 1)));
-      return `[${elems.join(", ")}]`;
+      return { t: "array", elems };
     }
-
     case "array-get":
-      return `_rt._arrayGet(${arg(1)}, ${arg(2)})`;
-
+      return J.rtCall("_arrayGet", [arg(1), arg(2)]);
     case "array-push":
-      return `[...${arg(1)}, ${arg(2)}]`;
-
+      // Use concat to avoid spread-precedence issues in serialization.
+      return J.call(J.member(arg(1), "concat"), [{ t: "array", elems: [arg(2)] }]);
     case "array-slice": {
       if (arr.length === 3) {
-        return `(${arg(1)}).slice(Number(${arg(2)}))`;
+        return J.call(J.member(arg(1), "slice"), [J.call(J.id("Number"), [arg(2)])]);
       }
-      return `(${arg(1)}).slice(Number(${arg(2)}), Number(${arg(3)}))`;
+      return J.call(J.member(arg(1), "slice"), [
+        J.call(J.id("Number"), [arg(2)]),
+        J.call(J.id("Number"), [arg(3)]),
+      ]);
     }
 
-    // --- Record aliases ---
     case "record-get":
-      return `_rt._get(${arg(1)}, ${arg(2)})`;
-
+      return J.rtCall("_get", [arg(1), arg(2)]);
     case "record-set":
-      return `_rt._set(${arg(1)}, ${arg(2)}, ${arg(3)})`;
-
-    case "record-del": {
-      const rCode = arg(1);
-      const kCode = arg(2);
-      return `((_$r, _$k) => { const _$o = {..._$r}; delete _$o[_$k]; return _$o; })(${rCode}, ${kCode})`;
-    }
-
+      return J.rtCall("_set", [arg(1), arg(2), arg(3)]);
+    case "record-del":
+      return J.rtCall("_recordDel", [arg(1), arg(2)]);
     case "record-keys":
-      return `_rt._keys(${arg(1)})`;
-
+      return J.rtCall("_keys", [arg(1)]);
     case "record-vals":
-      return `_rt._vals(${arg(1)})`;
-
+      return J.rtCall("_vals", [arg(1)]);
     case "record-merge":
-      return `_rt._merge(${arg(1)}, ${arg(2)})`;
+      return J.rtCall("_merge", [arg(1), arg(2)]);
 
-    // --- String primitives ---
     case "str-len":
-      return `BigInt(${arg(1)}.length)`;
-
+      return J.call(J.id("BigInt"), [J.member(arg(1), "length")]);
     case "str-get":
-      return `_rt._strGet(${arg(1)}, ${arg(2)})`;
-
+      return J.rtCall("_strGet", [arg(1), arg(2)]);
     case "str-concat":
-      return `(${arg(1)} + ${arg(2)})`;
-
+      return J.binary("+", arg(1), arg(2));
     case "str-slice":
-      return `(${arg(1)}).slice(Number(${arg(2)}), Number(${arg(3)}))`;
-
+      return J.call(J.member(arg(1), "slice"), [
+        J.call(J.id("Number"), [arg(2)]),
+        J.call(J.id("Number"), [arg(3)]),
+      ]);
     case "str-cmp":
-      return `_rt._strCmp(${arg(1)}, ${arg(2)})`;
-
+      return J.rtCall("_strCmp", [arg(1), arg(2)]);
     case "parse-int":
-      return `_rt._parseInt(${arg(1)})`;
-
+      return J.rtCall("_parseInt", [arg(1)]);
     case "parse-float":
-      return `_rt._parseFloat(${arg(1)})`;
+      return J.rtCall("_parseFloat", [arg(1)]);
 
-    // --- Math primitives ---
     case "floor":
-      return `(typeof (${arg(1)}) === "bigint" ? ${arg(1)} : Math.floor(${arg(1)}))`;
-
+      return J.rtCall("_floor", [arg(1)]);
     case "ceil":
-      return `(typeof (${arg(1)}) === "bigint" ? ${arg(1)} : Math.ceil(${arg(1)}))`;
-
+      return J.rtCall("_ceil", [arg(1)]);
     case "round":
-      return `(typeof (${arg(1)}) === "bigint" ? ${arg(1)} : Math.round(${arg(1)}))`;
-
+      return J.rtCall("_round", [arg(1)]);
     case "abs":
-      return `(typeof (${arg(1)}) === "bigint" ? (${arg(1)} < 0n ? -(${arg(1)}) : ${arg(1)}) : Math.abs(${arg(1)}))`;
-
+      return J.rtCall("_abs", [arg(1)]);
     case "min":
-      return `(typeof (${arg(1)}) === "bigint" && typeof (${arg(2)}) === "bigint" ? ((${arg(1)}) < (${arg(2)}) ? ${arg(1)} : ${arg(2)}) : Math.min(Number(${arg(1)}), Number(${arg(2)})))`;
-
+      return J.rtCall("_min", [arg(1), arg(2)]);
     case "max":
-      return `(typeof (${arg(1)}) === "bigint" && typeof (${arg(2)}) === "bigint" ? ((${arg(1)}) > (${arg(2)}) ? ${arg(1)} : ${arg(2)}) : Math.max(Number(${arg(1)}), Number(${arg(2)})))`;
-
+      return J.rtCall("_max", [arg(1), arg(2)]);
     case "pow":
-      return `Math.pow(Number(${arg(1)}), Number(${arg(2)}))`;
-
+      return J.call(J.member(J.id("Math"), "pow"), [
+        J.call(J.id("Number"), [arg(1)]),
+        J.call(J.id("Number"), [arg(2)]),
+      ]);
     case "sqrt":
-      return `Math.sqrt(Number(${arg(1)}))`;
-
+      return J.call(J.member(J.id("Math"), "sqrt"), [J.call(J.id("Number"), [arg(1)])]);
     case "int->float":
-      return `_rt._intToFloat(${arg(1)})`;
-
+      return J.rtCall("_intToFloat", [arg(1)]);
     case "float->int":
-      return `_rt._floatToInt(${arg(1)})`;
+      return J.rtCall("_floatToInt", [arg(1)]);
 
-    // --- Bitwise primitives ---
     case "bit-and":
-      return `((${arg(1)}) & (${arg(2)}))`;
-
+      return J.binary("&", arg(1), arg(2));
     case "bit-or":
-      return `((${arg(1)}) | (${arg(2)}))`;
-
+      return J.binary("|", arg(1), arg(2));
     case "bit-xor":
-      return `((${arg(1)}) ^ (${arg(2)}))`;
-
+      return J.binary("^", arg(1), arg(2));
     case "bit-not":
-      return `_rt._bitNot(${arg(1)})`;
-
+      return J.rtCall("_bitNot", [arg(1)]);
     case "bit-shl":
-      return `((${arg(1)}) << (${arg(2)}))`;
-
+      return J.binary("<<", arg(1), arg(2));
     case "bit-shr":
-      return `((${arg(1)}) >> (${arg(2)}))`;
+      return J.binary(">>", arg(1), arg(2));
 
     case "concat": {
       if (arr.length < 2) throw new CompileError("concat requires at least 1 arg", ctx.path);
       const parts = arr.slice(1).map((e, i) => compileExpr(e, childCtx(ctx, i + 1)));
       if (parts.length === 1) return parts[0]!;
-      return `(${parts.join("+")})`;
+      return parts.reduce((acc, p) => J.binary("+", acc, p));
     }
 
     case "slice":
-      return `_rt._slice(${arg(1)}, ${arg(2)}, ${arg(3)})`;
-
+      return J.rtCall("_slice", [arg(1), arg(2), arg(3)]);
     case "to-string":
-      return `_rt._toStr(${arg(1)})`;
-
+      return J.rtCall("_toStr", [arg(1)]);
     case "parse-number":
-      return `_rt._parseNum(${arg(1)})`;
-
+      return J.rtCall("_parseNum", [arg(1)]);
     case "untyped":
       return arg(1);
 
     case "match": {
-      // ["match", scrutinee, [pattern, body], ...]
-      const scrutCode = arg(1);
+      const scrutE = arg(1);
       const clauses = arr.slice(2);
-      const clauseCodes: string[] = [];
+      const stmts: JSStmt[] = [];
+      const scrutName = "_m_$s";
+      stmts.push({ t: "let", name: scrutName, init: scrutE });
       for (let i = 0; i < clauses.length; i++) {
         const clause = clauses[i];
         if (!Array.isArray(clause) || clause.length !== 2) {
@@ -697,24 +936,54 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
           throw new CompileError("match pattern tag must be a string", [...ctx.path, i + 2, 0]);
         }
         const bindingNames = pattern.slice(1) as string[];
-        // Compile body with binding names as locals
-        const bodyCtx = withLocals(ctx, bindingNames);
-        const bindings = bindingNames.map((name, fi) => `var ${name}=$s.$${fi};`).join("");
-        const bodyCode = compileExpr(body, {
+        const mapping: [string, string][] = bindingNames.map((n) => [n, sanitize(n)]);
+        const bodyCtx = withLocals(ctx, mapping);
+        const thenStmts: JSStmt[] = [];
+        for (let fi = 0; fi < bindingNames.length; fi++) {
+          thenStmts.push({
+            t: "let",
+            name: mapping[fi]![1],
+            init: J.member(J.id(scrutName), `$${fi}`),
+          });
+        }
+        const bodyExpr = compileExpr(body, {
+          ...bodyCtx,
           path: childCtx(ctx, i + 2).path,
-          locals: bodyCtx.locals,
-          loopParams: ctx.loopParams,
         });
-        clauseCodes.push(`if($s.$tag===${JSON.stringify(tag)}){${bindings}return ${bodyCode}}`);
+        thenStmts.push({ t: "return", expr: bodyExpr });
+        stmts.push({
+          t: "if-stmt",
+          test: J.binary("===", J.member(J.id(scrutName), "$tag"), J.lit(JSON.stringify(tag))),
+          cons: thenStmts,
+        });
       }
-      return `(($s)=>{${clauseCodes.join("")}throw new Error("non-exhaustive match")})(${scrutCode})`;
+      stmts.push({
+        t: "throw",
+        expr: {
+          t: "new",
+          ctor: J.id("Error"),
+          args: [J.lit(JSON.stringify("non-exhaustive match"))],
+        },
+      });
+      return { t: "iife", body: stmts };
     }
 
     case "cond": {
-      // ["cond", [test1, expr1], [test2, expr2], ["else", exprN]]
       if (arr.length < 2) throw new CompileError("cond requires at least 1 clause", ctx.path);
       const clauses = arr.slice(1);
-      let result = `(()=>{throw new Error("non-exhaustive cond")})()`;
+      let result: JSExpr = {
+        t: "iife",
+        body: [
+          {
+            t: "throw",
+            expr: {
+              t: "new",
+              ctor: J.id("Error"),
+              args: [J.lit(JSON.stringify("non-exhaustive cond"))],
+            },
+          },
+        ],
+      };
       for (let i = clauses.length - 1; i >= 0; i--) {
         const clause = clauses[i];
         if (!Array.isArray(clause) || clause.length !== 2) {
@@ -722,12 +991,12 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
         }
         const test = clause[0];
         const clauseExpr = clause[1] as Expr;
-        const exprCode = compileExpr(clauseExpr, childCtx(ctx, i + 1));
+        const exprE = compileExpr(clauseExpr, childCtx(ctx, i + 1));
         if (test === "else") {
-          result = exprCode;
+          result = exprE;
         } else {
-          const testCode = compileExpr(test as Expr, childCtx(ctx, i + 1));
-          result = `(${testCode} ? ${exprCode} : ${result})`;
+          const testE = compileExpr(test as Expr, childCtx(ctx, i + 1));
+          result = J.cond(testE, exprE, result);
         }
       }
       return result;
@@ -738,8 +1007,7 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
       if (typeof typStr !== "string") {
         throw new CompileError("is requires a type name string as first arg", [...ctx.path, 1]);
       }
-      const valCode = arg(2);
-      return compileIsCheck(typStr, valCode);
+      return compileIsCheck(typStr, arg(2));
     }
 
     case "as": {
@@ -747,40 +1015,34 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
       if (typeof typStr !== "string") {
         throw new CompileError("as requires a type name string as first arg", [...ctx.path, 1]);
       }
-      const valCode = arg(2);
-      const checkCode = compileIsCheck(typStr, "_$v");
-      return `((_$v)=>{ if(!(${checkCode})) throw new TypeError("expected ${typStr}"); return _$v; })(${valCode})`;
+      return J.rtCall("_asCheck", [J.lit(JSON.stringify(typStr)), arg(2)]);
     }
 
     case "perform":
       throw new CompileError("perform cannot be compiled (use interpreter for effects)", ctx.path);
-
     case "handle":
       throw new CompileError("handle cannot be compiled (use interpreter for effects)", ctx.path);
 
     case "__native": {
-      // ["__native", name, ...args]
       const name = arr[1];
       if (typeof name !== "string") {
         throw new CompileError("__native: first arg must be a function name string", ctx.path);
       }
-      const argCodes = arr.slice(2).map((e, i) => compileExpr(e as Expr, childCtx(ctx, i + 2)));
-      return `_nat.${name}(${argCodes.join(", ")})`;
+      const argEs = arr.slice(2).map((e, i) => compileExpr(e as Expr, childCtx(ctx, i + 2)));
+      return J.call(J.member(J.id("_nat"), name), argEs);
     }
 
     case "__lit": {
-      // ["__lit", value]
       if (arr.length !== 2) {
         throw new CompileError("__lit: requires exactly one argument", ctx.path);
       }
-      return serializeLit(arr[1]);
+      return J.lit(serializeLit(arr[1]));
     }
 
     case "__loop": {
-      // ["__loop", params, initArgs, body]
-      // Uses a sentinel exception (_LoopContinue) so __continue works from any expression depth.
-      // Emits:
-      //   (()=>{ let p1=init1, ...; while(true){ try{ return (body) }catch(_lc){ if(_lc instanceof _LoopContinue){ p1=_lc._v[0]; ...; continue } throw _lc } } })()
+      // ["__loop", params, initArgs, body] → labeled while loop in an IIFE.
+      // Body is compiled in tail-statement mode so __continue can emit a real
+      // `continue label;` without crossing a function boundary.
       const params = arr[1];
       const initArgs = arr[2];
       const body = arr[3] as Expr;
@@ -798,34 +1060,44 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
         }
         paramNames.push(p);
       }
-      const initCodes = (initArgs as Expr[]).map((e, i) => compileExpr(e, childCtx(ctx, i + 2)));
-      const decls = paramNames.map((p, i) => `let ${p} = ${initCodes[i] as string}`).join("; ");
+      const jsParams = paramNames.map(sanitize);
+      const initEs = (initArgs as Expr[]).map((e, i) => compileExpr(e, childCtx(ctx, i + 2)));
+
+      const label = `_L${ctx.loopCounter.n++}`;
       const bodyCtx: CompileCtx = {
+        ...withLocals(
+          ctx,
+          paramNames.map((p, i) => [p, jsParams[i]!] as [string, string]),
+        ),
         path: childCtx(ctx, 3).path,
-        locals: withLocals(ctx, paramNames).locals,
-        loopParams: paramNames,
+        loop: { params: jsParams, label },
       };
-      const bodyCode = compileExpr(body, bodyCtx);
-      const assigns = paramNames.map((p, i) => `${p} = _lc._v[${i}]`).join("; ");
-      return `(()=>{ ${decls}; while(true){ try{ return (${bodyCode}) }catch(_lc){ if(_lc instanceof _LoopContinue){ ${assigns}; continue } throw _lc } } })()`;
+      const bodyStmts = compileTail(body, bodyCtx);
+
+      // Stmts: let p1 = init1; ...; label: while(true) { ...bodyStmts }
+      const stmts: JSStmt[] = [];
+      for (let i = 0; i < jsParams.length; i++) {
+        stmts.push({ t: "let", name: jsParams[i]!, init: initEs[i]! });
+      }
+      stmts.push({
+        t: "while",
+        label,
+        body: bodyStmts,
+      });
+      return { t: "iife", body: stmts };
     }
 
     case "__continue": {
-      // ["__continue", ...newArgs]
-      // Throws a LoopContinue sentinel carrying the new loop variable values.
-      // Only valid inside __loop body.
-      if (ctx.loopParams === null) {
+      // __continue can only appear in tail position (handled by compileTail).
+      // If we reach here in expression context, that's an error — though the
+      // value is never used, we still need to remain semantically valid.
+      // The check ensures it's only used inside a __loop.
+      if (ctx.loop === null) {
         throw new CompileError("__continue outside __loop", ctx.path);
       }
-      const loopParams = ctx.loopParams;
-      const newArgCodes = arr.slice(1).map((e, i) => compileExpr(e as Expr, childCtx(ctx, i + 1)));
-      if (newArgCodes.length !== loopParams.length) {
-        throw new CompileError(
-          `__continue: expected ${loopParams.length} args, got ${newArgCodes.length}`,
-          ctx.path,
-        );
-      }
-      return `(()=>{ throw new _LoopContinue([${newArgCodes.join(", ")}]); })()`;
+      // Emit a (dead) expression that, if ever reached as a value, throws.
+      // In practice compileTail intercepts __continue before this is hit.
+      throw new CompileError("__continue must appear in tail position of __loop body", ctx.path);
     }
 
     default:
@@ -833,42 +1105,271 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
   }
 }
 
-function compileIsCheck(typStr: string, valExpr: string): string {
-  switch (typStr) {
-    case "null":
-      return `(${valExpr} === null)`;
-    case "bool":
-    case "boolean":
-      return `(typeof ${valExpr} === "boolean")`;
-    case "int":
-      return `(typeof ${valExpr} === "bigint")`;
-    case "float":
-      return `(typeof ${valExpr} === "number")`;
-    case "number":
-      return `(typeof ${valExpr} === "bigint" || typeof ${valExpr} === "number")`;
-    case "string":
-      return `(typeof ${valExpr} === "string")`;
-    case "array":
-      return `Array.isArray(${valExpr})`;
-    case "record":
-      return `(${valExpr} !== null && typeof ${valExpr} === "object" && !Array.isArray(${valExpr}))`;
-    case "variant":
-      return `(${valExpr} !== null && typeof ${valExpr} === "object" && typeof ${valExpr}.$tag === "string")`;
+// Compile in tail-statement position: result becomes either `return expr;` or,
+// for __continue, a sequence of assignments + `continue label;`.
+// Used inside __loop bodies so __continue emits real labeled-continue without
+// crossing any function boundary.
+function compileTail(expr: Expr, ctx: CompileCtx): JSStmt[] {
+  // Atoms / variable refs / ops other than control-flow ones fall through to
+  // expression compilation wrapped in a return.
+  if (
+    expr === null ||
+    typeof expr === "boolean" ||
+    typeof expr === "number" ||
+    typeof expr === "string"
+  ) {
+    return [{ t: "return", expr: compileExpr(expr, ctx) }];
+  }
+  const arr = expr as Expr[];
+  if (arr.length === 0) {
+    return [{ t: "return", expr: compileExpr(expr, ctx) }];
+  }
+  const opExpr = arr[0];
+  if (typeof opExpr !== "string") {
+    return [{ t: "return", expr: compileExpr(expr, ctx) }];
+  }
+  const op = opExpr;
+
+  switch (op) {
+    case "__continue": {
+      if (ctx.loop === null) {
+        throw new CompileError("__continue outside __loop", ctx.path);
+      }
+      const loop = ctx.loop;
+      const newArgEs = arr.slice(1).map((e, i) => compileExpr(e as Expr, childCtx(ctx, i + 1)));
+      if (newArgEs.length !== loop.params.length) {
+        throw new CompileError(
+          `__continue: expected ${loop.params.length} args, got ${newArgEs.length}`,
+          ctx.path,
+        );
+      }
+      // Evaluate args into temporaries first to avoid aliasing with loop params.
+      const stmts: JSStmt[] = [];
+      const tmpNames: string[] = [];
+      for (let i = 0; i < newArgEs.length; i++) {
+        const tmp = `_m_$c${ctx.loopCounter.n}_${i}`;
+        tmpNames.push(tmp);
+        stmts.push({ t: "let", name: tmp, init: newArgEs[i]! });
+      }
+      for (let i = 0; i < loop.params.length; i++) {
+        stmts.push({
+          t: "assign-stmt",
+          lhs: loop.params[i]!,
+          rhs: J.id(tmpNames[i]!),
+        });
+      }
+      stmts.push({ t: "continue", label: loop.label });
+      return stmts;
+    }
+
+    case "if": {
+      if (arr.length !== 4) {
+        return [{ t: "return", expr: compileExpr(expr, ctx) }];
+      }
+      const testE = compileExpr(arr[1] as Expr, childCtx(ctx, 1));
+      const thenStmts = compileTail(arr[2] as Expr, childCtx(ctx, 2));
+      const elseStmts = compileTail(arr[3] as Expr, childCtx(ctx, 3));
+      return [{ t: "if-stmt", test: testE, cons: thenStmts, else: elseStmts }];
+    }
+
+    case "do": {
+      if (arr.length < 2) {
+        return [{ t: "return", expr: compileExpr(expr, ctx) }];
+      }
+      const stmts: JSStmt[] = [];
+      for (let i = 1; i < arr.length - 1; i++) {
+        stmts.push({
+          t: "expr",
+          expr: compileExpr(arr[i] as Expr, childCtx(ctx, i)),
+        });
+      }
+      const tail = compileTail(arr[arr.length - 1] as Expr, childCtx(ctx, arr.length - 1));
+      return [...stmts, ...tail];
+    }
+
+    case "let": {
+      const bindings = arr[1];
+      if (!Array.isArray(bindings)) {
+        return [{ t: "return", expr: compileExpr(expr, ctx) }];
+      }
+      const body = arr[2] as Expr;
+      const stmts: JSStmt[] = [];
+      let currentCtx = ctx;
+      for (let i = 0; i < bindings.length; i++) {
+        const binding = bindings[i];
+        if (!Array.isArray(binding) || binding.length !== 2) {
+          throw new CompileError("each let binding must be [name, expr]", [...ctx.path, 1, i]);
+        }
+        const name = binding[0];
+        if (typeof name !== "string") {
+          throw new CompileError("let binding name must be a string", [...ctx.path, 1, i, 0]);
+        }
+        const valExpr = compileExpr(binding[1] as Expr, {
+          ...currentCtx,
+          path: childCtx(ctx, i).path,
+        });
+        const jsName = sanitize(name);
+        stmts.push({ t: "let", name: jsName, init: valExpr });
+        currentCtx = withLocals(currentCtx, [[name, jsName]]);
+      }
+      const tail = compileTail(body, {
+        ...currentCtx,
+        path: childCtx(ctx, 2).path,
+      });
+      // Wrap in a block so `let` declarations don't leak across iterations.
+      return [{ t: "block", stmts: [...stmts, ...tail] }];
+    }
+
+    case "cond": {
+      if (arr.length < 2) {
+        return [{ t: "return", expr: compileExpr(expr, ctx) }];
+      }
+      const clauses = arr.slice(1);
+      // Build from end: start with non-exhaustive throw, wrap in if-stmt's.
+      let elseBranch: JSStmt[] = [
+        {
+          t: "throw",
+          expr: {
+            t: "new",
+            ctor: J.id("Error"),
+            args: [J.lit(JSON.stringify("non-exhaustive cond"))],
+          },
+        },
+      ];
+      for (let i = clauses.length - 1; i >= 0; i--) {
+        const clause = clauses[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          throw new CompileError("cond clause must be [test, expr]", [...ctx.path, i + 1]);
+        }
+        const test = clause[0];
+        const clauseExpr = clause[1] as Expr;
+        const branch = compileTail(clauseExpr, childCtx(ctx, i + 1));
+        if (test === "else") {
+          elseBranch = branch;
+        } else {
+          const testE = compileExpr(test as Expr, childCtx(ctx, i + 1));
+          elseBranch = [{ t: "if-stmt", test: testE, cons: branch, else: elseBranch }];
+        }
+      }
+      return elseBranch;
+    }
+
+    case "match": {
+      if (arr.length < 2) {
+        return [{ t: "return", expr: compileExpr(expr, ctx) }];
+      }
+      const scrutE = compileExpr(arr[1] as Expr, childCtx(ctx, 1));
+      const clauses = arr.slice(2);
+      const scrutName = `_m_$s${ctx.loopCounter.n}`;
+      const stmts: JSStmt[] = [{ t: "let", name: scrutName, init: scrutE }];
+      for (let i = 0; i < clauses.length; i++) {
+        const clause = clauses[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          throw new CompileError("match clause must be [pattern, body]", [...ctx.path, i + 2]);
+        }
+        const pattern = clause[0];
+        const body = clause[1] as Expr;
+        if (!Array.isArray(pattern) || pattern.length < 1) {
+          throw new CompileError("match pattern must be an array starting with a tag", [
+            ...ctx.path,
+            i + 2,
+            0,
+          ]);
+        }
+        const tag = pattern[0];
+        if (typeof tag !== "string") {
+          throw new CompileError("match pattern tag must be a string", [...ctx.path, i + 2, 0]);
+        }
+        const bindingNames = pattern.slice(1) as string[];
+        const mapping: [string, string][] = bindingNames.map((n) => [n, sanitize(n)]);
+        const bodyCtx = withLocals(ctx, mapping);
+        const thenStmts: JSStmt[] = [];
+        for (let fi = 0; fi < bindingNames.length; fi++) {
+          thenStmts.push({
+            t: "let",
+            name: mapping[fi]![1],
+            init: J.member(J.id(scrutName), `$${fi}`),
+          });
+        }
+        const tail = compileTail(body, {
+          ...bodyCtx,
+          path: childCtx(ctx, i + 2).path,
+        });
+        thenStmts.push(...tail);
+        stmts.push({
+          t: "if-stmt",
+          test: J.binary("===", J.member(J.id(scrutName), "$tag"), J.lit(JSON.stringify(tag))),
+          cons: thenStmts,
+        });
+      }
+      stmts.push({
+        t: "throw",
+        expr: {
+          t: "new",
+          ctor: J.id("Error"),
+          args: [J.lit(JSON.stringify("non-exhaustive match"))],
+        },
+      });
+      return [{ t: "block", stmts }];
+    }
+
     default:
-      return "false";
+      return [{ t: "return", expr: compileExpr(expr, ctx) }];
   }
 }
 
-// Sentinel class for __loop/__continue: thrown by __continue, caught by __loop.
-class _LoopContinue {
-  constructor(public readonly _v: unknown[]) {}
+function compileIsCheck(typStr: string, val: JSExpr): JSExpr {
+  switch (typStr) {
+    case "null":
+      return J.binary("===", val, J.lit("null"));
+    case "bool":
+    case "boolean":
+      return J.binary("===", J.unary("typeof ", val), J.lit('"boolean"'));
+    case "int":
+      return J.binary("===", J.unary("typeof ", val), J.lit('"bigint"'));
+    case "float":
+      return J.binary("===", J.unary("typeof ", val), J.lit('"number"'));
+    case "number":
+      return J.binary(
+        "||",
+        J.binary("===", J.unary("typeof ", val), J.lit('"bigint"')),
+        J.binary("===", J.unary("typeof ", val), J.lit('"number"')),
+      );
+    case "string":
+      return J.binary("===", J.unary("typeof ", val), J.lit('"string"'));
+    case "array":
+      return J.call(J.member(J.id("Array"), "isArray"), [val]);
+    case "record":
+      return J.binary(
+        "&&",
+        J.binary(
+          "&&",
+          J.binary("!==", val, J.lit("null")),
+          J.binary("===", J.unary("typeof ", val), J.lit('"object"')),
+        ),
+        J.unary("!", J.call(J.member(J.id("Array"), "isArray"), [val])),
+      );
+    case "variant":
+      return J.binary(
+        "&&",
+        J.binary(
+          "&&",
+          J.binary("!==", val, J.lit("null")),
+          J.binary("===", J.unary("typeof ", val), J.lit('"object"')),
+        ),
+        J.binary("===", J.unary("typeof ", J.member(val, "$tag")), J.lit('"string"')),
+      );
+    default:
+      return J.lit("false");
+  }
 }
 
 // Compile a Marinada expression to a native JS function.
 // Throws CompileError if the expression cannot be compiled (e.g. uses effects).
 export function compile(expr: Expr): JitFn {
   const body = compileExpr(expr, emptyCtx());
+  const src = serializeExpr(body);
   // eslint-disable-next-line no-new-func
-  const raw = new Function("env", "_rt", "_nat", "_LoopContinue", `return (${body})`);
-  return (env: Record<string, unknown>) => raw(env, RUNTIME, NATIVES, _LoopContinue);
+  const raw = new Function("env", "_rt", "_nat", `return (${src})`);
+  return (env: Record<string, unknown>) => raw(env, RUNTIME, NATIVES);
 }
