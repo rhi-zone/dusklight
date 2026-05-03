@@ -455,15 +455,19 @@ Type definitions (DUs, aliases) live in a separate schema/manifest, not inline i
 
 ### Import Schemes
 
-All imports resolve to modules the same way. No special cases.
+All imports produce a `Module` — the output format is identical regardless of scheme. The schemes differ in *how the host resolves them*, not in what they produce.
 
-| Scheme    | Resolves to                                      |
+| Scheme    | Resolution strategy                              |
 |-----------|--------------------------------------------------|
-| `lib:`    | Named installed library (builtins, plugins, npm) |
-| `local:`  | Filesystem path                                  |
-| `https:`  | URL                                              |
+| `lib:`    | Named registry lookup (like npm package names)   |
+| `local:`  | Filesystem path resolution                       |
+| `https:`  | Network fetch                                    |
 
-Built-in libraries (all resolved as ordinary modules, no special-casing):
+`lib:` and `local:` are separate because they resolve differently: `lib:foo` asks "what is `foo` in the installed library registry?", while `local:./foo.json` asks "what is at this path?". This mirrors the `require('lodash')` vs `require('./utils')` distinction in Node — same module mechanism, different lookup strategy.
+
+Resolution is delegated to the host via a resolver callback `(scheme, path) => Promise<Module>`. Marinada does not hardcode any resolution strategy. The host decides how `lib:`, `local:`, and `https:` are resolved in its context (filesystem, virtual FS, network, cache, etc.).
+
+`lib:std` is the singular blessed standard library — the only `lib:` module guaranteed to be present in every Marinada environment. Other `lib:` modules are ecosystem libraries:
 - `lib:std` — standard functions (`map`, `filter`, `reduce`, `compose`, ...), standard DUs (`option`, `result`), standard effects (`Error`, `Async`, `Yield`)
 - `lib:transport` — HTTP, WebSocket, SSE, TCP capabilities
 - `lib:protocol` — JSON-RPC and other protocol primitives
