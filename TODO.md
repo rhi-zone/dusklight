@@ -16,13 +16,13 @@ module.ts:25 skips all non-lib:std imports. `local:` and `https:` schemes parse 
 
 `cond` is handled in typecheck.ts but has no case in evaluate.ts — inverse of the perform/handle gap.
 
-### [ ] Marinada: enforce linearity on closure capture
+### [x] Marinada: enforce linearity on closure capture via fn-once annotation
 
-Linear values captured in closures are not checked — the linearity pass counts each syntactic reference as exactly 1 use, so a linear value referenced inside an `fn` body counts once regardless of how many times the closure is called. Either forbid linear values in closures, or model call-count (undecidable in general — likely needs a "must be called exactly once" closure annotation).
+Regular `fn` now errors (`LINEAR_CAPTURED_BY_FN`) if it captures an outer explicit-linear value. A new `fn-once` op declares the closure is called exactly once; the linearity pass counts each outer linear capture as 1 use at the `fn-once` expression site. `fn-once` typechecks and evaluates identically to `fn`.
 
-### [ ] Marinada: enforce linearity in `letrec` mutual recursion
+### [x] Marinada: enforce linearity in `letrec` mutual recursion
 
-Linear values passed across a `letrec` recursion boundary are not modelled — the pass doesn't detect duplication through mutual recursion. Needs either forbidding linear values in recursive bindings or more careful use-count modelling across the SCC.
+The linearity pass now errors (`LINEAR_IN_LETREC`) if any outer explicit-linear value is referenced in a `letrec` RHS. Linear values may only appear in `let` (non-recursive) bindings.
 
 ### [x] Marinada: error on unhandled effects at module scope
 

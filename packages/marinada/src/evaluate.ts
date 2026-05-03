@@ -1255,12 +1255,14 @@ function* evalGen(expr: Expr, env: Env): EvalGen {
     }
 
     // --- Functions ---
+    // fn-once is a linearity-only annotation; at runtime it behaves identically to fn.
+    case "fn-once":
     case "fn": {
       // ["fn", params, body]  params is array of strings (or [name, type] pairs — we take name only)
-      if (arr.length !== 3) return err("ARITY_ERROR", [], "fn requires 2 args");
+      if (arr.length !== 3) return err("ARITY_ERROR", [], op + " requires 2 args");
       const paramsExpr = arr[1];
       if (!Array.isArray(paramsExpr)) {
-        return err("TYPE_ERROR", [1], "fn params must be an array");
+        return err("TYPE_ERROR", [1], op + " params must be an array");
       }
       const params: string[] = [];
       for (let i = 0; i < paramsExpr.length; i++) {
@@ -1271,7 +1273,7 @@ function* evalGen(expr: Expr, env: Env): EvalGen {
           // [name, type] annotation — take just the name
           params.push(p[0]);
         } else {
-          return err("TYPE_ERROR", [1, i], "fn param must be a string or [name, type] pair");
+          return err("TYPE_ERROR", [1, i], op + " param must be a string or [name, type] pair");
         }
       }
       return ok({ kind: "fn", params, body: at(arr, 2), env });

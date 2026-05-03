@@ -2306,19 +2306,53 @@ describe("adversarial", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("linear value captured in closure body — currently NOT flagged (known gap)", () => {
-    // Documents a conservative limitation: a fn that captures a linear free
-    // variable does not, by itself, count as a use (the body is not evaluated
-    // at definition time). Calling the closure later would consume the value,
-    // but the type system doesn't track this. Pin: this currently passes.
+  it("linear value captured in regular fn body → LINEAR_CAPTURED_BY_FN error", () => {
+    // A regular fn may be called any number of times, so capturing a linear
+    // value is forbidden — the type system cannot guarantee exactly-once use.
     const LINEAR_INT: MType = { kind: "linear", inner: INT };
     const CONSUME: MType = { kind: "fn", params: [LINEAR_INT], ret: INT };
     const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME });
     const result = typecheck(["fn", [], ["call", "consume", "x"]], env);
+    expect(result).toEqual(err("LINEAR_CAPTURED_BY_FN"));
+  });
+
+  it("linear value in letrec RHS → LINEAR_IN_LETREC error", () => {
+    // Call count through mutual recursion is undecidable, so outer linear
+    // values must not appear in any letrec RHS.
+    const LINEAR_INT: MType = { kind: "linear", inner: INT };
+    const CONSUME: MType = { kind: "fn", params: [LINEAR_INT], ret: INT };
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME });
+    const result = typecheck(
+      ["letrec", [["f", ["fn", [], ["call", "consume", "x"]]]], ["call", "f"]],
+      env,
+    );
+    expect(result).toEqual(err("LINEAR_IN_LETREC"));
+  });
+
+  it("fn-once consuming a linear capture → ok", () => {
+    // fn-once declares the closure is called exactly once; the linear capture
+    // is counted as consumed at the fn-once expression site.
+    const LINEAR_INT: MType = { kind: "linear", inner: INT };
+    const CONSUME: MType = { kind: "fn", params: [LINEAR_INT], ret: INT };
+    const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME });
+    const result = typecheck(["fn-once", [], ["call", "consume", "x"]], env);
     expect(result.ok).toBe(true);
   });
 
-  it("linear value used in letrec body once → ok (pin current behaviour)", () => {
+  it("fn-once produces the same fn type as fn", () => {
+    // fn-once is a linearity-only annotation; the type is identical to fn.
+    const resultFn = typecheck(["fn", [["x", "int"]], ["+", "x", 1]]);
+    const resultFnOnce = typecheck(["fn-once", [["x", "int"]], ["+", "x", 1]]);
+    expect(resultFn.ok).toBe(true);
+    expect(resultFnOnce.ok).toBe(true);
+    if (resultFn.ok && resultFnOnce.ok) {
+      expect(prettyType(resultFnOnce.type)).toBe(prettyType(resultFn.type));
+    }
+  });
+
+  it("linear value used in letrec body (not RHS) once → ok", () => {
+    // Linear values are allowed in the letrec body expression — only RHSs
+    // are forbidden.
     const LINEAR_INT: MType = { kind: "linear", inner: INT };
     const CONSUME: MType = { kind: "fn", params: [LINEAR_INT], ret: INT };
     const env = EMPTY_TYPE_ENV.extend({ x: LINEAR_INT, consume: CONSUME });

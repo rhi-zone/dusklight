@@ -1829,8 +1829,10 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
     }
 
     // -------------------- functions --------------------
+    // fn-once is a linearity-only annotation; it typechecks identically to fn.
+    case "fn-once":
     case "fn": {
-      if (!expectArity(ctx, "fn", arr, 2)) {
+      if (!expectArity(ctx, op, arr, 2)) {
         return {
           kind: "fn",
           params: [],
@@ -2991,6 +2993,12 @@ type UsageEntry = {
   bindPath: number[];
   /** Display name of the binder, for error messages. */
   name: string;
+  /**
+   * True when the linearity comes from an explicit `linear`/`affine` type
+   * annotation. False for capability-derived linearity (`Cap<T>`). Only
+   * explicit-linear entries trigger LINEAR_CAPTURED_BY_FN / LINEAR_IN_LETREC.
+   */
+  explicit: boolean;
 };
 
 /**
@@ -3034,6 +3042,15 @@ function classifyLinearity(t: MType): Linearity | null {
     default:
       return null;
   }
+}
+
+/**
+ * True when the type carries explicit `linear`/`affine` annotation.
+ * Cap-derived linearity is NOT explicit — capabilities may be freely captured
+ * in closures without triggering LINEAR_CAPTURED_BY_FN / LINEAR_IN_LETREC.
+ */
+function isExplicitLinear(t: MType): boolean {
+  return t.kind === "linear" || t.kind === "affine";
 }
 
 /**
@@ -3181,6 +3198,113 @@ function withLinPath<T>(ctx: LinCtx, idx: number, fn: (sub: LinCtx) => T): T {
 }
 
 /**
+ * Collect all UsageEntry objects from `scope` that are referenced (as free
+ * variables) inside `expr`, excluding names that are locally bound within
+ * `expr`. Each unique entry is returned at most once.
+ *
+ * Used to detect linear captures inside `fn` / `fn-once` bodies and `letrec`
+ * RHSs without running the full usage-counting walk.
+ */
+function collectFreeLinearRefs(
+  expr: Expr,
+  scope: UsageScope,
+  locallyBound: Set<string>,
+): UsageEntry[] {
+  const found = new Map<UsageEntry, true>();
+  function scan(e: Expr, bound: Set<string>): void {
+    if (e === null || typeof e === "boolean" || typeof e === "number") return;
+    if (typeof e === "string") {
+      if (bound.has(e)) return;
+      const entry = lookupUsage(scope, e);
+      // Only collect explicit linear/affine captures — not capability-linear.
+      if (entry !== undefined && entry.explicit) found.set(entry, true);
+      return;
+    }
+    if (!Array.isArray(e) || e.length === 0) return;
+    const head = e[0];
+    if (typeof head !== "string") return;
+    // Track new binders introduced by let / letrec / fn / fn-once / match to
+    // correctly exclude shadowed names.
+    if (head === "let" && e.length === 3) {
+      const bindings = e[1];
+      let cur = bound;
+      if (Array.isArray(bindings)) {
+        for (const b of bindings) {
+          if (Array.isArray(b) && b.length === 2) {
+            scan(b[1] as Expr, cur);
+            if (typeof b[0] === "string") {
+              cur = new Set(cur);
+              cur.add(b[0] as string);
+            }
+          }
+        }
+      }
+      scan(e[2] as Expr, cur);
+      return;
+    }
+    if (head === "letrec" && e.length === 3) {
+      const bindings = e[1];
+      let cur = bound;
+      if (Array.isArray(bindings)) {
+        for (const b of bindings) {
+          if (Array.isArray(b) && b.length === 2 && typeof b[0] === "string") {
+            cur = new Set(cur);
+            cur.add(b[0] as string);
+          }
+        }
+        for (const b of bindings) {
+          if (Array.isArray(b) && b.length === 2) {
+            scan(b[1] as Expr, cur);
+          }
+        }
+      }
+      scan(e[2] as Expr, cur);
+      return;
+    }
+    if ((head === "fn" || head === "fn-once") && e.length === 3) {
+      const params = e[1];
+      let cur = bound;
+      if (Array.isArray(params)) {
+        for (const p of params) {
+          let pname: string | null = null;
+          if (typeof p === "string") pname = p;
+          else if (Array.isArray(p) && p.length >= 1 && typeof p[0] === "string") pname = p[0];
+          if (pname !== null) {
+            cur = new Set(cur);
+            cur.add(pname);
+          }
+        }
+      }
+      scan(e[2] as Expr, cur);
+      return;
+    }
+    if (head === "match" && e.length >= 3) {
+      scan(e[1] as Expr, bound);
+      for (let i = 2; i < e.length; i++) {
+        const clause = e[i];
+        if (!Array.isArray(clause) || clause.length !== 2) continue;
+        const pattern = clause[0];
+        let branchBound = bound;
+        if (Array.isArray(pattern) && pattern.length >= 1 && typeof pattern[0] === "string") {
+          for (let j = 1; j < pattern.length; j++) {
+            if (typeof pattern[j] === "string" && pattern[j] !== "_") {
+              branchBound = new Set(branchBound);
+              branchBound.add(pattern[j] as string);
+            }
+          }
+        }
+        scan(clause[1] as Expr, branchBound);
+      }
+      return;
+    }
+    // Default: recurse into all children.
+    for (let i = 1; i < e.length; i++) scan(e[i] as Expr, bound);
+  }
+  scan(expr, locallyBound);
+  return Array.from(found.keys());
+}
+
+/**
  * Walk an expression in linearity mode, accumulating use counts on `scope`.
  *
  * The walker mirrors `infer` structurally but is independent — it only cares
@@ -3279,6 +3403,7 @@ function walkLin(expr: Expr, scope: UsageScope, env: TypeEnv, ctx: LinCtx): void
             uses: 0,
             bindPath: [...ctx.path, 1, i],
             name,
+            explicit: isExplicitLinear(body),
           };
           curScope = {
             entries: new Map([[name, entry]]),
@@ -3301,17 +3426,22 @@ function walkLin(expr: Expr, scope: UsageScope, env: TypeEnv, ctx: LinCtx): void
       // For letrec we don't attempt to model linear recursive bindings —
       // walk all RHSs and the body in the same scope. Linear bindings declared
       // in letrec are checked the same way.
+      //
+      // Outer-scope linear values must NOT appear in any letrec RHS: call
+      // count through mutual recursion is undecidable.
       const introduced: UsageEntry[] = [];
       let curScope = scope;
       // First, allocate fresh placeholders so all RHS probes can see the
       // names. Then probe each RHS to detect linearity.
       const placeholders: Record<string, MType> = {};
+      const recNames = new Set<string>();
       for (let i = 0; i < bindings.length; i++) {
         const b = bindings[i];
         if (!Array.isArray(b) || b.length !== 2) continue;
         const name = b[0];
         if (typeof name !== "string") continue;
         placeholders[name] = ctx.state.freshVar();
+        recNames.add(name);
       }
       const recEnv = env.extend(placeholders);
       for (let i = 0; i < bindings.length; i++) {
@@ -3328,9 +3458,30 @@ function walkLin(expr: Expr, scope: UsageScope, env: TypeEnv, ctx: LinCtx): void
             uses: 0,
             bindPath: [...ctx.path, 1, i],
             name,
+            explicit: isExplicitLinear(body),
           };
           curScope = { entries: new Map([[name, entry]]), parent: curScope };
           introduced.push(entry);
+        }
+      }
+      // Check each RHS for outer linear captures before walking.
+      for (let i = 0; i < bindings.length; i++) {
+        const b = bindings[i];
+        if (!Array.isArray(b) || b.length !== 2) continue;
+        const outerCaptures = collectFreeLinearRefs(b[1] as Expr, scope, recNames);
+        for (const cap of outerCaptures) {
+          withLinPath(ctx, 1, (sub) =>
+            withLinPath(sub, i, (sub2) =>
+              linAddError(
+                sub2,
+                "LINEAR_IN_LETREC",
+                "linear value '" +
+                  cap.name +
+                  "' cannot be referenced in a letrec RHS (call count is undecidable)",
+                sub2.path,
+              ),
+            ),
+          );
         }
       }
       for (let i = 0; i < bindings.length; i++) {
@@ -3344,14 +3495,13 @@ function walkLin(expr: Expr, scope: UsageScope, env: TypeEnv, ctx: LinCtx): void
       for (const e of introduced) checkBindingFinal(ctx, e);
       return;
     }
-    case "fn": {
+    case "fn":
+    case "fn-once": {
       if (arr.length !== 3) return;
       const paramsExpr = arr[1];
       if (!Array.isArray(paramsExpr)) return;
-      // Each linear/affine param introduces a fresh tracked entry. The fn
-      // body is its own scope: outer linear vars are still reachable (a
-      // syntactic reference inside the body counts as one use of the outer
-      // entry — captured-by-closure semantics, conservative).
+      // Collect param names for capture detection (params shadow outer vars).
+      const paramNames = new Set<string>();
       const introduced: UsageEntry[] = [];
       let bodyScope: UsageScope = { entries: new Map(), parent: scope };
       for (let i = 0; i < paramsExpr.length; i++) {
@@ -3367,6 +3517,7 @@ function walkLin(expr: Expr, scope: UsageScope, env: TypeEnv, ctx: LinCtx): void
           }
         }
         if (pname === null) continue;
+        paramNames.add(pname);
         if (ptype === null) continue;
         const lin = classifyLinearity(ptype);
         if (lin !== null) {
@@ -3375,12 +3526,47 @@ function walkLin(expr: Expr, scope: UsageScope, env: TypeEnv, ctx: LinCtx): void
             uses: 0,
             bindPath: [...ctx.path, 1, i],
             name: pname,
+            explicit: isExplicitLinear(ptype),
           };
           bodyScope.entries.set(pname, entry);
           introduced.push(entry);
         }
       }
-      withLinPath(ctx, 2, (sub) => walkLin(at(arr, 2), bodyScope, env, sub));
+      // Detect outer-scope explicit-linear captures in the body.
+      // Uses collectFreeLinearRefs to find which outer explicit-linear entries
+      // are referenced (considering inner binders that shadow names).
+      const outerCaptures = collectFreeLinearRefs(at(arr, 2), scope, paramNames);
+      if (op === "fn") {
+        // Regular fn must not capture outer explicit-linear values — call count
+        // is unknown, so we cannot guarantee exactly-once use.
+        for (const cap of outerCaptures) {
+          withLinPath(ctx, 2, (sub) =>
+            linAddError(
+              sub,
+              "LINEAR_CAPTURED_BY_FN",
+              "linear value '" +
+                cap.name +
+                "' cannot be captured by a regular fn (use fn-once for single-call closures)",
+              sub.path,
+            ),
+          );
+        }
+        // Snapshot outer explicit-linear entries before body walk so we can
+        // restore their counts — we've already emitted errors; don't let them
+        // accidentally satisfy the "used once" check via the body walk.
+        const snapBefore = new Map<UsageEntry, number>();
+        for (const cap of outerCaptures) snapBefore.set(cap, cap.uses);
+        withLinPath(ctx, 2, (sub) => walkLin(at(arr, 2), bodyScope, env, sub));
+        // Restore outer explicit-linear entry counts.
+        for (const [cap, n] of snapBefore) cap.uses = n;
+      } else {
+        // fn-once: snapshot outer explicit-linear entries before body walk,
+        // then clamp each to pre-walk + 1 (captured once at definition site).
+        const snapBefore = new Map<UsageEntry, number>();
+        for (const cap of outerCaptures) snapBefore.set(cap, cap.uses);
+        withLinPath(ctx, 2, (sub) => walkLin(at(arr, 2), bodyScope, env, sub));
+        for (const [cap, n] of snapBefore) cap.uses = n + 1;
+      }
       for (const e of introduced) checkBindingFinal(ctx, e);
       return;
     }
@@ -3425,6 +3611,7 @@ function walkLin(expr: Expr, scope: UsageScope, env: TypeEnv, ctx: LinCtx): void
                     uses: 0,
                     bindPath: [...ctx.path, idx, 0, j],
                     name: bname,
+                    explicit: isExplicitLinear(ft),
                   };
                   branchScope.entries.set(bname, entry);
                   introduced.push(entry);
@@ -3510,6 +3697,7 @@ function runLinearityPass(expr: Expr, env: TypeEnv, ctx: LinCtx): void {
           uses: 0,
           bindPath: [],
           name,
+          explicit: isExplicitLinear(body),
         };
         rootEntries.set(name, entry);
         introduced.push(entry);

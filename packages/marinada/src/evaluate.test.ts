@@ -577,6 +577,24 @@ describe("fn and call", () => {
     const expr: Expr = ["call", ["fn", [["x", "int"]], ["*", "x", 2]], 7];
     expect(evaluate(expr)).toEqual(ok(int(14)));
   });
+
+  it("fn-once evaluates identically to fn at runtime", () => {
+    // fn-once is a linearity-only annotation; at runtime it behaves like fn.
+    const expr: Expr = ["call", ["fn-once", ["x", "y"], ["+", "x", "y"]], 3, 4];
+    expect(evaluate(expr)).toEqual(ok(int(7)));
+  });
+
+  it("fn-once closure captures environment", () => {
+    const expr: Expr = [
+      "let",
+      [
+        ["base", 10],
+        ["adder", ["fn-once", ["x"], ["+", "x", "base"]]],
+      ],
+      ["call", "adder", 5],
+    ];
+    expect(evaluate(expr)).toEqual(ok(int(15)));
+  });
 });
 
 describe("DU variants and match", () => {
