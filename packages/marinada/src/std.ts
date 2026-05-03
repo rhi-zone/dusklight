@@ -180,10 +180,100 @@ export const STD_BINDINGS: StdBinding[] = [
   { name: "bool->str", expr: ["fn", ["b"], ["to-string", "b"]] },
 
   // --- Higher-order collection functions ---
-  // map, filter, reduce delegate to primitives of the same name.
-  { name: "map", expr: ["fn", ["f", "xs"], ["map", "f", "xs"]] },
-  { name: "filter", expr: ["fn", ["f", "xs"], ["filter", "f", "xs"]] },
-  { name: "reduce", expr: ["fn", ["f", "init", "xs"], ["reduce", "f", "init", "xs"]] },
+  // map: apply f to each element, returning a new array.
+  {
+    name: "map",
+    expr: [
+      "letrec",
+      [
+        [
+          "go",
+          [
+            "fn",
+            ["f", "xs", "acc", "i"],
+            [
+              "if",
+              ["==", "i", ["count", "xs"]],
+              "acc",
+              [
+                "call",
+                "go",
+                "f",
+                "xs",
+                ["array-push", "acc", ["call", "f", ["array-get", "xs", "i"]]],
+                ["+", "i", 1],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["f", "xs"], ["call", "go", "f", "xs", ["array"], 0]],
+    ],
+  },
+
+  // filter: keep only elements for which f returns true.
+  {
+    name: "filter",
+    expr: [
+      "letrec",
+      [
+        [
+          "go",
+          [
+            "fn",
+            ["f", "xs", "acc", "i"],
+            [
+              "if",
+              ["==", "i", ["count", "xs"]],
+              "acc",
+              [
+                "let",
+                [["item", ["array-get", "xs", "i"]]],
+                [
+                  "if",
+                  ["call", "f", "item"],
+                  ["call", "go", "f", "xs", ["array-push", "acc", "item"], ["+", "i", 1]],
+                  ["call", "go", "f", "xs", "acc", ["+", "i", 1]],
+                ],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["f", "xs"], ["call", "go", "f", "xs", ["array"], 0]],
+    ],
+  },
+
+  // reduce: fold array to a single value using f(acc, elem), starting from init.
+  {
+    name: "reduce",
+    expr: [
+      "letrec",
+      [
+        [
+          "go",
+          [
+            "fn",
+            ["f", "xs", "acc", "i"],
+            [
+              "if",
+              ["==", "i", ["count", "xs"]],
+              "acc",
+              [
+                "call",
+                "go",
+                "f",
+                "xs",
+                ["call", "f", "acc", ["array-get", "xs", "i"]],
+                ["+", "i", 1],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["f", "init", "xs"], ["call", "go", "f", "xs", "init", 0]],
+    ],
+  },
 
   // find: return first element matching predicate, or null.
   {
@@ -273,22 +363,56 @@ export const STD_BINDINGS: StdBinding[] = [
     ],
   },
 
-  // flat-map: map then flatten one level.
+  // flat-map: map f over xs, then flatten one level.
+  // Uses index-based recursion to avoid depending on the reduce std binding.
   {
     name: "flat-map",
     expr: [
-      "fn",
-      ["f", "xs"],
+      "letrec",
       [
-        "reduce",
+        // append-all: append all elements of src into acc, starting at index i
         [
-          "fn",
-          ["acc", "x"],
-          ["reduce", ["fn", ["a", "y"], ["array-push", "a", "y"]], "acc", ["call", "f", "x"]],
+          "append-all",
+          [
+            "fn",
+            ["src", "acc", "i"],
+            [
+              "if",
+              ["==", "i", ["count", "src"]],
+              "acc",
+              [
+                "call",
+                "append-all",
+                "src",
+                ["array-push", "acc", ["array-get", "src", "i"]],
+                ["+", "i", 1],
+              ],
+            ],
+          ],
         ],
-        ["array"],
-        "xs",
+        // go: process each element of xs, mapping f then appending results
+        [
+          "go",
+          [
+            "fn",
+            ["f", "xs", "acc", "i"],
+            [
+              "if",
+              ["==", "i", ["count", "xs"]],
+              "acc",
+              [
+                "call",
+                "go",
+                "f",
+                "xs",
+                ["call", "append-all", ["call", "f", ["array-get", "xs", "i"]], "acc", 0],
+                ["+", "i", 1],
+              ],
+            ],
+          ],
+        ],
       ],
+      ["fn", ["f", "xs"], ["call", "go", "f", "xs", ["array"], 0]],
     ],
   },
 

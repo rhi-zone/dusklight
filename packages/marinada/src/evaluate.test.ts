@@ -1,7 +1,9 @@
 import { describe, it, expect } from "bun:test";
 import { evaluate, EMPTY_ENV } from "./evaluate.ts";
+import { evaluateModule } from "./module.ts";
 import type { Value } from "./value.ts";
 import type { Expr } from "./types.ts";
+import type { Module } from "./types.ts";
 
 // --- Helpers ---
 
@@ -418,27 +420,6 @@ describe("type ops", () => {
 });
 
 describe("collections", () => {
-  it("map doubles each element", () => {
-    // [1, 2, 3] as array literal: we need to wrap it properly
-    // Actually in Marinada [1,2,3] is a call with op=1 (number) — not valid.
-    // We need to pass the array as a variable.
-    const env = EMPTY_ENV.extend({ nums: arr(int(1), int(2), int(3)) });
-    const expr2: Expr = ["map", ["fn", ["x"], ["*", "x", 2]], "nums"];
-    expect(evaluate(expr2, env)).toEqual(ok(arr(int(2), int(4), int(6))));
-  });
-
-  it("filter keeps matching elements", () => {
-    const env = EMPTY_ENV.extend({ nums: arr(int(1), int(2), int(3), int(4)) });
-    const expr: Expr = ["filter", ["fn", ["x"], ["==", ["%", "x", 2], 0]], "nums"];
-    expect(evaluate(expr, env)).toEqual(ok(arr(int(2), int(4))));
-  });
-
-  it("reduce sums array", () => {
-    const env = EMPTY_ENV.extend({ nums: arr(int(1), int(2), int(3), int(4)) });
-    const expr: Expr = ["reduce", ["fn", ["acc", "x"], ["+", "acc", "x"]], 0, "nums"];
-    expect(evaluate(expr, env)).toEqual(ok(int(10)));
-  });
-
   it("count array", () => {
     const env = EMPTY_ENV.extend({ nums: arr(int(1), int(2), int(3)) });
     expect(evaluate(["count", "nums"], env)).toEqual(ok(int(3)));
@@ -475,17 +456,6 @@ describe("collections", () => {
     const env = EMPTY_ENV.extend({ rec: rec({ x: int(10) }) });
     const result = evalOk(["vals", "rec"], env);
     expect(result).toEqual(arr(int(10)));
-  });
-
-  it("map type error: non-array", () => {
-    const env = EMPTY_ENV.extend({ x: int(5) });
-    expect(evaluate(["map", ["fn", ["v"], "v"], "x"], env)).toEqual(err("TYPE_ERROR"));
-  });
-
-  it("filter type error: predicate returns non-bool", () => {
-    const env = EMPTY_ENV.extend({ nums: arr(int(1)) });
-    const expr: Expr = ["filter", ["fn", ["x"], "x"], "nums"];
-    expect(evaluate(expr, env)).toEqual(err("TYPE_ERROR"));
   });
 });
 
@@ -771,21 +741,25 @@ describe("complex programs", () => {
     expect(evaluate(expr)).toEqual(ok(int(55)));
   });
 
-  it("map then filter then reduce", () => {
-    const env = EMPTY_ENV.extend({ nums: arr(int(1), int(2), int(3), int(4), int(5)) });
-    // Double, keep evens, sum
-    const expr: Expr = [
-      "reduce",
-      ["fn", ["acc", "x"], ["+", "acc", "x"]],
-      0,
-      [
-        "filter",
-        ["fn", ["x"], ["==", ["%", "x", 2], 0]],
-        ["map", ["fn", ["x"], ["*", "x", 2]], "nums"],
+  it("map then filter then reduce (via lib:std)", () => {
+    // Double [1..5], keep evens, sum → doubled: 2,4,6,8,10; evens: 2,4,6,8,10; sum: 30
+    const module: Module = {
+      imports: [{ from: "lib:std", import: ["map", "filter", "reduce"] }],
+      main: [
+        "call",
+        "reduce",
+        ["fn", ["acc", "x"], ["+", "acc", "x"]],
+        0,
+        [
+          "call",
+          "filter",
+          ["fn", ["x"], ["==", ["%", "x", 2], 0]],
+          ["call", "map", ["fn", ["x"], ["*", "x", 2]], ["array", 1, 2, 3, 4, 5]],
+        ],
       ],
-    ];
-    // doubled: 2,4,6,8,10; evens: 2,4,6,8,10; sum: 30
-    expect(evaluate(expr, env)).toEqual(ok(int(30)));
+    };
+    const r = evaluateModule(module);
+    expect(r).toEqual(ok(int(30)));
   });
 
   it("nested let with closures", () => {

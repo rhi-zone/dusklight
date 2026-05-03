@@ -597,69 +597,6 @@ function* evalGen(expr: Expr, env: Env): EvalGen {
     }
 
     // --- Collections ---
-    case "map": {
-      if (arr.length !== 3) return err("ARITY_ERROR", [], "map requires 2 args");
-      const fnR = prependPath(yield* evalGen(at(arr, 1), env), 1);
-      if (!fnR.ok) return fnR;
-      const arrR = prependPath(yield* evalGen(at(arr, 2), env), 2);
-      if (!arrR.ok) return arrR;
-      if (arrR.value.kind !== "array") {
-        return err("TYPE_ERROR", [2], "map requires array, got " + typeName(arrR.value));
-      }
-      const results: Value[] = [];
-      for (const item of arrR.value.value) {
-        const r = yield* callFnGen(fnR.value, [item], [1]);
-        if (!r.ok) return r;
-        results.push(r.value);
-      }
-      return ok({ kind: "array", value: results });
-    }
-
-    case "filter": {
-      if (arr.length !== 3) return err("ARITY_ERROR", [], "filter requires 2 args");
-      const fnR = prependPath(yield* evalGen(at(arr, 1), env), 1);
-      if (!fnR.ok) return fnR;
-      const arrR = prependPath(yield* evalGen(at(arr, 2), env), 2);
-      if (!arrR.ok) return arrR;
-      if (arrR.value.kind !== "array") {
-        return err("TYPE_ERROR", [2], "filter requires array, got " + typeName(arrR.value));
-      }
-      const results: Value[] = [];
-      for (const item of arrR.value.value) {
-        const r = yield* callFnGen(fnR.value, [item], [1]);
-        if (!r.ok) return r;
-        if (r.value.kind !== "bool") {
-          return err(
-            "TYPE_ERROR",
-            [1],
-            "filter predicate must return bool, got " + typeName(r.value),
-          );
-        }
-        if (r.value.value) results.push(item);
-      }
-      return ok({ kind: "array", value: results });
-    }
-
-    case "reduce": {
-      if (arr.length !== 4) return err("ARITY_ERROR", [], "reduce requires 3 args");
-      const fnR = prependPath(yield* evalGen(at(arr, 1), env), 1);
-      if (!fnR.ok) return fnR;
-      const initR = prependPath(yield* evalGen(at(arr, 2), env), 2);
-      if (!initR.ok) return initR;
-      const arrR = prependPath(yield* evalGen(at(arr, 3), env), 3);
-      if (!arrR.ok) return arrR;
-      if (arrR.value.kind !== "array") {
-        return err("TYPE_ERROR", [3], "reduce requires array, got " + typeName(arrR.value));
-      }
-      let acc = initR.value;
-      for (const item of arrR.value.value) {
-        const r = yield* callFnGen(fnR.value, [acc, item], [1]);
-        if (!r.ok) return r;
-        acc = r.value;
-      }
-      return ok(acc);
-    }
-
     case "count": {
       if (arr.length !== 2) return err("ARITY_ERROR", [], "count requires 1 arg");
       const arrR = prependPath(yield* evalGen(at(arr, 1), env), 1);

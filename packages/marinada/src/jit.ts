@@ -460,25 +460,6 @@ function compileExpr(expr: Expr, ctx: CompileCtx): string {
     case "set-in":
       return `_rt._setIn(${arg(1)}, ${arg(2)}, ${arg(3)})`;
 
-    case "map": {
-      const fnCode = arg(1);
-      const arrCode = arg(2);
-      return `(${arrCode}).map(((_$x) => (${fnCode})(_$x)))`;
-    }
-
-    case "filter": {
-      const fnCode = arg(1);
-      const arrCode = arg(2);
-      return `(${arrCode}).filter(((_$x) => (${fnCode})(_$x)))`;
-    }
-
-    case "reduce": {
-      const fnCode = arg(1);
-      const initCode = arg(2);
-      const arrCode = arg(3);
-      return `(${arrCode}).reduce(((_$acc, _$x) => (${fnCode})(_$acc, _$x)), ${initCode})`;
-    }
-
     case "count":
       return `_rt._count(${arg(1)})`;
 

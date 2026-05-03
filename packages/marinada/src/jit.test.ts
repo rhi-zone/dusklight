@@ -405,33 +405,6 @@ describe("get-in and set-in", () => {
   });
 });
 
-// --- map / filter / reduce ---
-
-describe("collections: map, filter, reduce", () => {
-  it("map doubles", () => {
-    const fn = (x: unknown) => (x as bigint) * 2n;
-    expect(run(["map", "f", "arr"], { f: fn, arr: [1n, 2n, 3n] })).toEqual([2n, 4n, 6n]);
-  });
-
-  it("map with inline fn", () => {
-    expect(run(["map", ["fn", ["x"], ["*", "x", 2]], "arr"], { arr: [1n, 2n, 3n] })).toEqual([
-      2n,
-      4n,
-      6n,
-    ]);
-  });
-
-  it("filter keeps evens", () => {
-    const isEven = (x: unknown) => (x as bigint) % 2n === 0n;
-    expect(run(["filter", "f", "arr"], { f: isEven, arr: [1n, 2n, 3n, 4n] })).toEqual([2n, 4n]);
-  });
-
-  it("reduce sum", () => {
-    const add = (a: unknown, b: unknown) => (a as bigint) + (b as bigint);
-    expect(run(["reduce", "f", 0, "arr"], { f: add, arr: [1n, 2n, 3n, 4n] })).toBe(10n);
-  });
-});
-
 // --- count / merge / keys / vals ---
 
 describe("count, merge, keys, vals", () => {
