@@ -8,6 +8,10 @@ Type representation (`{ kind: "linear"; inner: MType }`) exists in typecheck.ts:
 
 `perform` and `handle` are fully implemented in the evaluator (evaluate.ts:1357-1432) including multi-shot continuations, but typecheck.ts has no cases for them — they fall through to UNKNOWN_OP. Any effectful code fails typecheck unless wrapped in `["untyped", ...]`.
 
+### [ ] Marinada: JIT optimizer — see through lib:std for collection functions
+
+map/filter/reduce were removed from the primitive set and are now proper lib:std letrec expressions, but the JIT no longer emits native JS Array.prototype.map/filter/reduce for them. The spec says the compiler should pattern-match on the lib:std AST and emit optimized code (constant folding, loop fusion). Without this, collection-heavy expressions are slower than before.
+
 ### [ ] Marinada: implement local: and https: module import schemes
 
 module.ts:25 skips all non-lib:std imports. `local:` and `https:` schemes parse without error but names stay unbound. typecheck.ts:1373 types all such imports as UNKNOWN. Only `lib:std` is functional.
