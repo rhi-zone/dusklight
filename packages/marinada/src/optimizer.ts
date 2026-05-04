@@ -1176,6 +1176,598 @@ export function optimize(expr: Expr, rules: RewriteRule[], typeInfo?: TypeInfo):
   return optimizeNode(expr, index, fired, typeInfo);
 }
 
+// --- Phase 4: tail-call optimization ---
+//
+// Converts tail-recursive single-binding `letrec` forms into `__loop` /
+// `__continue` nodes — the canonical loop form. After TCO, all loops have a
+// single shape, which is the prerequisite for Phase 5 (loop pattern
+// recognition).
+
+/** Count free references to `name` in `expr`. Respects shadowing. */
+function countFreeRefs(name: string, expr: Expr): number {
+  if (typeof expr === "string") return expr === name ? 1 : 0;
+  if (!Array.isArray(expr) || expr.length === 0) return 0;
+  const op = expr[0];
+  if (typeof op !== "string") {
+    let n = 0;
+    for (const e of expr) n += countFreeRefs(name, e as Expr);
+    return n;
+  }
+  switch (op) {
+    case "__lit":
+      return 0;
+    case "fn":
+    case "fn-once": {
+      const ps = paramNames(expr[1] as Expr);
+      if (ps.includes(name)) return 0;
+      return countFreeRefs(name, expr[2] as Expr);
+    }
+    case "let": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return 0;
+      let total = 0;
+      let shadowed = false;
+      for (const b of bindings) {
+        if (!Array.isArray(b) || b.length !== 2) continue;
+        if (!shadowed) total += countFreeRefs(name, b[1] as Expr);
+        if (b[0] === name) shadowed = true;
+      }
+      if (!shadowed) total += countFreeRefs(name, expr[2] as Expr);
+      return total;
+    }
+    case "letrec": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return 0;
+      const names = bindings
+        .map((b) => (Array.isArray(b) ? b[0] : null))
+        .filter((n): n is string => typeof n === "string");
+      if (names.includes(name)) return 0;
+      let total = 0;
+      for (const b of bindings) {
+        if (!Array.isArray(b) || b.length !== 2) continue;
+        total += countFreeRefs(name, b[1] as Expr);
+      }
+      total += countFreeRefs(name, expr[2] as Expr);
+      return total;
+    }
+    case "match":
+    case "handle": {
+      let total = countFreeRefs(name, expr[1] as Expr);
+      for (let i = 2; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) continue;
+        const pattern = clause[0];
+        const body = clause[1] as Expr;
+        const bound = Array.isArray(pattern)
+          ? pattern.slice(1).filter((s): s is string => typeof s === "string")
+          : [];
+        if (!bound.includes(name)) total += countFreeRefs(name, body);
+      }
+      return total;
+    }
+    case "__loop": {
+      const ps = paramNames(expr[1] as Expr);
+      const initArgs = expr[2];
+      let total = 0;
+      if (Array.isArray(initArgs)) {
+        for (const a of initArgs) total += countFreeRefs(name, a as Expr);
+      }
+      if (!ps.includes(name)) total += countFreeRefs(name, expr[3] as Expr);
+      return total;
+    }
+    default: {
+      let total = 0;
+      for (let i = 1; i < expr.length; i++) total += countFreeRefs(name, expr[i] as Expr);
+      return total;
+    }
+  }
+}
+
+/** Verify every free reference to `name` in `expr` is the head of a
+ * `["call", name, ...args]` with exactly `arity` arguments. When
+ * `requireTailOnly` is set, additionally require each such call to be in a
+ * tail position. Used to validate the body of the recursive fn (tail-only)
+ * and the entry expression (any position is fine — the call subtree gets
+ * replaced wholesale by a `__loop` node). */
+function checkRecCallShape(
+  expr: Expr,
+  name: string,
+  arity: number,
+  requireTailOnly: boolean,
+  inTail: boolean,
+): boolean {
+  if (typeof expr === "string") return expr !== name;
+  if (!Array.isArray(expr) || expr.length === 0) return true;
+  const op = expr[0];
+  if (typeof op !== "string") {
+    for (const e of expr) {
+      if (!checkRecCallShape(e as Expr, name, arity, requireTailOnly, false)) return false;
+    }
+    return true;
+  }
+  switch (op) {
+    case "__lit":
+      return true;
+    case "call": {
+      const head = expr[1];
+      if (head === name) {
+        if (requireTailOnly && !inTail) return false;
+        if (expr.length - 2 !== arity) return false;
+        for (let i = 2; i < expr.length; i++) {
+          if (!checkRecCallShape(expr[i] as Expr, name, arity, requireTailOnly, false))
+            return false;
+        }
+        return true;
+      }
+      for (let i = 1; i < expr.length; i++) {
+        if (!checkRecCallShape(expr[i] as Expr, name, arity, requireTailOnly, false)) return false;
+      }
+      return true;
+    }
+    case "if": {
+      if (expr.length !== 4) {
+        for (let i = 1; i < expr.length; i++) {
+          if (!checkRecCallShape(expr[i] as Expr, name, arity, requireTailOnly, false))
+            return false;
+        }
+        return true;
+      }
+      if (!checkRecCallShape(expr[1] as Expr, name, arity, requireTailOnly, false)) return false;
+      if (!checkRecCallShape(expr[2] as Expr, name, arity, requireTailOnly, inTail)) return false;
+      if (!checkRecCallShape(expr[3] as Expr, name, arity, requireTailOnly, inTail)) return false;
+      return true;
+    }
+    case "do": {
+      for (let i = 1; i < expr.length - 1; i++) {
+        if (!checkRecCallShape(expr[i] as Expr, name, arity, requireTailOnly, false)) return false;
+      }
+      if (expr.length >= 2) {
+        if (!checkRecCallShape(expr[expr.length - 1] as Expr, name, arity, requireTailOnly, inTail))
+          return false;
+      }
+      return true;
+    }
+    case "let": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return true;
+      let shadowed = false;
+      for (const b of bindings) {
+        if (!Array.isArray(b) || b.length !== 2) continue;
+        if (!shadowed) {
+          if (!checkRecCallShape(b[1] as Expr, name, arity, requireTailOnly, false)) return false;
+        }
+        if (b[0] === name) shadowed = true;
+      }
+      if (shadowed) return true;
+      return checkRecCallShape(expr[2] as Expr, name, arity, requireTailOnly, inTail);
+    }
+    case "letrec": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return true;
+      const names = bindings
+        .map((b) => (Array.isArray(b) ? b[0] : null))
+        .filter((n): n is string => typeof n === "string");
+      if (names.includes(name)) return true;
+      for (const b of bindings) {
+        if (!Array.isArray(b) || b.length !== 2) continue;
+        if (!checkRecCallShape(b[1] as Expr, name, arity, requireTailOnly, false)) return false;
+      }
+      return checkRecCallShape(expr[2] as Expr, name, arity, requireTailOnly, inTail);
+    }
+    case "fn":
+    case "fn-once": {
+      const ps = paramNames(expr[1] as Expr);
+      if (ps.includes(name)) return true;
+      return checkRecCallShape(expr[2] as Expr, name, arity, requireTailOnly, false);
+    }
+    case "match":
+    case "handle": {
+      if (!checkRecCallShape(expr[1] as Expr, name, arity, requireTailOnly, false)) return false;
+      for (let i = 2; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) continue;
+        const pattern = clause[0];
+        const body = clause[1] as Expr;
+        const bound = Array.isArray(pattern)
+          ? pattern.slice(1).filter((s): s is string => typeof s === "string")
+          : [];
+        if (bound.includes(name)) continue;
+        if (!checkRecCallShape(body, name, arity, requireTailOnly, inTail)) return false;
+      }
+      return true;
+    }
+    case "cond": {
+      for (let i = 1; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) continue;
+        const test = clause[0];
+        const body = clause[1] as Expr;
+        if (test !== "else") {
+          if (!checkRecCallShape(test as Expr, name, arity, requireTailOnly, false)) return false;
+        }
+        if (!checkRecCallShape(body, name, arity, requireTailOnly, inTail)) return false;
+      }
+      return true;
+    }
+    case "__loop": {
+      const ps = paramNames(expr[1] as Expr);
+      const initArgs = expr[2];
+      if (Array.isArray(initArgs)) {
+        for (const a of initArgs) {
+          if (!checkRecCallShape(a as Expr, name, arity, requireTailOnly, false)) return false;
+        }
+      }
+      if (ps.includes(name)) return true;
+      return checkRecCallShape(expr[3] as Expr, name, arity, requireTailOnly, inTail);
+    }
+    default: {
+      for (let i = 1; i < expr.length; i++) {
+        if (!checkRecCallShape(expr[i] as Expr, name, arity, requireTailOnly, false)) return false;
+      }
+      return true;
+    }
+  }
+}
+
+/** Replace tail-position `["call", name, ...args]` with `["__continue", ...args]`. */
+function replaceTailCallsWithContinue(expr: Expr, name: string, inTail: boolean): Expr {
+  if (typeof expr === "string") return expr;
+  if (!Array.isArray(expr) || expr.length === 0) return expr;
+  const op = expr[0];
+  if (typeof op !== "string") {
+    return expr.map((e) => replaceTailCallsWithContinue(e as Expr, name, false)) as Expr;
+  }
+  switch (op) {
+    case "__lit":
+      return expr;
+    case "call": {
+      const head = expr[1];
+      if (head === name && inTail) {
+        const newArgs = expr
+          .slice(2)
+          .map((a) => replaceTailCallsWithContinue(a as Expr, name, false));
+        return ["__continue", ...newArgs];
+      }
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) {
+        out.push(replaceTailCallsWithContinue(expr[i] as Expr, name, false));
+      }
+      return out;
+    }
+    case "if": {
+      if (expr.length !== 4) {
+        return expr.map((e, i) =>
+          i === 0 ? e : replaceTailCallsWithContinue(e as Expr, name, false),
+        ) as Expr;
+      }
+      return [
+        op,
+        replaceTailCallsWithContinue(expr[1] as Expr, name, false),
+        replaceTailCallsWithContinue(expr[2] as Expr, name, inTail),
+        replaceTailCallsWithContinue(expr[3] as Expr, name, inTail),
+      ];
+    }
+    case "do": {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) {
+        const isLast = i === expr.length - 1;
+        out.push(replaceTailCallsWithContinue(expr[i] as Expr, name, isLast && inTail));
+      }
+      return out;
+    }
+    case "let": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return expr;
+      let shadowed = false;
+      const newBindings: Expr[] = [];
+      for (const b of bindings) {
+        if (!Array.isArray(b) || b.length !== 2) {
+          newBindings.push(b as Expr);
+          continue;
+        }
+        const bName = b[0] as string;
+        const bVal = shadowed
+          ? (b[1] as Expr)
+          : replaceTailCallsWithContinue(b[1] as Expr, name, false);
+        newBindings.push([bName, bVal] as Expr);
+        if (bName === name) shadowed = true;
+      }
+      const newBody = shadowed
+        ? (expr[2] as Expr)
+        : replaceTailCallsWithContinue(expr[2] as Expr, name, inTail);
+      return [op, newBindings as Expr, newBody];
+    }
+    case "letrec": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return expr;
+      const names = bindings
+        .map((b) => (Array.isArray(b) ? b[0] : null))
+        .filter((n): n is string => typeof n === "string");
+      if (names.includes(name)) return expr;
+      const newBindings = bindings.map((b) => {
+        if (!Array.isArray(b) || b.length !== 2) return b as Expr;
+        return [b[0] as string, replaceTailCallsWithContinue(b[1] as Expr, name, false)] as Expr;
+      });
+      return [op, newBindings as Expr, replaceTailCallsWithContinue(expr[2] as Expr, name, inTail)];
+    }
+    case "fn":
+    case "fn-once": {
+      const ps = paramNames(expr[1] as Expr);
+      if (ps.includes(name)) return expr;
+      return [op, expr[1] as Expr, replaceTailCallsWithContinue(expr[2] as Expr, name, false)];
+    }
+    case "match":
+    case "handle": {
+      const out: Expr[] = [op, replaceTailCallsWithContinue(expr[1] as Expr, name, false)];
+      for (let i = 2; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        const pattern = clause[0] as Expr;
+        const body = clause[1] as Expr;
+        const bound = Array.isArray(pattern)
+          ? pattern.slice(1).filter((s): s is string => typeof s === "string")
+          : [];
+        const newBody = bound.includes(name)
+          ? body
+          : replaceTailCallsWithContinue(body, name, inTail);
+        out.push([pattern, newBody] as Expr);
+      }
+      return out;
+    }
+    case "cond": {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        const test = clause[0];
+        const body = clause[1] as Expr;
+        const newTest =
+          test === "else" ? "else" : replaceTailCallsWithContinue(test as Expr, name, false);
+        out.push([newTest as Expr, replaceTailCallsWithContinue(body, name, inTail)] as Expr);
+      }
+      return out;
+    }
+    case "__loop": {
+      const ps = paramNames(expr[1] as Expr);
+      const initArgs = expr[2];
+      const newInit = Array.isArray(initArgs)
+        ? (initArgs.map((a) => replaceTailCallsWithContinue(a as Expr, name, false)) as Expr)
+        : (initArgs as Expr);
+      const body = expr[3] as Expr;
+      const newBody = ps.includes(name) ? body : replaceTailCallsWithContinue(body, name, inTail);
+      return [op, expr[1] as Expr, newInit, newBody];
+    }
+    default: {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) {
+        out.push(replaceTailCallsWithContinue(expr[i] as Expr, name, false));
+      }
+      return out;
+    }
+  }
+}
+
+/** Replace each `["call", name, ...args]` in `expr` with `makeLoop(args)`.
+ * Respects shadowing. */
+function replaceCallsWithLoop(expr: Expr, name: string, makeLoop: (args: Expr[]) => Expr): Expr {
+  if (typeof expr === "string") return expr;
+  if (!Array.isArray(expr) || expr.length === 0) return expr;
+  const op = expr[0];
+  if (typeof op !== "string") {
+    return expr.map((e) => replaceCallsWithLoop(e as Expr, name, makeLoop)) as Expr;
+  }
+  if (op === "__lit") return expr;
+  if (op === "call" && expr[1] === name) {
+    const args = expr.slice(2).map((a) => replaceCallsWithLoop(a as Expr, name, makeLoop));
+    return makeLoop(args);
+  }
+  switch (op) {
+    case "fn":
+    case "fn-once": {
+      const ps = paramNames(expr[1] as Expr);
+      if (ps.includes(name)) return expr;
+      return [op, expr[1] as Expr, replaceCallsWithLoop(expr[2] as Expr, name, makeLoop)];
+    }
+    case "let": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return expr;
+      let shadowed = false;
+      const newBindings: Expr[] = [];
+      for (const b of bindings) {
+        if (!Array.isArray(b) || b.length !== 2) {
+          newBindings.push(b as Expr);
+          continue;
+        }
+        const bName = b[0] as string;
+        const bVal = shadowed ? (b[1] as Expr) : replaceCallsWithLoop(b[1] as Expr, name, makeLoop);
+        newBindings.push([bName, bVal] as Expr);
+        if (bName === name) shadowed = true;
+      }
+      const newBody = shadowed
+        ? (expr[2] as Expr)
+        : replaceCallsWithLoop(expr[2] as Expr, name, makeLoop);
+      return [op, newBindings as Expr, newBody];
+    }
+    case "letrec": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return expr;
+      const names = bindings
+        .map((b) => (Array.isArray(b) ? b[0] : null))
+        .filter((n): n is string => typeof n === "string");
+      if (names.includes(name)) return expr;
+      const newBindings = bindings.map((b) => {
+        if (!Array.isArray(b) || b.length !== 2) return b as Expr;
+        return [b[0] as string, replaceCallsWithLoop(b[1] as Expr, name, makeLoop)] as Expr;
+      });
+      return [op, newBindings as Expr, replaceCallsWithLoop(expr[2] as Expr, name, makeLoop)];
+    }
+    case "match":
+    case "handle": {
+      const out: Expr[] = [op, replaceCallsWithLoop(expr[1] as Expr, name, makeLoop)];
+      for (let i = 2; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        const pattern = clause[0] as Expr;
+        const body = clause[1] as Expr;
+        const bound = Array.isArray(pattern)
+          ? pattern.slice(1).filter((s): s is string => typeof s === "string")
+          : [];
+        const newBody = bound.includes(name) ? body : replaceCallsWithLoop(body, name, makeLoop);
+        out.push([pattern, newBody] as Expr);
+      }
+      return out;
+    }
+    case "__loop": {
+      const ps = paramNames(expr[1] as Expr);
+      const initArgs = expr[2];
+      const newInit = Array.isArray(initArgs)
+        ? (initArgs.map((a) => replaceCallsWithLoop(a as Expr, name, makeLoop)) as Expr)
+        : (initArgs as Expr);
+      const body = expr[3] as Expr;
+      const newBody = ps.includes(name) ? body : replaceCallsWithLoop(body, name, makeLoop);
+      return [op, expr[1] as Expr, newInit, newBody];
+    }
+    default: {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) {
+        out.push(replaceCallsWithLoop(expr[i] as Expr, name, makeLoop));
+      }
+      return out;
+    }
+  }
+}
+
+/** Try to TCO a single-binding letrec. Returns rewritten expr or null. */
+function tryTcoLetrec(expr: Expr): Expr | null {
+  if (!Array.isArray(expr) || expr.length !== 3 || expr[0] !== "letrec") return null;
+  const bindings = expr[1];
+  const entry = expr[2] as Expr;
+  if (!Array.isArray(bindings) || bindings.length !== 1) return null;
+  const binding = bindings[0];
+  if (!Array.isArray(binding) || binding.length !== 2) return null;
+  const name = binding[0];
+  if (typeof name !== "string") return null;
+  const fnExpr = binding[1] as Expr;
+  if (!Array.isArray(fnExpr) || fnExpr.length !== 3 || fnExpr[0] !== "fn") return null;
+  const paramsExpr = fnExpr[1];
+  if (!Array.isArray(paramsExpr)) return null;
+  const params: string[] = [];
+  for (const p of paramsExpr) {
+    if (typeof p === "string") params.push(p);
+    else if (Array.isArray(p) && p.length >= 1 && typeof p[0] === "string") params.push(p[0]);
+    else return null;
+  }
+  if (params.includes(name)) return null;
+  const body = fnExpr[2] as Expr;
+  const arity = params.length;
+
+  if (!checkRecCallShape(body, name, arity, true, true)) return null;
+  if (!checkRecCallShape(entry, name, arity, false, true)) return null;
+  if (countFreeRefs(name, entry) === 0) return null;
+  if (countFreeRefs(name, body) === 0) return null;
+
+  const transformedBody = replaceTailCallsWithContinue(body, name, true);
+  if (countFreeRefs(name, transformedBody) !== 0) return null;
+
+  const makeLoop = (args: Expr[]): Expr => {
+    if (args.length !== arity) return ["call", name, ...args];
+    return ["__loop", params as Expr, args as Expr, transformedBody];
+  };
+
+  return replaceCallsWithLoop(entry, name, makeLoop);
+}
+
+/** Tail-call optimization pass. Walks bottom-up converting tail-recursive
+ * single-binding letrec forms into `__loop` / `__continue` nodes. */
+export function tco(expr: Expr): Expr {
+  if (typeof expr === "string" || expr === null) return expr;
+  if (typeof expr === "boolean" || typeof expr === "number") return expr;
+  if (!Array.isArray(expr) || expr.length === 0) return expr;
+  const op = expr[0];
+  if (typeof op !== "string") {
+    return expr.map((e) => tco(e as Expr)) as Expr;
+  }
+  switch (op) {
+    case "__lit":
+      return expr;
+    case "fn":
+    case "fn-once":
+      return [op, expr[1] as Expr, tco(expr[2] as Expr)];
+    case "let": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return expr;
+      const newBindings = bindings.map((b) => {
+        if (!Array.isArray(b) || b.length !== 2) return b as Expr;
+        return [b[0] as string, tco(b[1] as Expr)] as Expr;
+      });
+      return [op, newBindings as Expr, tco(expr[2] as Expr)];
+    }
+    case "letrec": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return expr;
+      const newBindings = bindings.map((b) => {
+        if (!Array.isArray(b) || b.length !== 2) return b as Expr;
+        return [b[0] as string, tco(b[1] as Expr)] as Expr;
+      });
+      const recursed: Expr = [op, newBindings as Expr, tco(expr[2] as Expr)];
+      const transformed = tryTcoLetrec(recursed);
+      return transformed !== null ? transformed : recursed;
+    }
+    case "match":
+    case "handle": {
+      const out: Expr[] = [op, tco(expr[1] as Expr)];
+      for (let i = 2; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        out.push([clause[0] as Expr, tco(clause[1] as Expr)] as Expr);
+      }
+      return out;
+    }
+    case "cond": {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        const test = clause[0];
+        const body = clause[1] as Expr;
+        const newTest = test === "else" ? "else" : tco(test as Expr);
+        out.push([newTest as Expr, tco(body)] as Expr);
+      }
+      return out;
+    }
+    case "__loop": {
+      const initArgs = expr[2];
+      const newInit = Array.isArray(initArgs)
+        ? (initArgs.map((a) => tco(a as Expr)) as Expr)
+        : (initArgs as Expr);
+      return [op, expr[1] as Expr, newInit, tco(expr[3] as Expr)];
+    }
+    case "perform":
+      if (expr.length === 3) return [op, expr[1] as Expr, tco(expr[2] as Expr)];
+      return expr;
+    default: {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) out.push(tco(expr[i] as Expr));
+      return out;
+    }
+  }
+}
+
 // --- Phase 6: function inlining ---
 //
 // Inlines `let`-bound (or `letrec`-bound) functions at single call sites when

@@ -5,8 +5,10 @@ import {
   optimize,
   CONSTANT_FOLDING_RULES,
   inlineSmallFunctions,
+  tco,
   type RewriteRule,
 } from "./optimizer.ts";
+import { STD_BINDINGS } from "./std.ts";
 import type { Expr } from "./types.ts";
 
 // --- Helper ---
@@ -743,6 +745,235 @@ describe("optimizer: function inlining", () => {
     const r = inlineSmallFunctions(expr);
     // id is referenced (returned) — not a call site, so otherUses > 0 → keep.
     expect(stringifyExpr(r)).toContain('"id"');
+  });
+});
+
+// --- Phase 4: tail-call optimization ---
+
+describe("optimizer: tail-call optimization (TCO)", () => {
+  function findLoop(expr: Expr): Expr | null {
+    if (!Array.isArray(expr)) return null;
+    if (expr[0] === "__loop") return expr;
+    for (const e of expr) {
+      const found = findLoop(e as Expr);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function hasOp(expr: Expr, op: string): boolean {
+    if (!Array.isArray(expr)) return false;
+    if (expr[0] === op) return true;
+    for (let i = 0; i < expr.length; i++) {
+      if (hasOp(expr[i] as Expr, op)) return true;
+    }
+    return false;
+  }
+
+  it("transforms simple self-recursive function into __loop/__continue", () => {
+    // letrec [[fact, fn [n, acc] (if (<= n 1) acc (call fact (- n 1) (* acc n)))]]
+    //   (call fact n-input 1)
+    const expr: Expr = [
+      "letrec",
+      [
+        [
+          "fact",
+          [
+            "fn",
+            ["n", "acc"],
+            ["if", ["<=", "n", 1], "acc", ["call", "fact", ["-", "n", 1], ["*", "acc", "n"]]],
+          ],
+        ],
+      ],
+      ["call", "fact", "n-input", 1],
+    ];
+    const r = tco(expr);
+    expect(Array.isArray(r) && r[0] === "__loop").toBe(true);
+    // No __continue in __continue must appear
+    expect(hasOp(r, "__continue")).toBe(true);
+    // letrec should be gone
+    expect(hasOp(r, "letrec")).toBe(false);
+  });
+
+  it("does NOT transform when recursive call is in non-tail position", () => {
+    // letrec [[f, fn [n] (if (== n 0) 0 (+ 1 (call f (- n 1))))]] (call f 5)
+    // The recursive call is inside (+ 1 _), which is non-tail. Should not transform.
+    const expr: Expr = [
+      "letrec",
+      [["f", ["fn", ["n"], ["if", ["==", "n", 0], 0, ["+", 1, ["call", "f", ["-", "n", 1]]]]]]],
+      ["call", "f", 5],
+    ];
+    const r = tco(expr);
+    expect(hasOp(r, "__loop")).toBe(false);
+    expect(hasOp(r, "letrec")).toBe(true);
+  });
+
+  it("transforms tail call inside if-branches", () => {
+    const expr: Expr = [
+      "letrec",
+      [["loop", ["fn", ["i"], ["if", [">=", "i", "n"], "i", ["call", "loop", ["+", "i", 1]]]]]],
+      ["call", "loop", 0],
+    ];
+    const r = tco(expr);
+    const loop = findLoop(r);
+    expect(loop).not.toBeNull();
+    expect(hasOp(r, "__continue")).toBe(true);
+  });
+
+  it("transforms tail call inside match-branch", () => {
+    // letrec [[f, fn [opt] (match opt [[None] 0] [[Some, x] (call f (Some x))])]]
+    //   (call f some-val) — recursive call is in tail position of a match clause.
+    const expr: Expr = [
+      "letrec",
+      [
+        [
+          "f",
+          [
+            "fn",
+            ["opt"],
+            [
+              "match",
+              "opt",
+              [["None"], 0],
+              [
+                ["Some", "x"],
+                ["call", "f", ["None"]],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["call", "f", "init"],
+    ];
+    const r = tco(expr);
+    expect(hasOp(r, "__loop")).toBe(true);
+    expect(hasOp(r, "__continue")).toBe(true);
+  });
+
+  it("transforms tail call as last expression of do", () => {
+    const expr: Expr = [
+      "letrec",
+      [
+        [
+          "loop",
+          [
+            "fn",
+            ["i"],
+            ["if", [">=", "i", "n"], "i", ["do", "i", ["call", "loop", ["+", "i", 1]]]],
+          ],
+        ],
+      ],
+      ["call", "loop", 0],
+    ];
+    const r = tco(expr);
+    expect(hasOp(r, "__loop")).toBe(true);
+    expect(hasOp(r, "__continue")).toBe(true);
+  });
+
+  it("does NOT transform mutual recursion", () => {
+    // letrec [[even, fn [n] ...], [odd, fn [n] ...]] — multiple bindings.
+    const expr: Expr = [
+      "letrec",
+      [
+        ["even", ["fn", ["n"], ["if", ["==", "n", 0], true, ["call", "odd", ["-", "n", 1]]]]],
+        ["odd", ["fn", ["n"], ["if", ["==", "n", 0], false, ["call", "even", ["-", "n", 1]]]]],
+      ],
+      ["call", "even", 4],
+    ];
+    const r = tco(expr);
+    expect(hasOp(r, "__loop")).toBe(false);
+    expect(hasOp(r, "letrec")).toBe(true);
+  });
+
+  it("compiled TCO'd function produces correct output (factorial)", () => {
+    const expr: Expr = [
+      "letrec",
+      [
+        [
+          "fact",
+          [
+            "fn",
+            ["n", "acc"],
+            ["if", ["<=", "n", 1], "acc", ["call", "fact", ["-", "n", 1], ["*", "acc", "n"]]],
+          ],
+        ],
+      ],
+      ["call", "fact", "n", 1],
+    ];
+    // After TCO, this becomes a __loop. Verify both that the AST is loop-shaped
+    // and that running it gives the right answer.
+    const after = tco(expr);
+    expect(hasOp(after, "__loop")).toBe(true);
+    const fn = compile(expr);
+    expect(fn({ n: 6n })).toBe(720n);
+  });
+
+  it("compiled TCO'd function produces correct output (sum)", () => {
+    const expr: Expr = [
+      "letrec",
+      [
+        [
+          "loop",
+          [
+            "fn",
+            ["i", "acc"],
+            ["if", [">", "i", "n"], "acc", ["call", "loop", ["+", "i", 1], ["+", "acc", "i"]]],
+          ],
+        ],
+      ],
+      ["call", "loop", 1, 0],
+    ];
+    const after = tco(expr);
+    expect(hasOp(after, "__loop")).toBe(true);
+    const fn = compile(expr);
+    expect(fn({ n: 10n })).toBe(55n);
+  });
+
+  it("transforms lib:std map (entry is fn wrapping a tail call)", () => {
+    const stdMap = STD_BINDINGS.find((b) => b.name === "map")!;
+    const after = tco(stdMap.expr);
+    // The fn shape stays but its body becomes a __loop.
+    expect(hasOp(after, "__loop")).toBe(true);
+    expect(hasOp(after, "__continue")).toBe(true);
+    expect(hasOp(after, "letrec")).toBe(false);
+  });
+
+  it("transforms lib:std filter", () => {
+    const stdFilter = STD_BINDINGS.find((b) => b.name === "filter")!;
+    const after = tco(stdFilter.expr);
+    expect(hasOp(after, "__loop")).toBe(true);
+    expect(hasOp(after, "__continue")).toBe(true);
+    expect(hasOp(after, "letrec")).toBe(false);
+  });
+
+  it("transforms lib:std reduce", () => {
+    const stdReduce = STD_BINDINGS.find((b) => b.name === "reduce")!;
+    const after = tco(stdReduce.expr);
+    expect(hasOp(after, "__loop")).toBe(true);
+    expect(hasOp(after, "__continue")).toBe(true);
+    expect(hasOp(after, "letrec")).toBe(false);
+  });
+
+  it("compiled lib:std map produces correct output via TCO loop", () => {
+    const stdMap = STD_BINDINGS.find((b) => b.name === "map")!;
+    // Apply: (call <map> (fn [x] (* x 2)) [1,2,3])
+    const expr: Expr = ["call", stdMap.expr, ["fn", ["x"], ["*", "x", 2]], "xs"];
+    const fn = compile(expr);
+    expect(fn({ xs: [1n, 2n, 3n] })).toEqual([2n, 4n, 6n]);
+  });
+
+  it("compiled lib:std filter produces correct output via TCO loop", () => {
+    const stdFilter = STD_BINDINGS.find((b) => b.name === "filter")!;
+    const expr: Expr = ["call", stdFilter.expr, ["fn", ["x"], [">", "x", 2]], "xs"];
+    const fn = compile(expr);
+    expect(fn({ xs: [1n, 2n, 3n, 4n] })).toEqual([3n, 4n]);
+  });
+
+  it("compiled lib:std reduce produces correct output via TCO loop", () => {
+    const stdReduce = STD_BINDINGS.find((b) => b.name === "reduce")!;
+    const expr: Expr = ["call", stdReduce.expr, ["fn", ["a", "b"], ["+", "a", "b"]], 0, "xs"];
+    const fn = compile(expr);
+    expect(fn({ xs: [1n, 2n, 3n, 4n] })).toBe(10n);
   });
 });
 

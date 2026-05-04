@@ -1,5 +1,5 @@
 import type { Expr } from "./types.ts";
-import { optimize, CONSTANT_FOLDING_RULES, inlineSmallFunctions } from "./optimizer.ts";
+import { optimize, CONSTANT_FOLDING_RULES, inlineSmallFunctions, tco } from "./optimizer.ts";
 
 // A compiled Marinada expression.
 // Takes an env (variable bindings) and returns a JS-native value.
@@ -1507,11 +1507,15 @@ function compileRaw(expr: Expr): JitFn {
 
 /** Run all enabled optimizer passes in pipeline order. */
 function runOptimizer(expr: Expr): Expr {
+  // Phase 4: tail-call optimization — convert tail-recursive letrec forms
+  // into `__loop` / `__continue` nodes. Runs before constant folding so
+  // subsequent passes see a normalized loop shape.
+  let e = tco(expr);
   // Phase 1+2: constant folding + dead-binding elimination + literal copy
   // propagation, all expressed as rewrite rules.
-  let e = optimize(expr, CONSTANT_FOLDING_RULES);
-  // Phase 6: inline small, non-looping, single-use functions. (Phases 3–5
-  // — TCO, loop pattern recognition, loop fusion — are not yet implemented.)
+  e = optimize(e, CONSTANT_FOLDING_RULES);
+  // Phase 6: inline small, non-looping, single-use functions. (Phase 5
+  // — loop pattern recognition + loop fusion — is not yet implemented.)
   e = inlineSmallFunctions(e);
   // Re-run constant folding so newly-inlined expressions get folded.
   e = optimize(e, CONSTANT_FOLDING_RULES);
