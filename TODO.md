@@ -12,7 +12,7 @@ Type representation (`{ kind: "linear"; inner: MType }`) exists in typecheck.ts:
 
 map/filter/reduce were removed from the primitive set and are now proper lib:std letrec expressions, but the JIT no longer emits native JS Array.prototype.map/filter/reduce for them. The spec says the compiler should pattern-match on the lib:std AST and emit optimized code (constant folding, loop fusion). Without this, collection-heavy expressions are slower than before.
 
-### [ ] Marinada: cross-module typechecking
+### [x] Marinada: cross-module typechecking
 
 `typecheckModule` starts with `EMPTY_TYPE_ENV` and never processes `module.imports` — imported names are UNDEFINED_VAR. Design: recursive typechecking with the host-provided resolver. Typecheck imported modules first (caching by module ID), extract exported binding types, inject into the env. Cycle handling: on first encounter of a cycle, assign fresh HM type variables to the module's exports; complete the cycle; unify the vars against the actual inferred types when the cycle closes. Mismatch = type error. Same mechanism as `letrec`, applied at module granularity.
 
@@ -20,7 +20,7 @@ map/filter/reduce were removed from the primitive set and are now proper lib:std
 
 The JIT throws `CompileError` on `perform`/`handle` (jit.ts:1188-1191), forcing all effectful code to the interpreter. The spec promises reactive compilation: expressions compile to Solid.js signals, dependencies are tracked, only affected expressions re-evaluate. Unimplemented — requires a separate reactive code generator that emits `createMemo`/`createSignal` wiring. Largest remaining architectural gap.
 
-### [ ] Marinada: implement local: and https: module import schemes
+### [x] Marinada: implement local: and https: module import schemes
 
 module.ts:25 skips all non-lib:std imports. `local:` and `https:` schemes parse without error but names stay unbound. typecheck.ts:1373 types all such imports as UNKNOWN. Only `lib:std` is functional.
 
