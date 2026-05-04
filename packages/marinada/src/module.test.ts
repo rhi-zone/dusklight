@@ -315,3 +315,187 @@ describe("typecheckModule", () => {
     expect(module.exports).toEqual(["Foo", "bar"]);
   });
 });
+
+// --- ModuleResolver — Phase 1 ---
+
+describe("evaluateModule with ModuleResolver", () => {
+  it("resolves a basic non-lib:std import and uses the imported value in main", () => {
+    const dep: Module = {
+      exports: ["x"],
+      main: ["let", [["x", 42]], 0],
+    };
+    const root: Module = {
+      imports: [{ from: "local:./dep.json", import: ["x"] }],
+      main: ["+", "x", 1],
+    };
+    const result = evaluateModule(root, {
+      resolver: (from) => (from === "local:./dep.json" ? dep : null),
+    });
+    expect(result).toEqual({ ok: true, value: int(43) });
+  });
+
+  it("returns MODULE_NOT_FOUND when resolver returns null", () => {
+    const root: Module = {
+      imports: [{ from: "local:./missing.json", import: ["x"] }],
+      main: 0,
+    };
+    const result = evaluateModule(root, { resolver: () => null });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) expect(result.error.code).toBe("MODULE_NOT_FOUND");
+  });
+
+  it("returns UNDEFINED_EXPORT when an imported name is not in the module's exports", () => {
+    const dep: Module = {
+      exports: ["x"],
+      main: ["let", [["x", 1]], 0],
+    };
+    const root: Module = {
+      imports: [{ from: "local:./dep.json", import: ["y"] }],
+      main: 0,
+    };
+    const result = evaluateModule(root, { resolver: () => dep });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) expect(result.error.code).toBe("UNDEFINED_EXPORT");
+  });
+
+  it("diamond import — resolver called once per unique path (D resolved once)", () => {
+    const calls: string[] = [];
+    const D: Module = { exports: ["d"], main: ["let", [["d", 7]], 0] };
+    const B: Module = {
+      imports: [{ from: "local:D", import: ["d"] }],
+      exports: ["b"],
+      main: ["let", [["b", ["+", "d", 1]]], 0],
+    };
+    const C: Module = {
+      imports: [{ from: "local:D", import: ["d"] }],
+      exports: ["c"],
+      main: ["let", [["c", ["+", "d", 2]]], 0],
+    };
+    const A: Module = {
+      imports: [
+        { from: "local:B", import: ["b"] },
+        { from: "local:C", import: ["c"] },
+      ],
+      main: ["+", "b", "c"],
+    };
+    const result = evaluateModule(A, {
+      resolver: (from) => {
+        calls.push(from);
+        if (from === "local:D") return D;
+        if (from === "local:B") return B;
+        if (from === "local:C") return C;
+        return null;
+      },
+    });
+    // b = d+1 = 8, c = d+2 = 9, b+c = 17
+    expect(result).toEqual({ ok: true, value: int(17) });
+    // D should be resolved once (cache hit on second sighting).
+    const dCalls = calls.filter((c) => c === "local:D");
+    expect(dCalls.length).toBe(1);
+  });
+
+  it("never calls resolver for lib:std imports", () => {
+    let called = false;
+    const root: Module = {
+      imports: [{ from: "lib:std", import: ["Some"] }],
+      main: ["Some", 1],
+    };
+    const result = evaluateModule(root, {
+      resolver: () => {
+        called = true;
+        return null;
+      },
+    });
+    expect(called).toBe(false);
+    expect(result).toEqual({ ok: true, value: variant("Some", int(1)) });
+  });
+});
+
+describe("typecheckModule with ModuleResolver", () => {
+  it("imports a value and gives it the correct type", () => {
+    const dep: Module = {
+      exports: ["x"],
+      main: ["let", [["x", 42]], 0],
+    };
+    const root: Module = {
+      imports: [{ from: "local:dep", import: ["x"] }],
+      main: ["+", "x", 1],
+    };
+    const result = typecheckModule(root, { resolver: () => dep });
+    expect(result).toMatchObject({ ok: true, type: { kind: "int" } });
+  });
+
+  it("flags TYPE_MISMATCH when imported value is used at the wrong type", () => {
+    // dep exports `b` of type bool; root tries to use it as the condition
+    // value of `+`, which expects numeric operands.
+    const dep: Module = {
+      exports: ["b"],
+      main: ["let", [["b", true]], 0],
+    };
+    const root: Module = {
+      imports: [{ from: "local:dep", import: ["b"] }],
+      main: ["+", "b", 1],
+    };
+    const result = typecheckModule(root, { resolver: () => dep });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === "TYPE_MISMATCH")).toBe(true);
+    }
+  });
+
+  it("returns MODULE_NOT_FOUND error and types imported names as unknown when resolver returns null", () => {
+    const root: Module = {
+      imports: [{ from: "local:missing", import: ["x"] }],
+      // x is unknown — arithmetic on unknown is allowed in gradual mode.
+      main: ["+", "x", 1],
+    };
+    const result = typecheckModule(root, { resolver: () => null });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === "MODULE_NOT_FOUND")).toBe(true);
+    }
+  });
+
+  it("populates the exports map in the success result", () => {
+    const dep: Module = {
+      exports: ["x", "y"],
+      main: [
+        "let",
+        [
+          ["x", 1],
+          ["y", true],
+        ],
+        0,
+      ],
+    };
+    const result = typecheckModule(dep);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.exports).toBeDefined();
+      expect(result.exports?.get("x")).toEqual({ kind: "int" });
+      expect(result.exports?.get("y")).toEqual({ kind: "bool" });
+    }
+  });
+
+  it("imports a DU constructor from another module and uses it", () => {
+    const dep: Module = {
+      types: [
+        {
+          name: "Shape",
+          variants: [{ tag: "Circle", fields: [["r", "float"]] }],
+        },
+      ],
+      exports: [],
+      main: 0,
+    };
+    const root: Module = {
+      imports: [{ from: "local:shapes", import: [] }],
+      main: ["Circle", 1.5],
+    };
+    const result = typecheckModule(root, { resolver: () => dep });
+    expect(result).toMatchObject({
+      ok: true,
+      type: { kind: "named", name: "Shape", args: [] },
+    });
+  });
+});

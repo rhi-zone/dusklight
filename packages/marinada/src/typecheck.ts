@@ -275,7 +275,9 @@ export type TypecheckError = {
   suggestion?: string;
 };
 
-export type TypecheckResult = { ok: true; type: MType } | { ok: false; errors: TypecheckError[] };
+export type TypecheckResult =
+  | { ok: true; type: MType; exports?: Map<string, MType> }
+  | { ok: false; errors: TypecheckError[] };
 
 /** Signature for an algebraic effect: payload type and resume type. */
 export type EffectSig = { payload: MType; resume: MType };
@@ -4023,7 +4025,26 @@ export function buildTypeInfo(expr: Expr, env?: TypeEnv): TypeInfo {
   };
 }
 
-export function typecheckModule(module: Module): TypecheckResult {
+/**
+ * Resolves a non-`lib:std` module import to a `Module`. Mirrors
+ * `ModuleResolver` in `module.ts`; defined locally here to avoid an import
+ * cycle between `typecheck.ts` and `module.ts`.
+ */
+type TypecheckModuleResolver = (from: string) => Module | null;
+
+export type TypecheckModuleOptions = {
+  resolver?: TypecheckModuleResolver;
+};
+
+/**
+ * Internal recursive entry that takes an explicit cache so diamond imports
+ * resolve once. Public `typecheckModule` is a thin wrapper.
+ */
+function typecheckModuleInternal(
+  module: Module,
+  opts: TypecheckModuleOptions | undefined,
+  cache: Map<string, TypecheckResult>,
+): TypecheckResult {
   const state = new State();
   const { typeDefs, ctors } = makeStdTypeDefs();
   registerModuleTypeDefs(module.types ?? [], typeDefs, ctors);
@@ -4038,8 +4059,180 @@ export function typecheckModule(module: Module): TypecheckResult {
     capMethods: makeBuiltinCapMethods(),
     currentEffects: freshEffectsRow(state),
   };
-  const moduleEnv = EMPTY_TYPE_ENV;
-  const t = infer(module.main, moduleEnv, ctx);
+
+  // Build the import env by resolving each non-lib:std import via the
+  // optional resolver. lib:std types are pre-registered; lib:std value
+  // imports are exposed via STD_BINDINGS at evaluation time but the
+  // type-checker treats them as unknown (existing behavior). For other
+  // imports, when a resolver is supplied we recursively typecheck the
+  // resolved module and inject the requested names' types.
+  let moduleEnv = EMPTY_TYPE_ENV;
+  for (const imp of module.imports ?? []) {
+    if (imp.from === "lib:std") continue;
+    const resolver = opts?.resolver;
+    if (resolver === undefined) continue; // backward-compatible skip
+
+    let resolved = cache.get(imp.from);
+    if (resolved === undefined) {
+      const mod = resolver(imp.from);
+      if (mod === null) {
+        addError(ctx, "MODULE_NOT_FOUND", `module not found: ${imp.from}`, {
+          got: imp.from,
+        });
+        // Bind requested names as unknown for gradual continuation.
+        const fallback: Record<string, MType> = {};
+        for (const name of imp.import) fallback[name] = UNKNOWN;
+        moduleEnv = moduleEnv.extend(fallback);
+        continue;
+      }
+      resolved = typecheckModuleInternal(mod, opts, cache);
+      cache.set(imp.from, resolved);
+      // Also import the resolved module's DU type definitions so imported
+      // constructors are usable in this module.
+      registerModuleTypeDefs(mod.types ?? [], typeDefs, ctors);
+    } else if (resolved.ok) {
+      // Cached success — re-register types so constructors are visible.
+      // Note: this requires holding the original Module to re-call
+      // registerModuleTypeDefs, but for the cache hit path we rely on the
+      // first registration having already populated typeDefs/ctors via the
+      // shared maps. Since each typecheckModule call has its own typeDefs
+      // map, we must look up from cached info. For Phase 1 we re-resolve
+      // via the resolver to pick up types — this is cheap because the
+      // resolver is expected to be cheap/cached on the host side.
+      const mod = resolver(imp.from);
+      if (mod !== null) {
+        registerModuleTypeDefs(mod.types ?? [], typeDefs, ctors);
+      }
+    }
+
+    if (!resolved.ok) {
+      // Surface a single MODULE_IMPORT_ERROR for this import path; the
+      // detailed errors live on the resolved result. We bind names as
+      // unknown so we can continue.
+      addError(ctx, "MODULE_IMPORT_ERROR", `module ${imp.from} failed to typecheck`, {
+        got: imp.from,
+      });
+      const fallback: Record<string, MType> = {};
+      for (const name of imp.import) fallback[name] = UNKNOWN;
+      moduleEnv = moduleEnv.extend(fallback);
+      continue;
+    }
+
+    const exports = resolved.exports ?? new Map<string, MType>();
+    const importBindings: Record<string, MType> = {};
+    for (const name of imp.import) {
+      const t = exports.get(name);
+      if (t === undefined) {
+        addError(ctx, "UNDEFINED_EXPORT", `module ${imp.from} does not export "${name}"`, {
+          got: name,
+        });
+        importBindings[name] = UNKNOWN;
+      } else {
+        importBindings[name] = t;
+      }
+    }
+    moduleEnv = moduleEnv.extend(importBindings);
+  }
+
+  // Walk module.main peeling let/letrec layers so we can record exports.
+  // The semantics of each layer are equivalent to what `infer` does for
+  // "let"/"letrec", so behavior on the inner body remains identical to
+  // calling infer(module.main, moduleEnv, ctx) directly.
+  const exportSet = new Set(module.exports ?? []);
+  const exports = new Map<string, MType>();
+
+  let cur: Expr = module.main;
+  let curEnv: TypeEnv = moduleEnv;
+  let curPath: number[] = [];
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    if (!Array.isArray(cur) || cur.length !== 3) break;
+    const head = cur[0];
+    if (head !== "let" && head !== "letrec") break;
+    const bindings = cur[1];
+    const body = cur[2] as Expr;
+    if (!Array.isArray(bindings)) break;
+
+    // Validate binding shapes; if any binding is malformed, fall back to
+    // calling infer on the whole `cur` to surface the standard error.
+    let malformed = false;
+    for (const binding of bindings) {
+      if (!Array.isArray(binding) || binding.length !== 2) {
+        malformed = true;
+        break;
+      }
+      if (typeof binding[0] !== "string") {
+        malformed = true;
+        break;
+      }
+    }
+    if (malformed) break;
+
+    if (head === "let") {
+      let stepEnv = curEnv;
+      for (let i = 0; i < bindings.length; i++) {
+        const binding = bindings[i] as Expr[];
+        const name = binding[0] as string;
+        // Mirror infer's path layout: ["let", BINDINGS=1, BODY=2], inside
+        // bindings each is at index i, and the RHS lives at index 1.
+        const sub: Ctx = { ...ctx, path: [...curPath, 1, i, 1] };
+        const valT = infer(binding[1] as Expr, stepEnv, sub);
+        ctx.errors = sub.errors;
+        ctx.currentEffects = sub.currentEffects;
+        const generalized = generalize(valT, stepEnv, state.subst);
+        stepEnv = stepEnv.extend({ [name]: generalized });
+        if (exportSet.has(name)) exports.set(name, zonk(generalized, state.subst));
+      }
+      curEnv = stepEnv;
+    } else {
+      // letrec
+      const placeholders: Record<string, MType> = {};
+      const names: string[] = [];
+      const vars: MType[] = [];
+      for (const binding of bindings) {
+        const name = (binding as Expr[])[0] as string;
+        const v = state.freshVar();
+        placeholders[name] = v;
+        names.push(name);
+        vars.push(v);
+      }
+      const recEnv = curEnv.extend(placeholders);
+      for (let i = 0; i < bindings.length; i++) {
+        const binding = bindings[i] as Expr[];
+        const name = names[i] as string;
+        const sub: Ctx = { ...ctx, path: [...curPath, 1, i, 1] };
+        const bodyT = infer(binding[1] as Expr, recEnv, sub);
+        ctx.errors = sub.errors;
+        ctx.currentEffects = sub.currentEffects;
+        const subUnify: Ctx = { ...ctx, path: [...curPath, 1, i, 1] };
+        unifyOrError(subUnify, vars[i] as MType, bodyT, "letrec binding " + name);
+        ctx.errors = subUnify.errors;
+      }
+      const finalEnv = curEnv.extend(
+        Object.fromEntries(
+          names.map((n, i) => [n, generalize(vars[i] as MType, curEnv, state.subst)] as const),
+        ),
+      );
+      for (let i = 0; i < names.length; i++) {
+        const n = names[i] as string;
+        if (exportSet.has(n)) {
+          const t = finalEnv.lookup(n);
+          if (t !== undefined) exports.set(n, zonk(t, state.subst));
+        }
+      }
+      curEnv = finalEnv;
+    }
+    curPath = [...curPath, 2];
+    cur = body;
+  }
+
+  const innerCtx: Ctx = { ...ctx, path: curPath };
+  const innerT = infer(cur, curEnv, innerCtx);
+  ctx.errors = innerCtx.errors;
+  ctx.currentEffects = innerCtx.currentEffects;
+  const t = innerT;
+
   // Check that the module's top-level expression is pure (no unhandled effects).
   // We only report concrete unhandled tags — a fully-unknown effect row (a
   // free var, no tags) is a gradual escape and must not trigger the error.
@@ -4068,5 +4261,12 @@ export function typecheckModule(module: Module): TypecheckResult {
   if (ctx.errors.length > 0) {
     return { ok: false, errors: ctx.errors };
   }
-  return { ok: true, type: zonk(t, state.subst) };
+  if (exports.size === 0) {
+    return { ok: true, type: zonk(t, state.subst) };
+  }
+  return { ok: true, type: zonk(t, state.subst), exports };
+}
+
+export function typecheckModule(module: Module, opts?: TypecheckModuleOptions): TypecheckResult {
+  return typecheckModuleInternal(module, opts, new Map());
 }
