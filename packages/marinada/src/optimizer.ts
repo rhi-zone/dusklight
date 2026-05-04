@@ -928,6 +928,196 @@ const FOLD_LET: RewriteRule = {
   },
 };
 
+// --- Bitwise folding (bigint-only; the runtime ops require integer operands) ---
+
+function bitRule(op: string, fn: (a: bigint, b: bigint) => bigint): RewriteRule {
+  return {
+    name: `fold-${op}`,
+    headOp: op,
+    reducing: true,
+    match(e) {
+      if (!Array.isArray(e) || e.length !== 3 || e[0] !== op) return null;
+      return { a: e[1] as Expr, b: e[2] as Expr };
+    },
+    where(b) {
+      const c = bothConst(b.a as Expr, b.b as Expr);
+      if (!c.ok) return false;
+      const va = typeof c.a === "number" && Number.isInteger(c.a) ? BigInt(c.a) : c.a;
+      const vb = typeof c.b === "number" && Number.isInteger(c.b) ? BigInt(c.b) : c.b;
+      if (typeof va !== "bigint" || typeof vb !== "bigint") return false;
+      // bit-shl / bit-shr: refuse to fold for negative shift counts (runtime would throw).
+      if ((op === "bit-shl" || op === "bit-shr") && vb < 0n) return false;
+      return true;
+    },
+    rewrite(b) {
+      const c = bothConst(b.a as Expr, b.b as Expr) as { ok: true; a: unknown; b: unknown };
+      const va = typeof c.a === "number" ? BigInt(c.a as number) : (c.a as bigint);
+      const vb = typeof c.b === "number" ? BigInt(c.b as number) : (c.b as bigint);
+      return lit(fn(va, vb));
+    },
+  };
+}
+
+const FOLD_BIT_AND = bitRule("bit-and", (a, b) => a & b);
+const FOLD_BIT_OR = bitRule("bit-or", (a, b) => a | b);
+const FOLD_BIT_XOR = bitRule("bit-xor", (a, b) => a ^ b);
+const FOLD_BIT_SHL = bitRule("bit-shl", (a, b) => a << b);
+const FOLD_BIT_SHR = bitRule("bit-shr", (a, b) => a >> b);
+
+const FOLD_BIT_NOT: RewriteRule = {
+  name: "fold-bit-not",
+  headOp: "bit-not",
+  reducing: true,
+  match(e) {
+    if (!Array.isArray(e) || e.length !== 2 || e[0] !== "bit-not") return null;
+    return { a: e[1] as Expr };
+  },
+  where(b) {
+    const c = asConst(b.a as Expr);
+    if (!c.ok) return false;
+    return (
+      typeof c.value === "bigint" || (typeof c.value === "number" && Number.isInteger(c.value))
+    );
+  },
+  rewrite(b) {
+    const c = asConst(b.a as Expr) as { ok: true; value: unknown };
+    const v = typeof c.value === "number" ? BigInt(c.value as number) : (c.value as bigint);
+    return lit(~v);
+  },
+};
+
+// --- Math function folding ---
+//
+// Per the runtime in jit.ts: floor/ceil/round are no-ops on bigints (return as-is)
+// and use Math.* on numbers. abs handles both. min/max accept either.
+
+function mathUnaryRule(
+  op: string,
+  bigFn: (a: bigint) => bigint,
+  numFn: (a: number) => number,
+): RewriteRule {
+  return {
+    name: `fold-${op}`,
+    headOp: op,
+    reducing: true,
+    match(e) {
+      if (!Array.isArray(e) || e.length !== 2 || e[0] !== op) return null;
+      return { a: e[1] as Expr };
+    },
+    where(b) {
+      const c = asConst(b.a as Expr);
+      if (!c.ok) return false;
+      if (typeof c.value === "bigint") return true;
+      if (typeof c.value === "number") return Number.isFinite(numFn(c.value));
+      return false;
+    },
+    rewrite(b) {
+      const c = asConst(b.a as Expr) as { ok: true; value: unknown };
+      if (typeof c.value === "bigint") return lit(bigFn(c.value));
+      return lit(numFn(c.value as number));
+    },
+  };
+}
+
+const FOLD_FLOOR = mathUnaryRule(
+  "floor",
+  (a) => a,
+  (a) => Math.floor(a),
+);
+const FOLD_CEIL = mathUnaryRule(
+  "ceil",
+  (a) => a,
+  (a) => Math.ceil(a),
+);
+const FOLD_ROUND = mathUnaryRule(
+  "round",
+  (a) => a,
+  (a) => Math.round(a),
+);
+const FOLD_ABS = mathUnaryRule(
+  "abs",
+  (a) => (a < 0n ? -a : a),
+  (a) => Math.abs(a),
+);
+
+function mathBinaryRule(
+  op: string,
+  bigFn: (a: bigint, b: bigint) => bigint,
+  numFn: (a: number, b: number) => number,
+): RewriteRule {
+  return {
+    name: `fold-${op}`,
+    headOp: op,
+    reducing: true,
+    match(e) {
+      if (!Array.isArray(e) || e.length !== 3 || e[0] !== op) return null;
+      return { a: e[1] as Expr, b: e[2] as Expr };
+    },
+    where(b) {
+      const c = bothConst(b.a as Expr, b.b as Expr);
+      if (!c.ok) return false;
+      if (typeof c.a === "bigint" && typeof c.b === "bigint") return true;
+      if (
+        (typeof c.a === "bigint" || typeof c.a === "number") &&
+        (typeof c.b === "bigint" || typeof c.b === "number")
+      ) {
+        const av = typeof c.a === "bigint" ? Number(c.a) : c.a;
+        const bv = typeof c.b === "bigint" ? Number(c.b) : c.b;
+        return Number.isFinite(numFn(av, bv));
+      }
+      return false;
+    },
+    rewrite(b) {
+      const c = bothConst(b.a as Expr, b.b as Expr) as { ok: true; a: unknown; b: unknown };
+      if (typeof c.a === "bigint" && typeof c.b === "bigint") return lit(bigFn(c.a, c.b));
+      const av = typeof c.a === "bigint" ? Number(c.a) : (c.a as number);
+      const bv = typeof c.b === "bigint" ? Number(c.b) : (c.b as number);
+      return lit(numFn(av, bv));
+    },
+  };
+}
+
+const FOLD_MIN = mathBinaryRule(
+  "min",
+  (a, b) => (a < b ? a : b),
+  (a, b) => Math.min(a, b),
+);
+const FOLD_MAX = mathBinaryRule(
+  "max",
+  (a, b) => (a > b ? a : b),
+  (a, b) => Math.max(a, b),
+);
+
+// pow: jit.ts compiles to Math.pow(Number(a), Number(b)) — always returns a number.
+const FOLD_POW: RewriteRule = {
+  name: "fold-pow",
+  headOp: "pow",
+  reducing: true,
+  match(e) {
+    if (!Array.isArray(e) || e.length !== 3 || e[0] !== "pow") return null;
+    return { a: e[1] as Expr, b: e[2] as Expr };
+  },
+  where(b) {
+    const c = bothConst(b.a as Expr, b.b as Expr);
+    if (!c.ok) return false;
+    if (
+      (typeof c.a !== "bigint" && typeof c.a !== "number") ||
+      (typeof c.b !== "bigint" && typeof c.b !== "number")
+    ) {
+      return false;
+    }
+    const av = typeof c.a === "bigint" ? Number(c.a) : c.a;
+    const bv = typeof c.b === "bigint" ? Number(c.b) : c.b;
+    return Number.isFinite(Math.pow(av, bv));
+  },
+  rewrite(b) {
+    const c = bothConst(b.a as Expr, b.b as Expr) as { ok: true; a: unknown; b: unknown };
+    const av = typeof c.a === "bigint" ? Number(c.a) : (c.a as number);
+    const bv = typeof c.b === "bigint" ? Number(c.b) : (c.b as number);
+    return lit(Math.pow(av, bv));
+  },
+};
+
 export const CONSTANT_FOLDING_RULES: RewriteRule[] = [
   FOLD_ADD,
   FOLD_SUB,
@@ -952,6 +1142,19 @@ export const CONSTANT_FOLDING_RULES: RewriteRule[] = [
   FOLD_GET,
   FOLD_TO_STRING,
   FOLD_LET,
+  FOLD_BIT_AND,
+  FOLD_BIT_OR,
+  FOLD_BIT_XOR,
+  FOLD_BIT_SHL,
+  FOLD_BIT_SHR,
+  FOLD_BIT_NOT,
+  FOLD_FLOOR,
+  FOLD_CEIL,
+  FOLD_ROUND,
+  FOLD_ABS,
+  FOLD_MIN,
+  FOLD_MAX,
+  FOLD_POW,
 ];
 
 // --- Tree-automaton driver ---

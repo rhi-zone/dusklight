@@ -1262,5 +1262,388 @@ describe("fuseLoops", () => {
   });
 });
 
+// --- Adversarial optimizer tests ---
+//
+// These tests pin down behaviors that previously relied on careful path
+// arithmetic and pipeline ordering. They include cases the author thought
+// might be unsound but verified by direct trace are in fact correct (kept
+// as regressions), plus genuinely tricky inputs.
+//
+// Investigation notes:
+//   - Bug 1 ("fusion uses wrong path for inner function purity"): NOT
+//     reproducible. `tryFuseAt` is called on `recursed` (post-recurse) at
+//     `path` (path in the original tree). For the four fusion cases:
+//       map-after-map, map-after-filter, filter-after-map,
+//       filter-after-filter, reduce-after-map
+//     the inner __native node sits at expr[2] and its function/predicate
+//     at index 3, so [...path, 2, 3] is the correct path into the original
+//     TypeInfo. Verified by exhaustive case tests below.
+//   - Bug 2 ("substitute corrupts __loop initArgs"): NOT a bug. initArgs
+//     are evaluated in the outer scope, so substitution must always apply
+//     there. The body is the only place where loop params shadow the
+//     substituted name. The current implementation correctly substitutes
+//     initArgs unconditionally and only skips the body when shadowed.
+
+describe("adversarial optimizer", () => {
+  function countNative(e: Expr, name: string): number {
+    if (!Array.isArray(e) || e.length === 0) return 0;
+    let n = e[0] === "__native" && e[1] === name ? 1 : 0;
+    for (const c of e) {
+      if (typeof c === "object") n += countNative(c as Expr, name);
+    }
+    return n;
+  }
+  function hasOp(expr: Expr, op: string): boolean {
+    if (!Array.isArray(expr)) return false;
+    if (expr[0] === op) return true;
+    for (let i = 0; i < expr.length; i++) {
+      if (hasOp(expr[i] as Expr, op)) return true;
+    }
+    return false;
+  }
+
+  // 1. Fusion purity (critical): inner effectful blocks fusion in every case.
+  it("does NOT fuse map-after-map when INNER function is effectful", () => {
+    const expr: Expr = [
+      "__native",
+      "array_map",
+      [
+        "__native",
+        "array_map",
+        "xs",
+        ["fn", ["x"], ["do", ["perform", "Log", "x"], ["+", "x", 1]]],
+      ],
+      ["fn", ["y"], ["*", "y", 2]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(countNative(fused, "array_map")).toBe(2);
+  });
+
+  it("does NOT fuse map-after-filter when INNER predicate is effectful", () => {
+    const expr: Expr = [
+      "__native",
+      "array_map",
+      [
+        "__native",
+        "array_filter",
+        "xs",
+        ["fn", ["x"], ["do", ["perform", "Log", "x"], [">", "x", 0]]],
+      ],
+      ["fn", ["y"], ["*", "y", 2]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(countNative(fused, "array_map_filter")).toBe(0);
+    expect(countNative(fused, "array_map")).toBe(1);
+    expect(countNative(fused, "array_filter")).toBe(1);
+  });
+
+  it("does NOT fuse filter-after-map when INNER function is effectful", () => {
+    const expr: Expr = [
+      "__native",
+      "array_filter",
+      [
+        "__native",
+        "array_map",
+        "xs",
+        ["fn", ["x"], ["do", ["perform", "Log", "x"], ["+", "x", 1]]],
+      ],
+      ["fn", ["y"], [">", "y", 0]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(countNative(fused, "array_filter_map")).toBe(0);
+    expect(countNative(fused, "array_map")).toBe(1);
+    expect(countNative(fused, "array_filter")).toBe(1);
+  });
+
+  it("does NOT fuse filter-after-filter when INNER predicate is effectful", () => {
+    const expr: Expr = [
+      "__native",
+      "array_filter",
+      [
+        "__native",
+        "array_filter",
+        "xs",
+        ["fn", ["x"], ["do", ["perform", "Log", "x"], [">", "x", 0]]],
+      ],
+      ["fn", ["y"], ["<", "y", 100]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(countNative(fused, "array_filter")).toBe(2);
+  });
+
+  it("does NOT fuse reduce-after-map when INNER map function is effectful", () => {
+    const expr: Expr = [
+      "__native",
+      "array_reduce",
+      [
+        "__native",
+        "array_map",
+        "xs",
+        ["fn", ["x"], ["do", ["perform", "Log", "x"], ["+", "x", 1]]],
+      ],
+      ["fn", ["a", "b"], ["+", "a", "b"]],
+      0,
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(countNative(fused, "array_map_reduce")).toBe(0);
+    expect(countNative(fused, "array_map")).toBe(1);
+    expect(countNative(fused, "array_reduce")).toBe(1);
+  });
+
+  // 2. Fusion purity: outer effectful blocks fusion (regression of existing behavior).
+  it("does NOT fuse when OUTER function is effectful", () => {
+    const expr: Expr = [
+      "__native",
+      "array_map",
+      ["__native", "array_map", "xs", ["fn", ["x"], ["+", "x", 1]]],
+      ["fn", ["y"], ["do", ["perform", "Log", "y"], ["*", "y", 2]]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(countNative(fused, "array_map")).toBe(2);
+  });
+
+  // 3. TCO + match shadowing: a match clause that shadows the recursive name
+  //    must not corrupt the loop. We don't require TCO to fire — we require
+  //    that whatever it does is sound (the compiled program returns the
+  //    correct answer).
+  it("TCO is sound when a match clause binding shadows the recursive name", () => {
+    // letrec [[f, fn [opt] (match opt
+    //                          [[None] 0]
+    //                          [[Some, f] (call f (None))])]]   -- inner `f` shadows outer
+    //   (call f (Some inner-fn))
+    const expr: Expr = [
+      "letrec",
+      [
+        [
+          "f",
+          [
+            "fn",
+            ["opt"],
+            [
+              "match",
+              "opt",
+              [["None"], 0],
+              [
+                ["Some", "f"],
+                ["call", "f", ["None"]],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["call", "f", ["Some", ["fn", ["_x"], 42]]],
+    ];
+    // Whatever TCO does (transform or leave alone), compiling and running
+    // must yield the right answer (the inner fn ignores its argument and
+    // returns 42).
+    const fn = compile(expr);
+    expect(fn({})).toBe(42n);
+  });
+
+  // 4. Bitwise fold rules.
+  it("folds bit-and on bigint literals", () => {
+    expect(optimize(["bit-and", 15, 7], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", 7n]);
+  });
+
+  it("folds bit-or on bigint literals", () => {
+    expect(optimize(["bit-or", 12, 3], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", 15n]);
+  });
+
+  it("folds bit-xor / bit-shl / bit-shr / bit-not", () => {
+    expect(optimize(["bit-xor", 5, 3], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", 6n]);
+    expect(optimize(["bit-shl", 1, 4], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", 16n]);
+    expect(optimize(["bit-shr", 16, 2], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", 4n]);
+    expect(optimize(["bit-not", 0], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", -1n]);
+  });
+
+  it("does not fold bit-shl with negative shift count", () => {
+    // Negative shift would throw at runtime; preserve the expression.
+    const expr: Expr = ["bit-shl", 1, -1];
+    expect(optimize(expr, CONSTANT_FOLDING_RULES)).toEqual(expr);
+  });
+
+  // 5. Math function fold rules.
+  it("folds floor / ceil / round / abs on numeric literals", () => {
+    expect(optimize(["floor", 3.7], CONSTANT_FOLDING_RULES)).toEqual(["__lit", 3]);
+    expect(optimize(["ceil", 3.2], CONSTANT_FOLDING_RULES)).toEqual(["__lit", 4]);
+    expect(optimize(["round", 2.5], CONSTANT_FOLDING_RULES)).toEqual(["__lit", 3]);
+    expect(optimize(["abs", -5], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", 5n]);
+  });
+
+  it("folds min / max / pow on literals", () => {
+    expect(optimize(["min", 3, 5], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", 3n]);
+    expect(optimize(["max", 3, 5], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", 5n]);
+    expect(optimize(["pow", 2, 8], CONSTANT_FOLDING_RULES)).toEqual(["__lit", 256]);
+  });
+
+  it("floor / ceil / round are no-ops on bigints", () => {
+    // Already integral — fold preserves the value.
+    expect(optimize(["floor", 7], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", 7n]);
+    expect(optimize(["ceil", 7], CONSTANT_FOLDING_RULES) as unknown).toEqual(["__lit", 7n]);
+  });
+
+  // 6. Loop pattern recognition on a user-written reduce (not from lib:std).
+  it("recognizes a user-written, structurally-equivalent reduce loop", () => {
+    // User defines their own reduce under a different name, structurally
+    // identical to lib:std reduce.
+    const userReduce: Expr = [
+      "letrec",
+      [
+        [
+          "my-reduce",
+          [
+            "fn",
+            ["g", "ys", "acc", "k"],
+            [
+              "if",
+              ["==", "k", ["count", "ys"]],
+              "acc",
+              [
+                "call",
+                "my-reduce",
+                "g",
+                "ys",
+                ["call", "g", "acc", ["array-get", "ys", "k"]],
+                ["+", "k", 1],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["g", "init", "ys"], ["call", "my-reduce", "g", "ys", "init", 0]],
+    ];
+    let e = tco(userReduce);
+    e = optimize(e, CONSTANT_FOLDING_RULES);
+    e = inlineSmallFunctions(e);
+    e = recognizeLoopPatterns(e);
+    expect(hasOp(e, "__loop")).toBe(false);
+    function hasNative(expr: Expr, name: string): boolean {
+      if (!Array.isArray(expr) || expr.length === 0) return false;
+      if (expr[0] === "__native" && expr[1] === name) return true;
+      return expr.some((c) => (typeof c === "object" ? hasNative(c as Expr, name) : false));
+    }
+    expect(hasNative(e, "array_reduce")).toBe(true);
+  });
+
+  // 7. Pipeline interaction: inlining exposes a constant that subsequent folding picks up.
+  it("inlining exposes a new constant that gets folded by the re-fold pass", () => {
+    // let id = (fn [x] x) in (+ (call id 40) 2)
+    // Inlining the call exposes (+ 40 2), which the second fold pass simplifies to 42.
+    const expr: Expr = ["let", [["id", ["fn", ["x"], "x"]]], ["+", ["call", "id", 40], 2]];
+    let e = tco(expr);
+    e = optimize(e, CONSTANT_FOLDING_RULES);
+    e = inlineSmallFunctions(e);
+    e = optimize(e, CONSTANT_FOLDING_RULES);
+    expect(e as unknown).toEqual(["__lit", 42n]);
+  });
+
+  // 8. Pipeline interaction: TCO transforms a letrec, then pattern recognition fires.
+  it("TCO + pattern recognition fires on a TCO-produced __loop", () => {
+    // User-written map (same as in recognizeLoopPatterns suite, but verifying
+    // that TCO is the producer of the __loop that recognition then matches).
+    const userMap: Expr = [
+      "letrec",
+      [
+        [
+          "my-map",
+          [
+            "fn",
+            ["g", "ys", "out", "k"],
+            [
+              "if",
+              ["==", "k", ["count", "ys"]],
+              "out",
+              [
+                "call",
+                "my-map",
+                "g",
+                "ys",
+                ["array-push", "out", ["call", "g", ["array-get", "ys", "k"]]],
+                ["+", "k", 1],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["g", "ys"], ["call", "my-map", "g", "ys", ["array"], 0]],
+    ];
+    const afterTco = tco(userMap);
+    expect(hasOp(afterTco, "__loop")).toBe(true);
+    expect(hasOp(afterTco, "letrec")).toBe(false);
+    let e = optimize(afterTco, CONSTANT_FOLDING_RULES);
+    e = inlineSmallFunctions(e);
+    e = recognizeLoopPatterns(e);
+    expect(hasOp(e, "__loop")).toBe(false);
+    function hasNative(expr: Expr, name: string): boolean {
+      if (!Array.isArray(expr) || expr.length === 0) return false;
+      if (expr[0] === "__native" && expr[1] === name) return true;
+      return expr.some((c) => (typeof c === "object" ? hasNative(c as Expr, name) : false));
+    }
+    expect(hasNative(e, "array_map")).toBe(true);
+  });
+
+  // 9. Termination guard: a rule that would loop is detected (backstop fires).
+  it("termination guard fires when a rule would otherwise loop forever", () => {
+    // A rule that always returns a fresh node with the same head op — the
+    // 1000-iteration backstop must catch this rather than running forever.
+    const loopingRule: RewriteRule = {
+      name: "would-loop",
+      headOp: "spin",
+      reducing: true,
+      match: (e) => (Array.isArray(e) && e[0] === "spin" ? {} : null),
+      rewrite: () => ["spin"] as Expr,
+    };
+    expect(() => optimize(["spin"], [loopingRule])).toThrow(
+      /did not terminate|same node|non-reducing/,
+    );
+  });
+
+  // 10. Deeply nested constant folding terminates and produces the right result.
+  it("deeply nested constant folding terminates and is correct", () => {
+    // Build (+ (+ (+ ... (+ 1 1) ...) 1) 1) with depth 12 — should fold to 13n.
+    let e: Expr = 1;
+    for (let i = 0; i < 12; i++) {
+      e = ["+", e, 1];
+    }
+    const folded = optimize(e, CONSTANT_FOLDING_RULES);
+    expect(folded as unknown).toEqual(["__lit", 13n]);
+  });
+
+  // 11. Empty array: map(f, []) evaluates to [] after optimization.
+  it("map(f, []) optimizes and evaluates to []", () => {
+    const expr: Expr = ["__native", "array_map", ["array"], ["fn", ["x"], ["+", "x", 1]]];
+    const info = buildTypeInfo(expr);
+    const fn = compile(expr, { typeInfo: info });
+    expect(fn({})).toEqual([]);
+  });
+
+  // 12. Triple-fusion chain: map(f, map(g, map(h, xs))) → single pass.
+  it("fuses map(f, map(g, map(h, xs))) into a single array_map", () => {
+    const expr: Expr = [
+      "__native",
+      "array_map",
+      [
+        "__native",
+        "array_map",
+        ["__native", "array_map", "xs", ["fn", ["a"], ["+", "a", 1]]],
+        ["fn", ["b"], ["*", "b", 2]],
+      ],
+      ["fn", ["c"], ["-", "c", 3]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(countNative(fused, "array_map")).toBe(1);
+    // Correctness end-to-end: ((1+1)*2)-3 = 1, ((2+1)*2)-3 = 3, ((3+1)*2)-3 = 5.
+    const fn = compile(expr, { typeInfo: info });
+    expect(fn({ xs: [1n, 2n, 3n] })).toEqual([1n, 3n, 5n]);
+  });
+});
+
 // CompileError is referenced indirectly via earlier suite imports; ensure not unused.
 void CompileError;
