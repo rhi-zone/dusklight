@@ -2717,32 +2717,6 @@ function makeAndPred(pred1: Expr, pred2: Expr): Expr {
 /** Check whether a function-typed value at the given path can be invoked
  * without producing observable effects. Reads the inferred function type's
  * latent-effects row from `typeInfo` and returns true when that row has no
- * concrete effect fields. Returns false for non-function types, missing
- * type info, or when concrete effects are present.
- *
- * Note: this is distinct from `isPure(path)`, which asks about the effects
- * of *evaluating* the expression at `path`. For a `fn` literal, evaluating
- * just creates a closure (no effects) — but we care about effects produced
- * when the function is later *called*. Those live in the fn type's `effects`
- * row.
- *
- * The row's tail may be open (a free var) — that's the normal artifact of
- * Hindley–Milner inference for an `fn` whose body did not invoke any concrete
- * effect. A `perform` inside the body would add a concrete field; if no field
- * is present, no effect was performed during inference. Treating that as pure
- * is sound for fusion: we are asking "could this function, as written, ever
- * produce a side effect?" — and the absence of any concrete effect row entry
- * answers no. */
-function isFunctionPure(typeInfo: TypeInfo, path: number[]): boolean {
-  const t = typeInfo.typeOf(path);
-  if (t === null) return false;
-  if (t.kind !== "fn") return false;
-  const eff = t.effects;
-  if (eff === undefined) return false;
-  if (eff.kind !== "row") return false;
-  return eff.fields.size === 0;
-}
-
 /** Try to fuse a single `__native` array operation with its (already-fused)
  * inner argument. Returns the fused expression, or null if no rule applies.
  * `path` is the path to `expr` in the post-walk tree (i.e. paths into
@@ -2763,7 +2737,7 @@ function tryFuseAt(expr: Expr[], path: number[], typeInfo: TypeInfo): Expr | nul
         const ys = xs[2] as Expr;
         const g = xs[3] as Expr;
         // Both inner-g and outer-f must be pure.
-        if (isFunctionPure(typeInfo, [...path, 3]) && isFunctionPure(typeInfo, [...path, 2, 3])) {
+        if (typeInfo.isPure([...path, 3]) && typeInfo.isPure([...path, 2, 3])) {
           return ["__native", "array_map", ys, makeCompose(f, g)];
         }
       }
@@ -2771,7 +2745,7 @@ function tryFuseAt(expr: Expr[], path: number[], typeInfo: TypeInfo): Expr | nul
       if (innerName === "array_filter" && xs.length === 4) {
         const ys = xs[2] as Expr;
         const pred = xs[3] as Expr;
-        if (isFunctionPure(typeInfo, [...path, 3]) && isFunctionPure(typeInfo, [...path, 2, 3])) {
+        if (typeInfo.isPure([...path, 3]) && typeInfo.isPure([...path, 2, 3])) {
           return ["__native", "array_map_filter", ys, pred, f];
         }
       }
@@ -2788,7 +2762,7 @@ function tryFuseAt(expr: Expr[], path: number[], typeInfo: TypeInfo): Expr | nul
       if (innerName === "array_map" && xs.length === 4) {
         const ys = xs[2] as Expr;
         const f = xs[3] as Expr;
-        if (isFunctionPure(typeInfo, [...path, 3]) && isFunctionPure(typeInfo, [...path, 2, 3])) {
+        if (typeInfo.isPure([...path, 3]) && typeInfo.isPure([...path, 2, 3])) {
           return ["__native", "array_filter_map", ys, f, pred2];
         }
       }
@@ -2796,7 +2770,7 @@ function tryFuseAt(expr: Expr[], path: number[], typeInfo: TypeInfo): Expr | nul
       if (innerName === "array_filter" && xs.length === 4) {
         const ys = xs[2] as Expr;
         const pred1 = xs[3] as Expr;
-        if (isFunctionPure(typeInfo, [...path, 3]) && isFunctionPure(typeInfo, [...path, 2, 3])) {
+        if (typeInfo.isPure([...path, 3]) && typeInfo.isPure([...path, 2, 3])) {
           return ["__native", "array_filter", ys, makeAndPred(pred1, pred2)];
         }
       }
@@ -2811,7 +2785,7 @@ function tryFuseAt(expr: Expr[], path: number[], typeInfo: TypeInfo): Expr | nul
     if (Array.isArray(xs) && xs[0] === "__native" && xs[1] === "array_map" && xs.length === 4) {
       const ys = xs[2] as Expr;
       const g = xs[3] as Expr;
-      if (isFunctionPure(typeInfo, [...path, 3]) && isFunctionPure(typeInfo, [...path, 2, 3])) {
+      if (typeInfo.isPure([...path, 3]) && typeInfo.isPure([...path, 2, 3])) {
         return ["__native", "array_map_reduce", ys, g, f, init];
       }
     }

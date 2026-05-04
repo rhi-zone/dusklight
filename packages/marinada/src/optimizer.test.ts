@@ -235,16 +235,16 @@ describe("buildTypeInfo", () => {
     expect(info.typeOf([99])).toBeNull();
   });
 
-  it("isPure returns false for pure int expression (open row is conservative)", () => {
-    // A fresh open effects row is conservative — isPure returns false.
-    // The root effects row starts as an open fresh row even for pure exprs.
+  it("isPure returns true for pure int expression (open row with no concrete fields is pure)", () => {
+    // An open effects row with no concrete fields means no effects were inferred.
+    // isPure returns true: the expression produces no observable effects.
     const info = buildTypeInfo(["+", 1, 2]);
-    expect(info.isPure([])).toBe(false);
+    expect(info.isPure([])).toBe(true);
   });
 
-  it("isPure returns false for boolean literal (open row is conservative)", () => {
+  it("isPure returns true for boolean literal (open row with no concrete fields is pure)", () => {
     const info = buildTypeInfo(true);
-    expect(info.isPure([])).toBe(false);
+    expect(info.isPure([])).toBe(true);
   });
 
   it("isPure returns false for perform (effectful)", () => {

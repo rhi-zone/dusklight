@@ -3947,7 +3947,12 @@ export type TypeInfo = {
   typeOf(path: number[]): MType | null;
   /** Return the effect row type at the given path, or null if not applicable. */
   effectsOf(path: number[]): MType | null;
-  /** True only when the effect row at the given path is a concretely empty closed row. */
+  /**
+   * Returns true if this expression, when called (for fn types) or evaluated
+   * (for other types), will produce no observable effects — i.e. its effect
+   * row has no concrete fields. The row's tail may be open (a free var), which
+   * is the normal HM artifact for code that never invoked a concrete effect.
+   */
   isPure(path: number[]): boolean;
 };
 
@@ -3956,8 +3961,6 @@ export type TypeInfo = {
  * `typeOf([])` returns the type of the root expression.
  * `typeOf([1])` returns the type of the first argument.
  * etc.
- *
- * `isPure` returns false for unknown/free rows — conservative.
  */
 export function buildTypeInfo(expr: Expr, env?: TypeEnv): TypeInfo {
   const state = new State();
@@ -3989,11 +3992,10 @@ export function buildTypeInfo(expr: Expr, env?: TypeEnv): TypeInfo {
     return JSON.stringify(path);
   }
 
-  function isEmptyClosedRow(t: MType): boolean {
+  function hasNoConcreteFields(t: MType): boolean {
     const r = zonk(t, state.subst);
     if (r.kind !== "row") return false;
-    if (r.fields.size !== 0) return false;
-    return r.rest === "empty";
+    return r.fields.size === 0;
   }
 
   return {
@@ -4010,7 +4012,13 @@ export function buildTypeInfo(expr: Expr, env?: TypeEnv): TypeInfo {
     isPure(path: number[]): boolean {
       const entry = rawIndex.get(pathKey(path));
       if (!entry) return false;
-      return isEmptyClosedRow(entry.effectsRowId);
+      const t = zonk(entry.type, state.subst);
+      // For fn types, check the fn's own effect row (effects when called).
+      // For other types, check the expression's ambient effect row (effects when evaluated).
+      if (t.kind === "fn" && t.effects !== undefined) {
+        return hasNoConcreteFields(t.effects);
+      }
+      return hasNoConcreteFields(entry.effectsRowId);
     },
   };
 }
