@@ -534,22 +534,147 @@ export function serializeStmt(s: JSStmt): string {
   }
 }
 
-// --- Sanitization ---
+// --- Sanitization & Scope ---
 
+// JS reserved words and identifiers used by the generated code.
+// Bindings that sanitize to one of these get a numeric suffix.
+const RESERVED: ReadonlySet<string> = new Set([
+  // Generated-code identifiers
+  "env",
+  "_rt",
+  "_nat",
+  // JS reserved words / future reserved words / contextual keywords
+  "break",
+  "case",
+  "catch",
+  "class",
+  "const",
+  "continue",
+  "debugger",
+  "default",
+  "delete",
+  "do",
+  "else",
+  "enum",
+  "export",
+  "extends",
+  "false",
+  "finally",
+  "for",
+  "function",
+  "if",
+  "implements",
+  "import",
+  "in",
+  "instanceof",
+  "interface",
+  "let",
+  "new",
+  "null",
+  "package",
+  "private",
+  "protected",
+  "public",
+  "return",
+  "static",
+  "super",
+  "switch",
+  "this",
+  "throw",
+  "true",
+  "try",
+  "typeof",
+  "var",
+  "void",
+  "while",
+  "with",
+  "yield",
+  "await",
+  "async",
+  // Globals our generated code might reference
+  "Array",
+  "BigInt",
+  "Error",
+  "Math",
+  "Number",
+  "Object",
+  "String",
+  "TypeError",
+  "RangeError",
+  "undefined",
+  "NaN",
+  "Infinity",
+  "globalThis",
+]);
+
+/** Sanitize a Marinada name to a valid JS identifier base.
+ * Replaces any character outside [a-zA-Z0-9_$] with `_`, and prefixes with `_`
+ * if the result starts with a digit or is empty. The result is NOT
+ * guaranteed unique — `Scope.bind` handles disambiguation. */
 function sanitize(name: string): string {
-  // Replace any character that's not [a-zA-Z0-9_$] with _
   let safe = name.replace(/[^a-zA-Z0-9_$]/g, "_");
-  // Always prefix with _m_ to avoid colliding with reserved words and our own names.
-  safe = "_m_" + safe;
+  if (safe === "" || /^[0-9]/.test(safe)) safe = "_" + safe;
   return safe;
+}
+
+/** Lexical scope: maps Marinada names to JS identifiers, with parent chain. */
+class Scope {
+  private readonly bindings = new Map<string, string>();
+  constructor(
+    readonly parent: Scope | null,
+    readonly taken: Set<string>,
+  ) {}
+
+  /** Create a child scope sharing the same compilation-wide taken set. */
+  child(): Scope {
+    return new Scope(this, this.taken);
+  }
+
+  /** Bind `name` to a fresh JS identifier, avoiding all currently-taken names.
+   * Returns the JS identifier. */
+  bind(name: string): string {
+    const base = sanitize(name);
+    let candidate = base;
+    let i = 1;
+    while (this.taken.has(candidate) || RESERVED.has(candidate)) {
+      candidate = `${base}_${i++}`;
+    }
+    this.taken.add(candidate);
+    this.bindings.set(name, candidate);
+    return candidate;
+  }
+
+  /** Generate a fresh internal JS identifier with the given base.
+   * Not associated with any Marinada name. */
+  gensym(base: string): string {
+    let candidate = base;
+    let i = 1;
+    while (this.taken.has(candidate) || RESERVED.has(candidate)) {
+      candidate = `${base}_${i++}`;
+    }
+    this.taken.add(candidate);
+    return candidate;
+  }
+
+  /** Walk the scope chain looking for a Marinada name. */
+  resolve(name: string): string | undefined {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    let s: Scope | null = this;
+    while (s !== null) {
+      const r = s.bindings.get(name);
+      if (r !== undefined) return r;
+      s = s.parent;
+    }
+    return undefined;
+  }
 }
 
 // --- Compiler ---
 
 type CompileCtx = {
   path: number[];
-  // Map from Marinada name → sanitized JS identifier, for in-scope locals.
-  locals: ReadonlyMap<string, string>;
+  /** Lexical scope for variable name resolution. */
+  scope: Scope;
   /** When inside a __loop body, the sanitized loop parameter names + label. */
   loop: { params: string[]; label: string } | null;
   /** Counter for generating unique loop labels. */
@@ -557,21 +682,25 @@ type CompileCtx = {
 };
 
 function emptyCtx(): CompileCtx {
-  return { path: [], locals: new Map(), loop: null, loopCounter: { n: 0 } };
+  return {
+    path: [],
+    scope: new Scope(null, new Set()),
+    loop: null,
+    loopCounter: { n: 0 },
+  };
 }
 
 function childCtx(ctx: CompileCtx, i: number): CompileCtx {
   return { ...ctx, path: [...ctx.path, i] };
 }
 
-function withLocals(ctx: CompileCtx, mapping: Iterable<[string, string]>): CompileCtx {
-  const newLocals = new Map(ctx.locals);
-  for (const [k, v] of mapping) newLocals.set(k, v);
-  return { ...ctx, locals: newLocals };
+/** Create a child context with a fresh nested scope. */
+function pushScope(ctx: CompileCtx): CompileCtx {
+  return { ...ctx, scope: ctx.scope.child() };
 }
 
 function varRef(name: string, ctx: CompileCtx): JSExpr {
-  const local = ctx.locals.get(name);
+  const local = ctx.scope.resolve(name);
   if (local !== undefined) return J.id(local);
   return J.idx(J.id("env"), J.lit(JSON.stringify(name)));
 }
@@ -680,7 +809,7 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
 
       // Compile each binding's value in the context with all PRIOR bindings in scope,
       // then add the new binding to the scope for subsequent bindings and the body.
-      let currentCtx = ctx;
+      let currentCtx = pushScope(ctx);
       const bindingData: Array<{ jsName: string; valExpr: JSExpr }> = [];
       for (let i = 0; i < bindings.length; i++) {
         const binding = bindings[i];
@@ -695,9 +824,8 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
           ...currentCtx,
           path: childCtx(ctx, i).path,
         });
-        const jsName = sanitize(name);
+        const jsName = currentCtx.scope.bind(name);
         bindingData.push({ jsName, valExpr });
-        currentCtx = withLocals(currentCtx, [[name, jsName]]);
       }
 
       let bodyExpr = compileExpr(body, {
@@ -733,16 +861,16 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
         names.push(name);
       }
 
-      const mapping: [string, string][] = names.map((n) => [n, sanitize(n)]);
-      const recCtx = withLocals(ctx, mapping);
+      const recCtx = pushScope(ctx);
+      const jsNames: string[] = names.map((n) => recCtx.scope.bind(n));
 
       const stmts: JSStmt[] = [];
-      for (const [, jsName] of mapping) {
+      for (const jsName of jsNames) {
         stmts.push({ t: "var", name: jsName });
       }
       for (let i = 0; i < bindings.length; i++) {
         const binding = bindings[i] as Expr[];
-        const jsName = mapping[i]![1];
+        const jsName = jsNames[i]!;
         const valExpr = compileExpr(binding[1] as Expr, recCtx);
         stmts.push({ t: "assign-stmt", lhs: jsName, rhs: valExpr });
       }
@@ -771,8 +899,8 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
           ]);
         }
       }
-      const mapping: [string, string][] = params.map((p) => [p, sanitize(p)]);
-      const fnCtx = withLocals(ctx, mapping);
+      const fnCtx = pushScope(ctx);
+      const jsParams: string[] = params.map((p) => fnCtx.scope.bind(p));
       const bodyExpr = compileExpr(arr[2] as Expr, {
         ...fnCtx,
         path: childCtx(ctx, 2).path,
@@ -780,7 +908,7 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
       });
       return {
         t: "arrow",
-        params: mapping.map(([, j]) => j),
+        params: jsParams,
         body: bodyExpr,
       };
     }
@@ -915,7 +1043,7 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
       const scrutE = arg(1);
       const clauses = arr.slice(2);
       const stmts: JSStmt[] = [];
-      const scrutName = "_m_$s";
+      const scrutName = ctx.scope.gensym("$s");
       stmts.push({ t: "let", name: scrutName, init: scrutE });
       for (let i = 0; i < clauses.length; i++) {
         const clause = clauses[i];
@@ -936,13 +1064,13 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
           throw new CompileError("match pattern tag must be a string", [...ctx.path, i + 2, 0]);
         }
         const bindingNames = pattern.slice(1) as string[];
-        const mapping: [string, string][] = bindingNames.map((n) => [n, sanitize(n)]);
-        const bodyCtx = withLocals(ctx, mapping);
+        const bodyCtx = pushScope(ctx);
+        const jsBindings: string[] = bindingNames.map((n) => bodyCtx.scope.bind(n));
         const thenStmts: JSStmt[] = [];
         for (let fi = 0; fi < bindingNames.length; fi++) {
           thenStmts.push({
             t: "let",
-            name: mapping[fi]![1],
+            name: jsBindings[fi]!,
             init: J.member(J.id(scrutName), `$${fi}`),
           });
         }
@@ -1060,15 +1188,13 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
         }
         paramNames.push(p);
       }
-      const jsParams = paramNames.map(sanitize);
       const initEs = (initArgs as Expr[]).map((e, i) => compileExpr(e, childCtx(ctx, i + 2)));
 
-      const label = `_L${ctx.loopCounter.n++}`;
+      const loopScopeCtx = pushScope(ctx);
+      const jsParams: string[] = paramNames.map((p) => loopScopeCtx.scope.bind(p));
+      const label = loopScopeCtx.scope.gensym(`_L${ctx.loopCounter.n++}`);
       const bodyCtx: CompileCtx = {
-        ...withLocals(
-          ctx,
-          paramNames.map((p, i) => [p, jsParams[i]!] as [string, string]),
-        ),
+        ...loopScopeCtx,
         path: childCtx(ctx, 3).path,
         loop: { params: jsParams, label },
       };
@@ -1147,7 +1273,7 @@ function compileTail(expr: Expr, ctx: CompileCtx): JSStmt[] {
       const stmts: JSStmt[] = [];
       const tmpNames: string[] = [];
       for (let i = 0; i < newArgEs.length; i++) {
-        const tmp = `_m_$c${ctx.loopCounter.n}_${i}`;
+        const tmp = ctx.scope.gensym(`$c${ctx.loopCounter.n}_${i}`);
         tmpNames.push(tmp);
         stmts.push({ t: "let", name: tmp, init: newArgEs[i]! });
       }
@@ -1194,7 +1320,7 @@ function compileTail(expr: Expr, ctx: CompileCtx): JSStmt[] {
       }
       const body = arr[2] as Expr;
       const stmts: JSStmt[] = [];
-      let currentCtx = ctx;
+      let currentCtx = pushScope(ctx);
       for (let i = 0; i < bindings.length; i++) {
         const binding = bindings[i];
         if (!Array.isArray(binding) || binding.length !== 2) {
@@ -1208,9 +1334,8 @@ function compileTail(expr: Expr, ctx: CompileCtx): JSStmt[] {
           ...currentCtx,
           path: childCtx(ctx, i).path,
         });
-        const jsName = sanitize(name);
+        const jsName = currentCtx.scope.bind(name);
         stmts.push({ t: "let", name: jsName, init: valExpr });
-        currentCtx = withLocals(currentCtx, [[name, jsName]]);
       }
       const tail = compileTail(body, {
         ...currentCtx,
@@ -1260,7 +1385,7 @@ function compileTail(expr: Expr, ctx: CompileCtx): JSStmt[] {
       }
       const scrutE = compileExpr(arr[1] as Expr, childCtx(ctx, 1));
       const clauses = arr.slice(2);
-      const scrutName = `_m_$s${ctx.loopCounter.n}`;
+      const scrutName = ctx.scope.gensym(`$s${ctx.loopCounter.n}`);
       const stmts: JSStmt[] = [{ t: "let", name: scrutName, init: scrutE }];
       for (let i = 0; i < clauses.length; i++) {
         const clause = clauses[i];
@@ -1281,13 +1406,13 @@ function compileTail(expr: Expr, ctx: CompileCtx): JSStmt[] {
           throw new CompileError("match pattern tag must be a string", [...ctx.path, i + 2, 0]);
         }
         const bindingNames = pattern.slice(1) as string[];
-        const mapping: [string, string][] = bindingNames.map((n) => [n, sanitize(n)]);
-        const bodyCtx = withLocals(ctx, mapping);
+        const bodyCtx = pushScope(ctx);
+        const jsBindings: string[] = bindingNames.map((n) => bodyCtx.scope.bind(n));
         const thenStmts: JSStmt[] = [];
         for (let fi = 0; fi < bindingNames.length; fi++) {
           thenStmts.push({
             t: "let",
-            name: mapping[fi]![1],
+            name: jsBindings[fi]!,
             init: J.member(J.id(scrutName), `$${fi}`),
           });
         }

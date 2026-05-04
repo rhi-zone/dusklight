@@ -892,6 +892,125 @@ describe("math primitives (JIT)", () => {
   });
 });
 
+// --- Variable name collision and reserved words ---
+
+describe("variable name collisions", () => {
+  it("two let bindings whose sanitized names collide compile and evaluate correctly", () => {
+    // "foo-bar" and "foo_bar" both sanitize to "foo_bar" — second must get a suffix.
+    const expr: Expr = [
+      "let",
+      [
+        ["foo-bar", 1],
+        ["foo_bar", 2],
+      ],
+      ["+", "foo-bar", "foo_bar"],
+    ];
+    expect(run(expr)).toBe(3n);
+  });
+
+  it("reverse order also works", () => {
+    const expr: Expr = [
+      "let",
+      [
+        ["foo_bar", 10],
+        ["foo-bar", 20],
+      ],
+      ["-", "foo_bar", "foo-bar"],
+    ];
+    expect(run(expr)).toBe(-10n);
+  });
+
+  it("fn params with sanitization collision", () => {
+    const expr: Expr = ["call", ["fn", ["a-b", "a_b"], ["+", "a-b", "a_b"]], 100, 1];
+    expect(run(expr)).toBe(101n);
+  });
+
+  it("match pattern bindings with sanitization collision", () => {
+    const expr: Expr = [
+      "match",
+      "v",
+      [
+        ["Pair", "x-y", "x_y"],
+        ["+", "x-y", "x_y"],
+      ],
+    ];
+    expect(run(expr, { v: { $tag: "Pair", $0: 5n, $1: 7n } })).toBe(12n);
+  });
+
+  it("nested let with sanitization collisions across scopes", () => {
+    const expr: Expr = [
+      "let",
+      [["foo-bar", 1]],
+      ["let", [["foo_bar", 2]], ["+", "foo-bar", "foo_bar"]],
+    ];
+    expect(run(expr)).toBe(3n);
+  });
+
+  it("three names colliding to the same base", () => {
+    const expr: Expr = [
+      "let",
+      [
+        ["a-b", 1],
+        ["a_b", 2],
+        ["a.b", 4],
+      ],
+      ["+", ["+", "a-b", "a_b"], "a.b"],
+    ];
+    expect(run(expr)).toBe(7n);
+  });
+});
+
+describe("reserved-word and runtime-name bindings", () => {
+  it("variable named 'env' as let binding", () => {
+    const expr: Expr = ["let", [["env", 42]], "env"];
+    expect(run(expr)).toBe(42n);
+  });
+
+  it("variable named '_rt' as let binding", () => {
+    const expr: Expr = ["let", [["_rt", 99]], "_rt"];
+    expect(run(expr)).toBe(99n);
+  });
+
+  it("variable named 'return' as let binding", () => {
+    const expr: Expr = ["let", [["return", 7]], "return"];
+    expect(run(expr)).toBe(7n);
+  });
+
+  it("variable named 'class' as let binding", () => {
+    const expr: Expr = ["let", [["class", 13]], "class"];
+    expect(run(expr)).toBe(13n);
+  });
+
+  it("variable named '_nat' as fn param", () => {
+    const expr: Expr = ["call", ["fn", ["_nat"], ["+", "_nat", 1]], 5];
+    expect(run(expr)).toBe(6n);
+  });
+
+  it("reserved-word free variable still reads from env", () => {
+    // A reference to "env" without a let-binding should look up env["env"].
+    expect(run("env", { env: 123n })).toBe(123n);
+  });
+
+  it("reserved-word binding does not leak the runtime value", () => {
+    // Binding 'env' must not give back the actual env object — just the bound value.
+    const expr: Expr = ["let", [["env", 42]], "env"];
+    expect(run(expr, { env: 999n })).toBe(42n);
+  });
+
+  it("multiple reserved-word bindings in same scope", () => {
+    const expr: Expr = [
+      "let",
+      [
+        ["env", 1],
+        ["return", 2],
+        ["class", 3],
+      ],
+      ["+", ["+", "env", "return"], "class"],
+    ];
+    expect(run(expr)).toBe(6n);
+  });
+});
+
 // --- Bitwise primitives (JIT) ---
 
 describe("bitwise primitives (JIT)", () => {
