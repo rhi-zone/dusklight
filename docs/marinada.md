@@ -341,7 +341,7 @@ After the optimizer runs, backends receive an AST containing `__native`, `__lit`
 - `__lit v` → emit the value as a literal.
 - `__loop` → labeled while loop (JS) or `loop` block (Rust).
 
-Backend-specific optimizations (SIMD, vectorization, platform intrinsics) are viable: the optimizer identifies patterns at optimization time and emits specific `__native` nodes. Each backend handles `__native` nodes however fits its execution model — code generation, native dispatch, intrinsics, etc. The optimizer is backend-agnostic; backends are optimizer-agnostic.
+The optimizer is backend-agnostic — it produces normalized AST containing `__native`, `__lit`, and `__loop` nodes. Any backend must handle these nodes; how it does so is an implementation detail. This makes backend-specific optimizations (SIMD, vectorization, platform intrinsics) viable: the optimizer identifies patterns at optimization time, backends execute the resulting `__native` nodes efficiently.
 
 The optimizer fires once at load time. Backends execute the normalized AST on every call.
 
