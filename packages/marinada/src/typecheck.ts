@@ -4037,15 +4037,57 @@ export type TypecheckModuleOptions = {
 };
 
 /**
+ * Cache entry for in-flight or completed module typechecks.
+ *
+ * `in-progress`: this module is currently being typechecked further up the
+ * call stack. Importers should use the placeholder type vars allocated for
+ * each export name; they are unified with the actual inferred types once
+ * the cycle closes (see `typecheckModuleInternal`).
+ *
+ * `done`: the module has been fully typechecked.
+ */
+type TypecheckCacheEntry =
+  | { status: "in-progress"; placeholders: Map<string, MType>; exportNames: string[] }
+  | { status: "done"; result: TypecheckResult };
+
+/**
+ * Compute the set of names a module declares as exports for cycle handling.
+ * If `module.exports` is present, use it. Otherwise, conservatively peel
+ * top-level let/letrec layers from `module.main` to discover binding names.
+ */
+function discoverExportNames(module: Module): string[] {
+  if (module.exports !== undefined) return [...module.exports];
+  const out: string[] = [];
+  let cur: Expr = module.main;
+  while (
+    Array.isArray(cur) &&
+    cur.length === 3 &&
+    (cur[0] === "let" || cur[0] === "letrec") &&
+    Array.isArray(cur[1])
+  ) {
+    for (const b of cur[1] as Expr[]) {
+      if (Array.isArray(b) && b.length === 2 && typeof b[0] === "string") out.push(b[0]);
+    }
+    cur = cur[2] as Expr;
+  }
+  return out;
+}
+
+/**
  * Internal recursive entry that takes an explicit cache so diamond imports
  * resolve once. Public `typecheckModule` is a thin wrapper.
+ *
+ * `state` is shared across all modules in one typechecking session — the
+ * substitution and fresh-var counter must be unified, otherwise placeholder
+ * vars allocated for in-progress (cycle-target) modules would not be
+ * unifiable with types inferred later when the cycle closes.
  */
 function typecheckModuleInternal(
   module: Module,
   opts: TypecheckModuleOptions | undefined,
-  cache: Map<string, TypecheckResult>,
+  cache: Map<string, TypecheckCacheEntry>,
+  state: State,
 ): TypecheckResult {
-  const state = new State();
   const { typeDefs, ctors } = makeStdTypeDefs();
   registerModuleTypeDefs(module.types ?? [], typeDefs, ctors);
   const effectSigs = makeStdEffectSigs(state);
@@ -4072,8 +4114,10 @@ function typecheckModuleInternal(
     const resolver = opts?.resolver;
     if (resolver === undefined) continue; // backward-compatible skip
 
-    let resolved = cache.get(imp.from);
-    if (resolved === undefined) {
+    const cached = cache.get(imp.from);
+    let importExports: Map<string, MType>;
+    let importedExportNames: Set<string>;
+    if (cached === undefined) {
       const mod = resolver(imp.from);
       if (mod === null) {
         addError(ctx, "MODULE_NOT_FOUND", `module not found: ${imp.from}`, {
@@ -4085,48 +4129,97 @@ function typecheckModuleInternal(
         moduleEnv = moduleEnv.extend(fallback);
         continue;
       }
-      resolved = typecheckModuleInternal(mod, opts, cache);
-      cache.set(imp.from, resolved);
-      // Also import the resolved module's DU type definitions so imported
-      // constructors are usable in this module.
-      registerModuleTypeDefs(mod.types ?? [], typeDefs, ctors);
-    } else if (resolved.ok) {
-      // Cached success — re-register types so constructors are visible.
-      // Note: this requires holding the original Module to re-call
-      // registerModuleTypeDefs, but for the cache hit path we rely on the
-      // first registration having already populated typeDefs/ctors via the
-      // shared maps. Since each typecheckModule call has its own typeDefs
-      // map, we must look up from cached info. For Phase 1 we re-resolve
-      // via the resolver to pick up types — this is cheap because the
-      // resolver is expected to be cheap/cached on the host side.
-      const mod = resolver(imp.from);
-      if (mod !== null) {
-        registerModuleTypeDefs(mod.types ?? [], typeDefs, ctors);
+      // Open an in-progress slot before recursing. Pre-allocate placeholder
+      // type vars for each declared export — if the module recurses back
+      // into us (a cycle), importers will read these placeholders. Once we
+      // finish, we unify each placeholder with the actually inferred type.
+      const exportNames = discoverExportNames(mod);
+      const placeholders = new Map<string, MType>();
+      for (const name of exportNames) placeholders.set(name, state.freshVar());
+      cache.set(imp.from, { status: "in-progress", placeholders, exportNames });
+
+      const resolved = typecheckModuleInternal(mod, opts, cache, state);
+      cache.set(imp.from, { status: "done", result: resolved });
+
+      // Close the cycle: unify each placeholder against the actually
+      // inferred type for that export. If the cycle expected a different
+      // type than was produced, this emits a TYPE_MISMATCH error here.
+      if (resolved.ok) {
+        const resolvedExports = resolved.exports ?? new Map<string, MType>();
+        for (const [name, placeholder] of placeholders) {
+          const actual = resolvedExports.get(name);
+          if (actual === undefined) continue; // missing-export error reported inside the recursive call
+          // Instantiate any polymorphic exported type so its quantified
+          // vars are fresh — the placeholder may already be bound to a
+          // monomorphic shape from prior use in the cycle.
+          const u = unify(placeholder, instantiate(actual, state), state.subst, state);
+          if (!u.ok) {
+            addError(
+              ctx,
+              "TYPE_MISMATCH",
+              `cycle through ${imp.from}: type mismatch for "${name}": ` + u.reason,
+              { got: name },
+            );
+          }
+        }
       }
+
+      // Re-register types so constructors are visible.
+      registerModuleTypeDefs(mod.types ?? [], typeDefs, ctors);
+
+      if (!resolved.ok) {
+        addError(ctx, "MODULE_IMPORT_ERROR", `module ${imp.from} failed to typecheck`, {
+          got: imp.from,
+        });
+        const fallback: Record<string, MType> = {};
+        for (const name of imp.import) fallback[name] = UNKNOWN;
+        moduleEnv = moduleEnv.extend(fallback);
+        continue;
+      }
+      importExports = resolved.exports ?? new Map<string, MType>();
+      importedExportNames = new Set(exportNames);
+    } else if (cached.status === "in-progress") {
+      // Cycle: bind imported names to their placeholder type vars. They will
+      // be unified with the actual inferred types once the cycle target
+      // finishes typechecking (see post-pass below).
+      importExports = cached.placeholders;
+      importedExportNames = new Set(cached.exportNames);
+      // Re-register the module's types so constructors are visible. We can
+      // call resolver again (host caches cheaply); this only affects DU
+      // constructor visibility, not cycle handling.
+      const mod = resolver(imp.from);
+      if (mod !== null) registerModuleTypeDefs(mod.types ?? [], typeDefs, ctors);
+    } else {
+      // Cached done.
+      const mod = resolver(imp.from);
+      if (mod !== null) registerModuleTypeDefs(mod.types ?? [], typeDefs, ctors);
+      if (!cached.result.ok) {
+        addError(ctx, "MODULE_IMPORT_ERROR", `module ${imp.from} failed to typecheck`, {
+          got: imp.from,
+        });
+        const fallback: Record<string, MType> = {};
+        for (const name of imp.import) fallback[name] = UNKNOWN;
+        moduleEnv = moduleEnv.extend(fallback);
+        continue;
+      }
+      importExports = cached.result.exports ?? new Map<string, MType>();
+      importedExportNames = new Set(importExports.keys());
     }
 
-    if (!resolved.ok) {
-      // Surface a single MODULE_IMPORT_ERROR for this import path; the
-      // detailed errors live on the resolved result. We bind names as
-      // unknown so we can continue.
-      addError(ctx, "MODULE_IMPORT_ERROR", `module ${imp.from} failed to typecheck`, {
-        got: imp.from,
-      });
-      const fallback: Record<string, MType> = {};
-      for (const name of imp.import) fallback[name] = UNKNOWN;
-      moduleEnv = moduleEnv.extend(fallback);
-      continue;
-    }
-
-    const exports = resolved.exports ?? new Map<string, MType>();
     const importBindings: Record<string, MType> = {};
     for (const name of imp.import) {
-      const t = exports.get(name);
+      const t = importExports.get(name);
       if (t === undefined) {
-        addError(ctx, "UNDEFINED_EXPORT", `module ${imp.from} does not export "${name}"`, {
-          got: name,
-        });
-        importBindings[name] = UNKNOWN;
+        if (importedExportNames.has(name)) {
+          // Should not happen — placeholders are pre-populated for declared
+          // exports — but be defensive.
+          importBindings[name] = state.freshVar();
+        } else {
+          addError(ctx, "UNDEFINED_EXPORT", `module ${imp.from} does not export "${name}"`, {
+            got: name,
+          });
+          importBindings[name] = UNKNOWN;
+        }
       } else {
         importBindings[name] = t;
       }
@@ -4233,6 +4326,28 @@ function typecheckModuleInternal(
   ctx.currentEffects = innerCtx.currentEffects;
   const t = innerT;
 
+  // Phase 2: emit UNDEFINED_EXPORT at typecheck time for any name listed in
+  // `module.exports` that wasn't bound by a top-level let/letrec layer in
+  // `main`. This catches the case where the export is defined deep inside
+  // (e.g. inside an inner let body) and so was never reachable via peeling.
+  if (module.exports !== undefined) {
+    for (const name of module.exports) {
+      if (!exports.has(name)) {
+        const t2 = curEnv.lookup(name);
+        if (t2 !== undefined) {
+          // It's bound somewhere in the env (e.g. came from an import). We
+          // still consider this a binding for completeness — record its
+          // type in exports rather than erroring.
+          exports.set(name, zonk(t2, state.subst));
+        } else {
+          addError(ctx, "UNDEFINED_EXPORT", `module exports "${name}" but it is never bound`, {
+            got: name,
+          });
+        }
+      }
+    }
+  }
+
   // Check that the module's top-level expression is pure (no unhandled effects).
   // We only report concrete unhandled tags — a fully-unknown effect row (a
   // free var, no tags) is a gradual escape and must not trigger the error.
@@ -4268,5 +4383,5 @@ function typecheckModuleInternal(
 }
 
 export function typecheckModule(module: Module, opts?: TypecheckModuleOptions): TypecheckResult {
-  return typecheckModuleInternal(module, opts, new Map());
+  return typecheckModuleInternal(module, opts, new Map(), new State());
 }
