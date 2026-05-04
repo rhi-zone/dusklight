@@ -319,16 +319,31 @@ The compiler knows a **fixed, complete primitive set** — the ops listed above.
 
 `lib:std` is just a module. It is loaded and resolved exactly like any other module — no special-casing in the compiler or runtime. `map`, `filter`, `reduce`, and other standard functions are defined as ordinary Marinada `letrec` expressions over the primitives above. The compiler sees through them transparently.
 
-Because lib:std definitions are plain AST, the compiler's optimization passes apply uniformly:
+### Optimization pipeline
 
-- **Constant folding** — `["+", 1, 2]` → `3` at compile time
-- **Inlining** — small known functions are inlined at call sites
-- **Loop fusion** — `["call", map, f, ["call", map, g, arr]]` fuses to a single traversal
-- **Dead code elimination** — unreachable branches removed
+The optimizer runs **before** backend execution, transforming the Marinada AST into a normalized form. This is not a runtime concern — it happens when an expression is first compiled/loaded, once.
 
-These passes operate by pattern-matching on the Marinada AST. They fire on lib:std functions and user functions alike — there are no privileged names.
+The optimizer is a **tree automaton rule engine**: rules are indexed by their root op, applied bottom-up in a fixed-point pass. Rules fire on structural patterns in the AST — there are no privileged names. A user-written recursive function that structurally matches a known pattern is optimized identically to the lib:std version.
 
-Each backend (JS JIT, future WASM, future Rust native) lowers the same fixed primitive set to its target. The Marinada AST is the shared representation between the language and all backends. No separate IR type is needed.
+Pipeline:
+
+1. **Constant folding** — `["+", 1, 2]` → `["__lit", 3n]`. Applies to any pure expression over known values, including compound values (arrays, records).
+2. **TCO** — tail-recursive `letrec` → `["__loop", ...]` nodes. This is the key normalization step: after TCO, all loops have a single canonical form.
+3. **Loop pattern recognition** — `__loop` nodes matching known patterns (array-map, array-filter, array-reduce, etc.) → `["__native", ...]` nodes. Fires on ANY structurally matching loop — lib:std, user-defined, or generated. No name checking.
+4. **Loop fusion** — adjacent `__native` array operations fused to a single pass (gated on empty effect rows).
+5. **Inlining** — small, non-looping functions inlined at call sites.
+
+### Backends are dumb dispatchers
+
+After the optimizer runs, backends receive an AST containing `__native`, `__lit`, and `__loop` nodes alongside ordinary Marinada ops. Backends do not perform pattern recognition — they just dispatch:
+
+- `__native "array_map"` → JS: tight `for` loop or `.map()`; Rust: pre-compiled native function (potentially SIMD for typed arrays).
+- `__lit v` → emit the value as a literal.
+- `__loop` → labeled while loop (JS) or `loop` block (Rust).
+
+**SIMD in the Rust backend** is viable without runtime recompilation: the optimizer identifies patterns at optimization time (e.g. `__loop` over `array<float>` doing scalar multiplication) and emits specific `__native` nodes. The Rust binary has pre-compiled SIMD implementations for those nodes. Runtime is just a dispatch — no JIT required.
+
+The optimizer fires once at load time. Backends execute the normalized AST on every call.
 
 ---
 
