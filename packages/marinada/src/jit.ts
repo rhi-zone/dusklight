@@ -1,4 +1,5 @@
 import type { Expr } from "./types.ts";
+import { optimize, CONSTANT_FOLDING_RULES } from "./optimizer.ts";
 
 // A compiled Marinada expression.
 // Takes an env (variable bindings) and returns a JS-native value.
@@ -1489,12 +1490,38 @@ function compileIsCheck(typStr: string, val: JSExpr): JSExpr {
   }
 }
 
-// Compile a Marinada expression to a native JS function.
-// Throws CompileError if the expression cannot be compiled (e.g. uses effects).
-export function compile(expr: Expr): JitFn {
+// Options for compilation.
+export type CompileOptions = {
+  /** When true (default), run constant-folding optimizer before code generation. */
+  optimize?: boolean;
+};
+
+/** Internal: compile an already-prepared expression (no optimization step). */
+function compileRaw(expr: Expr): JitFn {
   const body = compileExpr(expr, emptyCtx());
   const src = serializeExpr(body);
   // eslint-disable-next-line no-new-func
   const raw = new Function("env", "_rt", "_nat", `return (${src})`);
   return (env: Record<string, unknown>) => raw(env, RUNTIME, NATIVES);
+}
+
+/** Internal: render an expression to its generated JS source (for tests/inspection). */
+export function compileToSource(expr: Expr, opts: CompileOptions = {}): string {
+  const e = opts.optimize === false ? expr : optimize(expr, CONSTANT_FOLDING_RULES);
+  return serializeExpr(compileExpr(e, emptyCtx()));
+}
+
+// Compile a Marinada expression to a native JS function.
+// Throws CompileError if the expression cannot be compiled (e.g. uses effects).
+// By default, runs the constant-folding optimizer first; pass `{ optimize: false }`
+// to skip it (useful for tests that want to inspect un-optimized code shape).
+export function compile(expr: Expr, opts: CompileOptions = {}): JitFn {
+  const e = opts.optimize === false ? expr : optimize(expr, CONSTANT_FOLDING_RULES);
+  return compileRaw(e);
+}
+
+/** Compile with constant folding explicitly enabled. Identical to `compile()` default;
+ * exported for symmetry with explicit opt-out. */
+export function compileOptimized(expr: Expr): JitFn {
+  return compile(expr, { optimize: true });
 }
