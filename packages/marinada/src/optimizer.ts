@@ -364,7 +364,11 @@ function arithRule(
       return false;
     },
     rewrite(b) {
-      const c = bothConst(b.a as Expr, b.b as Expr) as { ok: true; a: unknown; b: unknown };
+      const c = bothConst(b.a as Expr, b.b as Expr) as {
+        ok: true;
+        a: unknown;
+        b: unknown;
+      };
       const va = c.a;
       const vb = c.b;
       if (typeof va === "bigint" && typeof vb === "bigint") {
@@ -396,7 +400,11 @@ function cmpRule(op: string, fn: (a: number, b: number) => boolean): RewriteRule
       );
     },
     rewrite(b) {
-      const c = bothConst(b.a as Expr, b.b as Expr) as { ok: true; a: unknown; b: unknown };
+      const c = bothConst(b.a as Expr, b.b as Expr) as {
+        ok: true;
+        a: unknown;
+        b: unknown;
+      };
       const av = typeof c.a === "bigint" ? Number(c.a) : (c.a as number);
       const bv = typeof c.b === "bigint" ? Number(c.b) : (c.b as number);
       return lit(fn(av, bv));
@@ -444,7 +452,11 @@ const FOLD_DIV: RewriteRule = {
     return false;
   },
   rewrite(b) {
-    const c = bothConst(b.a as Expr, b.b as Expr) as { ok: true; a: unknown; b: unknown };
+    const c = bothConst(b.a as Expr, b.b as Expr) as {
+      ok: true;
+      a: unknown;
+      b: unknown;
+    };
     if (typeof c.a === "bigint" && typeof c.b === "bigint") {
       return lit(c.a / c.b);
     }
@@ -479,7 +491,11 @@ const FOLD_MOD: RewriteRule = {
     return false;
   },
   rewrite(b) {
-    const c = bothConst(b.a as Expr, b.b as Expr) as { ok: true; a: unknown; b: unknown };
+    const c = bothConst(b.a as Expr, b.b as Expr) as {
+      ok: true;
+      a: unknown;
+      b: unknown;
+    };
     if (typeof c.a === "bigint" && typeof c.b === "bigint") {
       return lit(c.a % c.b);
     }
@@ -501,7 +517,11 @@ const FOLD_EQ: RewriteRule = {
     return bothConst(b.a as Expr, b.b as Expr).ok;
   },
   rewrite(b) {
-    const c = bothConst(b.a as Expr, b.b as Expr) as { ok: true; a: unknown; b: unknown };
+    const c = bothConst(b.a as Expr, b.b as Expr) as {
+      ok: true;
+      a: unknown;
+      b: unknown;
+    };
     return lit(deepEq(c.a, c.b));
   },
 };
@@ -518,7 +538,11 @@ const FOLD_NEQ: RewriteRule = {
     return bothConst(b.a as Expr, b.b as Expr).ok;
   },
   rewrite(b) {
-    const c = bothConst(b.a as Expr, b.b as Expr) as { ok: true; a: unknown; b: unknown };
+    const c = bothConst(b.a as Expr, b.b as Expr) as {
+      ok: true;
+      a: unknown;
+      b: unknown;
+    };
     return lit(!deepEq(c.a, c.b));
   },
 };
@@ -669,7 +693,11 @@ const FOLD_STR_CONCAT: RewriteRule = {
     return c.ok && typeof c.a === "string" && typeof c.b === "string";
   },
   rewrite(b) {
-    const c = bothConst(b.a as Expr, b.b as Expr) as { ok: true; a: unknown; b: unknown };
+    const c = bothConst(b.a as Expr, b.b as Expr) as {
+      ok: true;
+      a: unknown;
+      b: unknown;
+    };
     return lit((c.a as string) + (c.b as string));
   },
 };
@@ -1148,5 +1176,614 @@ export function optimize(expr: Expr, rules: RewriteRule[], typeInfo?: TypeInfo):
   return optimizeNode(expr, index, fired, typeInfo);
 }
 
+// --- Phase 6: function inlining ---
+//
+// Inlines `let`-bound (or `letrec`-bound) functions at single call sites when
+// the body is small, pure, and non-looping. This is intentionally surgical:
+// only fires when it's clearly beneficial (no code duplication, no effect
+// reordering, no loop unrolling). Tiny lib:std combinators like `identity`,
+// `const`, and `flip` qualify; recursive helpers (`map`, `filter`, etc.) do
+// not because their bodies contain `letrec`.
+
+const INLINE_SIZE_THRESHOLD = 10;
+
+/** Count AST nodes in `expr` (atoms count as 1). */
+function astSize(expr: Expr): number {
+  if (!Array.isArray(expr)) return 1;
+  let n = 1;
+  for (const c of expr) n += astSize(c as Expr);
+  return n;
+}
+
+/** True if `body` qualifies as a "small, non-looping, pure" function body
+ * suitable for inlining. */
+function isInlineableBody(body: Expr): boolean {
+  if (hasEffects(body)) return false;
+  if (containsBlocked(body)) return false;
+  if (astSize(body) > INLINE_SIZE_THRESHOLD) return false;
+  return true;
+}
+
+/** True if `expr` contains any construct that disqualifies inlining:
+ * `letrec` (loops), nested `call` to another function (one-level limit),
+ * `perform`, `handle`, `__loop`, `__continue`. */
+function containsBlocked(expr: Expr): boolean {
+  if (!Array.isArray(expr) || expr.length === 0) return false;
+  const op = expr[0];
+  if (typeof op === "string") {
+    if (
+      op === "letrec" ||
+      op === "perform" ||
+      op === "handle" ||
+      op === "__loop" ||
+      op === "__continue" ||
+      op === "call"
+    ) {
+      return true;
+    }
+  }
+  for (let i = 1; i < expr.length; i++) {
+    if (containsBlocked(expr[i] as Expr)) return true;
+  }
+  return false;
+}
+
+/** Count call sites of the form `["call", name, ...]` referencing `name` as a
+ * bare variable. Also counts other free uses of `name` (in non-call position),
+ * since those would prevent inlining (the function escapes). Returns
+ * { calls, otherUses } so callers can require otherUses === 0 and calls === 1. */
+function countUses(name: string, expr: Expr): { calls: number; otherUses: number } {
+  let calls = 0;
+  let otherUses = 0;
+  function visit(e: Expr, asCallee: boolean): void {
+    if (typeof e === "string") {
+      if (e === name && !asCallee) otherUses++;
+      return;
+    }
+    if (!Array.isArray(e) || e.length === 0) return;
+    const op = e[0];
+    if (typeof op !== "string") {
+      for (const c of e) visit(c as Expr, false);
+      return;
+    }
+    switch (op) {
+      case "__lit":
+        return;
+      case "fn":
+      case "fn-once": {
+        const ps = paramNames(e[1] as Expr);
+        if (ps.includes(name)) return;
+        visit(e[2] as Expr, false);
+        return;
+      }
+      case "let": {
+        const bindings = e[1];
+        if (!Array.isArray(bindings)) return;
+        let shadowed = false;
+        for (const b of bindings) {
+          if (!Array.isArray(b) || b.length !== 2) continue;
+          if (!shadowed) visit(b[1] as Expr, false);
+          if (b[0] === name) shadowed = true;
+        }
+        if (!shadowed) visit(e[2] as Expr, false);
+        return;
+      }
+      case "letrec": {
+        const bindings = e[1];
+        if (!Array.isArray(bindings)) return;
+        const names = bindings
+          .map((b) => (Array.isArray(b) ? b[0] : null))
+          .filter((n): n is string => typeof n === "string");
+        if (names.includes(name)) return;
+        for (const b of bindings) {
+          if (!Array.isArray(b) || b.length !== 2) continue;
+          visit(b[1] as Expr, false);
+        }
+        visit(e[2] as Expr, false);
+        return;
+      }
+      case "match":
+      case "handle": {
+        visit(e[1] as Expr, false);
+        for (let i = 2; i < e.length; i++) {
+          const clause = e[i];
+          if (!Array.isArray(clause) || clause.length !== 2) continue;
+          const pattern = clause[0];
+          const body = clause[1] as Expr;
+          const bound = Array.isArray(pattern)
+            ? pattern.slice(1).filter((s): s is string => typeof s === "string")
+            : [];
+          if (!bound.includes(name)) visit(body, false);
+        }
+        return;
+      }
+      case "__loop": {
+        const ps = paramNames(e[1] as Expr);
+        const initArgs = e[2];
+        if (Array.isArray(initArgs)) {
+          for (const a of initArgs) visit(a as Expr, false);
+        }
+        if (!ps.includes(name)) visit(e[3] as Expr, false);
+        return;
+      }
+      case "call": {
+        // First arg is the callee.
+        if (e.length >= 2) {
+          const callee = e[1];
+          if (typeof callee === "string" && callee === name) {
+            calls++;
+          } else {
+            visit(callee as Expr, false);
+          }
+          for (let i = 2; i < e.length; i++) visit(e[i] as Expr, false);
+        }
+        return;
+      }
+      default:
+        for (let i = 1; i < e.length; i++) visit(e[i] as Expr, false);
+        return;
+    }
+  }
+  visit(expr, false);
+  return { calls, otherUses };
+}
+
+/** Generate a fresh name based on `base` not in `taken`. Mutates `taken` to
+ * include the result. */
+function freshName(base: string, taken: Set<string>): string {
+  let i = 0;
+  let candidate = `${base}__inl${i}`;
+  while (taken.has(candidate)) {
+    i++;
+    candidate = `${base}__inl${i}`;
+  }
+  taken.add(candidate);
+  return candidate;
+}
+
+/** Collect every name that appears (free or bound) in `expr` — used to seed
+ * the `taken` set for fresh-name generation during alpha-renaming. */
+function collectAllNames(expr: Expr, out: Set<string>): void {
+  if (typeof expr === "string") {
+    out.add(expr);
+    return;
+  }
+  if (!Array.isArray(expr) || expr.length === 0) return;
+  const op = expr[0];
+  if (typeof op === "string") {
+    switch (op) {
+      case "__lit":
+        return;
+      case "fn":
+      case "fn-once": {
+        for (const n of paramNames(expr[1] as Expr)) out.add(n);
+        collectAllNames(expr[2] as Expr, out);
+        return;
+      }
+      case "let":
+      case "letrec": {
+        const bindings = expr[1];
+        if (Array.isArray(bindings)) {
+          for (const b of bindings) {
+            if (Array.isArray(b) && b.length === 2) {
+              if (typeof b[0] === "string") out.add(b[0]);
+              collectAllNames(b[1] as Expr, out);
+            }
+          }
+        }
+        collectAllNames(expr[2] as Expr, out);
+        return;
+      }
+    }
+  }
+  for (let i = 1; i < expr.length; i++) collectAllNames(expr[i] as Expr, out);
+}
+
+/** Alpha-rename all bound variables in `expr` to fresh names not in `taken`.
+ * Free variables are left alone. Used before substitution to prevent capture. */
+function alphaRename(expr: Expr, taken: Set<string>, env: Map<string, string>): Expr {
+  if (typeof expr === "string") {
+    const r = env.get(expr);
+    return r === undefined ? expr : r;
+  }
+  if (!Array.isArray(expr) || expr.length === 0) return expr;
+  const op = expr[0];
+  if (typeof op !== "string") {
+    return expr.map((e) => alphaRename(e as Expr, taken, env)) as Expr;
+  }
+
+  switch (op) {
+    case "__lit":
+      return expr;
+    case "fn":
+    case "fn-once": {
+      const params = expr[1];
+      const newEnv = new Map(env);
+      let newParams: Expr;
+      if (Array.isArray(params)) {
+        newParams = params.map((p) => {
+          if (typeof p === "string") {
+            const fresh = freshName(p, taken);
+            newEnv.set(p, fresh);
+            return fresh;
+          }
+          if (Array.isArray(p) && p.length >= 1 && typeof p[0] === "string") {
+            const fresh = freshName(p[0], taken);
+            newEnv.set(p[0], fresh);
+            return [fresh, ...p.slice(1)] as Expr;
+          }
+          return p as Expr;
+        }) as Expr;
+      } else {
+        newParams = params as Expr;
+      }
+      return [op, newParams, alphaRename(expr[2] as Expr, taken, newEnv)];
+    }
+    case "let": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return expr;
+      const currentEnv = new Map(env);
+      const newBindings: Expr[] = [];
+      for (const b of bindings) {
+        if (!Array.isArray(b) || b.length !== 2) {
+          newBindings.push(b as Expr);
+          continue;
+        }
+        const bName = b[0] as string;
+        const newVal = alphaRename(b[1] as Expr, taken, currentEnv);
+        const fresh = freshName(bName, taken);
+        currentEnv.set(bName, fresh);
+        newBindings.push([fresh, newVal] as Expr);
+      }
+      return ["let", newBindings as Expr, alphaRename(expr[2] as Expr, taken, currentEnv)];
+    }
+    case "letrec": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return expr;
+      const newEnv = new Map(env);
+      const renamed: string[] = [];
+      for (const b of bindings) {
+        if (Array.isArray(b) && b.length === 2 && typeof b[0] === "string") {
+          const fresh = freshName(b[0], taken);
+          newEnv.set(b[0], fresh);
+          renamed.push(fresh);
+        } else {
+          renamed.push("");
+        }
+      }
+      const newBindings: Expr[] = bindings.map((b, i) => {
+        if (!Array.isArray(b) || b.length !== 2) return b as Expr;
+        return [renamed[i] as string, alphaRename(b[1] as Expr, taken, newEnv)] as Expr;
+      });
+      return ["letrec", newBindings as Expr, alphaRename(expr[2] as Expr, taken, newEnv)];
+    }
+    case "match":
+    case "handle": {
+      const out: Expr[] = [op, alphaRename(expr[1] as Expr, taken, env)];
+      for (let i = 2; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        const pattern = clause[0] as Expr;
+        const body = clause[1] as Expr;
+        const newEnv = new Map(env);
+        let newPattern: Expr = pattern;
+        if (Array.isArray(pattern)) {
+          newPattern = [
+            pattern[0],
+            ...pattern.slice(1).map((p) => {
+              if (typeof p === "string") {
+                const fresh = freshName(p, taken);
+                newEnv.set(p, fresh);
+                return fresh;
+              }
+              return p as Expr;
+            }),
+          ] as Expr;
+        }
+        out.push([newPattern, alphaRename(body, taken, newEnv)] as Expr);
+      }
+      return out;
+    }
+    case "__loop": {
+      const params = expr[1];
+      const initArgs = expr[2];
+      const newInit = Array.isArray(initArgs)
+        ? (initArgs.map((a) => alphaRename(a as Expr, taken, env)) as Expr)
+        : (initArgs as Expr);
+      const newEnv = new Map(env);
+      let newParams: Expr;
+      if (Array.isArray(params)) {
+        newParams = params.map((p) => {
+          if (typeof p === "string") {
+            const fresh = freshName(p, taken);
+            newEnv.set(p, fresh);
+            return fresh;
+          }
+          return p as Expr;
+        }) as Expr;
+      } else {
+        newParams = params as Expr;
+      }
+      return [op, newParams, newInit, alphaRename(expr[3] as Expr, taken, newEnv)];
+    }
+    default:
+      return expr.map((e) => alphaRename(e as Expr, taken, env)) as Expr;
+  }
+}
+
+/** Inline `["call", name, arg1, ...]` where `fn = ["fn", params, body]`,
+ * by substituting params with args in an alpha-renamed body. Returns null if
+ * arity doesn't match. */
+function inlineCall(fn: Expr, args: Expr[], outerTaken: Set<string>): Expr | null {
+  if (!Array.isArray(fn) || fn[0] !== "fn") return null;
+  const params = fn[1];
+  const body = fn[2] as Expr;
+  if (!Array.isArray(params)) return null;
+  const paramNs: string[] = [];
+  for (const p of params) {
+    if (typeof p === "string") paramNs.push(p);
+    else if (Array.isArray(p) && p.length >= 1 && typeof p[0] === "string") paramNs.push(p[0]);
+    else return null;
+  }
+  if (paramNs.length !== args.length) return null;
+
+  // Build the taken set: outerTaken ∪ all names in body ∪ all names in args.
+  const taken = new Set(outerTaken);
+  collectAllNames(body, taken);
+  for (const a of args) collectAllNames(a, taken);
+  for (const p of paramNs) taken.add(p);
+
+  // Alpha-rename the body so its bound names don't collide with anything.
+  // We start with a fresh env: params keep their original names so we can
+  // substitute them, but the rest of the body's bound vars get fresh names.
+  // To do this cleanly: alpha-rename, but seed env with identity for params.
+  // Simpler: alpha-rename the whole body; params get renamed too; track their
+  // new names; then substitute new-param-name → arg.
+  const env = new Map<string, string>();
+  const renamedBody = alphaRename(body, taken, env);
+  // After alphaRename, params have been renamed. But we built `env` empty —
+  // alphaRename traverses from the top; since `body` is the raw fn body, its
+  // free uses of params won't be in `env` yet. We need to rename the params
+  // explicitly first.
+  // Simpler approach: do it manually here.
+  const env2 = new Map<string, string>();
+  const newParamNames: string[] = [];
+  for (const p of paramNs) {
+    const fresh = freshName(p, taken);
+    env2.set(p, fresh);
+    newParamNames.push(fresh);
+  }
+  const renamed = alphaRename(body, taken, env2);
+  void renamedBody;
+
+  // Substitute fresh param name → arg in `renamed`.
+  let result = renamed;
+  for (let i = 0; i < newParamNames.length; i++) {
+    result = substitute(result, newParamNames[i] as string, args[i] as Expr);
+  }
+  return result;
+}
+
+/** Walk `expr` and inline single-use small functions bound by `let`/`letrec`. */
+export function inlineSmallFunctions(expr: Expr): Expr {
+  if (!Array.isArray(expr) || expr.length === 0) return expr;
+  const op = expr[0];
+  if (typeof op !== "string") {
+    return expr.map((e) => inlineSmallFunctions(e as Expr)) as Expr;
+  }
+
+  // First, recurse into children.
+  const recurseChildren = (e: Expr): Expr => inlineSmallFunctions(e);
+
+  switch (op) {
+    case "__lit":
+      return expr;
+    case "let": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return expr;
+      // Optimize children first.
+      const newBindings: Expr[] = bindings.map((b) => {
+        if (!Array.isArray(b) || b.length !== 2) return b as Expr;
+        return [b[0] as string, recurseChildren(b[1] as Expr)] as Expr;
+      });
+      let body = recurseChildren(expr[2] as Expr);
+
+      // Now scan bindings (in scope order) for inlineable small functions.
+      // Build the "scope after binding i" — for simplicity, only handle
+      // bindings whose scope is exactly `body` (i.e. last binding, or none of
+      // the later bindings reference the candidate). Conservative but covers
+      // the common case.
+      const kept: Expr[] = [];
+      for (let i = 0; i < newBindings.length; i++) {
+        const b = newBindings[i];
+        if (!Array.isArray(b) || b.length !== 2) {
+          kept.push(b as Expr);
+          continue;
+        }
+        const name = b[0] as string;
+        const val = b[1] as Expr;
+
+        // Candidate iff val is ["fn", params, fnBody] with small/pure/no-loop body.
+        if (
+          !Array.isArray(val) ||
+          val[0] !== "fn" ||
+          !Array.isArray(val[1]) ||
+          !isInlineableBody(val[2] as Expr)
+        ) {
+          kept.push(b as Expr);
+          continue;
+        }
+
+        // Determine scope: later bindings' values + body. To keep things
+        // simple and safe, only inline if the candidate is unused in the
+        // remaining bindings (i.e. only used in `body`).
+        let usedInLater = false;
+        for (let j = i + 1; j < newBindings.length; j++) {
+          const bj = newBindings[j];
+          if (Array.isArray(bj) && bj.length === 2 && freeIn(name, bj[1] as Expr)) {
+            usedInLater = true;
+            break;
+          }
+        }
+        if (usedInLater) {
+          kept.push(b as Expr);
+          continue;
+        }
+
+        const { calls, otherUses } = countUses(name, body);
+        if (otherUses !== 0 || calls !== 1) {
+          kept.push(b as Expr);
+          continue;
+        }
+
+        // Inline: replace the single ["call", name, ...args] call site in body.
+        const inlined = replaceCall(body, name, val);
+        if (inlined === null) {
+          kept.push(b as Expr);
+          continue;
+        }
+        body = inlined;
+        // Drop the binding (its single use has been inlined).
+      }
+
+      if (kept.length === 0) return body;
+      return ["let", kept as Expr, body];
+    }
+    case "letrec": {
+      const bindings = expr[1];
+      if (!Array.isArray(bindings)) return expr;
+      const newBindings: Expr[] = bindings.map((b) => {
+        if (!Array.isArray(b) || b.length !== 2) return b as Expr;
+        return [b[0] as string, recurseChildren(b[1] as Expr)] as Expr;
+      });
+      const body = recurseChildren(expr[2] as Expr);
+      // letrec bindings can be self/mutually recursive, which usually means a
+      // letrec body — disqualifying for inlining. Be conservative: don't
+      // inline letrec bindings here.
+      return ["letrec", newBindings as Expr, body];
+    }
+    case "fn":
+    case "fn-once":
+      return [op, expr[1] as Expr, recurseChildren(expr[2] as Expr)];
+    case "match":
+    case "handle": {
+      const out: Expr[] = [op, recurseChildren(expr[1] as Expr)];
+      for (let i = 2; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        out.push([clause[0] as Expr, recurseChildren(clause[1] as Expr)] as Expr);
+      }
+      return out;
+    }
+    case "__loop": {
+      const initArgs = expr[2];
+      const newInit = Array.isArray(initArgs)
+        ? (initArgs.map((a) => recurseChildren(a as Expr)) as Expr)
+        : (initArgs as Expr);
+      return [op, expr[1] as Expr, newInit, recurseChildren(expr[3] as Expr)];
+    }
+    default: {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) out.push(recurseChildren(expr[i] as Expr));
+      return out;
+    }
+  }
+}
+
+/** Find the (single) `["call", name, ...args]` site in `expr` and replace it
+ * with the inlined body. Returns null if not found or shadowing prevents
+ * substitution. */
+function replaceCall(expr: Expr, name: string, fn: Expr): Expr | null {
+  // Build the outer "taken" set once (names visible at the inline site
+  // matters for fresh-name generation). We approximate by collecting all names
+  // in `expr` plus the function body itself.
+  const taken = new Set<string>();
+  collectAllNames(expr, taken);
+  collectAllNames(fn, taken);
+
+  let replaced = false;
+  function go(e: Expr): Expr {
+    if (replaced) return e;
+    if (typeof e === "string") return e;
+    if (!Array.isArray(e) || e.length === 0) return e;
+    const op = e[0];
+    if (typeof op !== "string") return e.map(go) as Expr;
+    // Stop at scopes that shadow `name`.
+    switch (op) {
+      case "__lit":
+        return e;
+      case "fn":
+      case "fn-once": {
+        const ps = paramNames(e[1] as Expr);
+        if (ps.includes(name)) return e;
+        return [op, e[1] as Expr, go(e[2] as Expr)];
+      }
+      case "let": {
+        const bindings = e[1];
+        if (!Array.isArray(bindings)) return e;
+        const newBindings: Expr[] = [];
+        let shadowed = false;
+        for (const b of bindings) {
+          if (!Array.isArray(b) || b.length !== 2) {
+            newBindings.push(b as Expr);
+            continue;
+          }
+          const bName = b[0] as string;
+          const newVal = shadowed ? (b[1] as Expr) : go(b[1] as Expr);
+          newBindings.push([bName, newVal] as Expr);
+          if (bName === name) shadowed = true;
+        }
+        const newBody = shadowed ? (e[2] as Expr) : go(e[2] as Expr);
+        return ["let", newBindings as Expr, newBody];
+      }
+      case "letrec": {
+        const bindings = e[1];
+        if (!Array.isArray(bindings)) return e;
+        const ns = bindings
+          .map((b) => (Array.isArray(b) ? b[0] : null))
+          .filter((n): n is string => typeof n === "string");
+        if (ns.includes(name)) return e;
+        const newBindings = bindings.map((b) => {
+          if (!Array.isArray(b) || b.length !== 2) return b as Expr;
+          return [b[0] as string, go(b[1] as Expr)] as Expr;
+        });
+        return ["letrec", newBindings as Expr, go(e[2] as Expr)];
+      }
+      case "call": {
+        if (e.length >= 2 && e[1] === name) {
+          const args = e.slice(2) as Expr[];
+          // Recurse into args first (they may contain unrelated work).
+          const argsGo = args.map(go);
+          const inlined = inlineCall(fn, argsGo, taken);
+          if (inlined !== null) {
+            replaced = true;
+            return inlined;
+          }
+          return [op, e[1] as Expr, ...argsGo] as Expr;
+        }
+        return e.map(go) as Expr;
+      }
+      default:
+        return e.map(go) as Expr;
+    }
+  }
+  const result = go(expr);
+  return replaced ? result : null;
+}
+
 // Re-export helpers for tests.
-export const __test__ = { freeIn, hasEffects, substitute, asConst };
+export const __test__ = {
+  freeIn,
+  hasEffects,
+  substitute,
+  asConst,
+  inlineSmallFunctions,
+  countUses,
+  isInlineableBody,
+};

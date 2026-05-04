@@ -1,5 +1,5 @@
 import type { Expr } from "./types.ts";
-import { optimize, CONSTANT_FOLDING_RULES } from "./optimizer.ts";
+import { optimize, CONSTANT_FOLDING_RULES, inlineSmallFunctions } from "./optimizer.ts";
 
 // A compiled Marinada expression.
 // Takes an env (variable bindings) and returns a JS-native value.
@@ -1505,9 +1505,22 @@ function compileRaw(expr: Expr): JitFn {
   return (env: Record<string, unknown>) => raw(env, RUNTIME, NATIVES);
 }
 
+/** Run all enabled optimizer passes in pipeline order. */
+function runOptimizer(expr: Expr): Expr {
+  // Phase 1+2: constant folding + dead-binding elimination + literal copy
+  // propagation, all expressed as rewrite rules.
+  let e = optimize(expr, CONSTANT_FOLDING_RULES);
+  // Phase 6: inline small, non-looping, single-use functions. (Phases 3–5
+  // — TCO, loop pattern recognition, loop fusion — are not yet implemented.)
+  e = inlineSmallFunctions(e);
+  // Re-run constant folding so newly-inlined expressions get folded.
+  e = optimize(e, CONSTANT_FOLDING_RULES);
+  return e;
+}
+
 /** Internal: render an expression to its generated JS source (for tests/inspection). */
 export function compileToSource(expr: Expr, opts: CompileOptions = {}): string {
-  const e = opts.optimize === false ? expr : optimize(expr, CONSTANT_FOLDING_RULES);
+  const e = opts.optimize === false ? expr : runOptimizer(expr);
   return serializeExpr(compileExpr(e, emptyCtx()));
 }
 
@@ -1516,7 +1529,7 @@ export function compileToSource(expr: Expr, opts: CompileOptions = {}): string {
 // By default, runs the constant-folding optimizer first; pass `{ optimize: false }`
 // to skip it (useful for tests that want to inspect un-optimized code shape).
 export function compile(expr: Expr, opts: CompileOptions = {}): JitFn {
-  const e = opts.optimize === false ? expr : optimize(expr, CONSTANT_FOLDING_RULES);
+  const e = opts.optimize === false ? expr : runOptimizer(expr);
   return compileRaw(e);
 }
 

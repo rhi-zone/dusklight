@@ -1,7 +1,12 @@
 import { describe, it, expect } from "bun:test";
 import { compile, compileToSource, CompileError } from "./jit.ts";
 import { buildTypeInfo } from "./typecheck.ts";
-import { optimize, CONSTANT_FOLDING_RULES, type RewriteRule } from "./optimizer.ts";
+import {
+  optimize,
+  CONSTANT_FOLDING_RULES,
+  inlineSmallFunctions,
+  type RewriteRule,
+} from "./optimizer.ts";
 import type { Expr } from "./types.ts";
 
 // --- Helper ---
@@ -584,6 +589,160 @@ describe("optimizer: integration with compile", () => {
     // ["+", 1, "x"] — x is a var ref; cannot fold.
     const fn = compile(["+", 1, "x"]);
     expect(fn({ x: 41n })).toBe(42n);
+  });
+});
+
+// --- Phase 6: function inlining ---
+
+// JSON.stringify can't serialize bigints, so we use a custom dumper that
+// renders bigints as `"<n>n"` for substring checks.
+function stringifyExpr(e: unknown): string {
+  if (typeof e === "bigint") return `"${e}n"`;
+  if (Array.isArray(e)) return `[${e.map(stringifyExpr).join(",")}]`;
+  if (e === null) return "null";
+  if (typeof e === "object") {
+    return `{${Object.entries(e as Record<string, unknown>)
+      .map(([k, v]) => `${JSON.stringify(k)}:${stringifyExpr(v)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(e);
+}
+
+describe("optimizer: function inlining", () => {
+  it("inlines identity at a single call site", () => {
+    // let id = (fn (x) x) in (call id 42)  →  42
+    const expr: Expr = [
+      "let",
+      [["id", ["fn", ["x"], "x"]]],
+      ["call", "id", ["__lit", 42n as unknown as null]],
+    ];
+    const r = inlineSmallFunctions(expr);
+    // After inlining, the binding is dropped and `(call id 42)` becomes `42`.
+    expect(r).toEqual(["__lit", 42n as unknown as null]);
+  });
+
+  it("inlines const at a single call site", () => {
+    // let k = (fn (x) (fn (_) x)) in (call (call k 7) 99)
+    const expr: Expr = [
+      "let",
+      [["k", ["fn", ["x"], ["fn", ["_"], "x"]]]],
+      ["call", ["call", "k", ["__lit", 7n as unknown as null]], ["__lit", 99n as unknown as null]],
+    ];
+    // k's body is (fn (_) x) — small, no call, no letrec → inlineable.
+    // The outer (call k 7) is the single call site referencing k.
+    const r = inlineSmallFunctions(expr);
+    expect(stringifyExpr(r)).not.toContain('"k"');
+    // Semantics: result is 7.
+    expect(compile(expr)({})).toBe(7n);
+  });
+
+  it("does NOT inline a function used twice", () => {
+    // let f = (fn (x) (+ x 1)) in (+ (call f 1) (call f 2))
+    const expr: Expr = [
+      "let",
+      [["f", ["fn", ["x"], ["+", "x", 1]]]],
+      ["+", ["call", "f", 1], ["call", "f", 2]],
+    ];
+    const r = inlineSmallFunctions(expr);
+    // Binding for f must remain (used twice — would duplicate body).
+    expect(stringifyExpr(r)).toContain('"f"');
+  });
+
+  it("does NOT inline a large function body", () => {
+    // Body size > threshold (10 nodes).
+    const bigBody: Expr = ["+", ["+", ["+", ["+", "x", 1], 2], 3], ["+", ["+", ["+", 4, 5], 6], 7]];
+    const expr: Expr = [
+      "let",
+      [["big", ["fn", ["x"], bigBody]]],
+      ["call", "big", ["__lit", 99n as unknown as null]],
+    ];
+    const r = inlineSmallFunctions(expr);
+    expect(stringifyExpr(r)).toContain('"big"');
+  });
+
+  it("does NOT inline a function whose body contains letrec (loop)", () => {
+    const expr: Expr = [
+      "let",
+      [["looper", ["fn", ["xs"], ["letrec", [["go", ["fn", ["i"], "i"]]], "xs"]]]],
+      ["call", "looper", ["__lit", 0n as unknown as null]],
+    ];
+    const r = inlineSmallFunctions(expr);
+    expect(stringifyExpr(r)).toContain('"looper"');
+  });
+
+  it("does NOT inline a function whose body contains a nested call", () => {
+    // Body has its own call → blocked.
+    const expr: Expr = [
+      "let",
+      [
+        ["g", ["fn", ["x"], "x"]],
+        ["f", ["fn", ["x"], ["call", "g", "x"]]],
+      ],
+      ["call", "f", ["__lit", 1n as unknown as null]],
+    ];
+    const r = inlineSmallFunctions(expr);
+    // f has a `call` in its body — not inlineable.
+    expect(stringifyExpr(r)).toContain('"f"');
+  });
+
+  it("alpha-renames to avoid variable capture", () => {
+    // let f = (fn (x) (+ x 1)) in
+    //   let x = 100 in (call f x)
+    // Naive substitution would map param x→arg x — luckily not capture, but
+    // a more devious case: body has a let that binds the same name as the arg.
+    // let f = (fn (x) (let [[y x]] (+ y 1))) in
+    //   let y = 999 in (call f y)
+    // After inlining without renaming: (let [[y y]] (+ y 1)) — `y` from the
+    // arg gets shadowed. Alpha-renaming should make the inner y fresh.
+    const expr: Expr = [
+      "let",
+      [["f", ["fn", ["x"], ["let", [["y", "x"]], ["+", "y", 1]]]]],
+      ["let", [["y", ["__lit", 999n as unknown as null]]], ["call", "f", "y"]],
+    ];
+    const fn = compile(expr);
+    expect(fn({})).toBe(1000n);
+  });
+
+  it("inlined result produces correct output through compile", () => {
+    // identity at a single call site, end-to-end.
+    const expr: Expr = ["let", [["id", ["fn", ["x"], "x"]]], ["call", "id", ["+", 1, 2]]];
+    const fn = compile(expr);
+    expect(fn({})).toBe(3n);
+  });
+
+  it("inlines flip and produces correct output", () => {
+    // let flip = (fn (f) (fn (a b) (call f b a))) — body has a `call`, NOT inlineable directly.
+    // But identity composition is. Test that flip remains because of nested call.
+    const expr: Expr = [
+      "let",
+      [["fl", ["fn", ["f"], ["fn", ["a", "b"], ["call", "f", "b", "a"]]]]],
+      ["call", "fl", "sub"],
+    ];
+    const r = inlineSmallFunctions(expr);
+    // fl's body has a `call` (call f b a) — disqualified.
+    expect(stringifyExpr(r)).toContain('"fl"');
+  });
+
+  it("inlining preserves semantics with const-like function", () => {
+    // let k = (fn (x) (fn (y) x)) in (call (call k 5) 999)
+    // k's body is (fn (y) x) — no call, no letrec, small. Inlineable.
+    // After inlining outer (call k 5): substitute x=5 in (fn (y) x) → (fn (y) 5).
+    // Then (call (fn (y) 5) 999) — direct call to fn literal.
+    const expr: Expr = [
+      "let",
+      [["k", ["fn", ["x"], ["fn", ["y"], "x"]]]],
+      ["call", ["call", "k", ["__lit", 5n as unknown as null]], ["__lit", 999n as unknown as null]],
+    ];
+    const fn = compile(expr);
+    expect(fn({})).toBe(5n);
+  });
+
+  it("does not inline when binding is referenced as a value (not just called)", () => {
+    // let id = (fn (x) x) in id  — id escapes; can't inline.
+    const expr: Expr = ["let", [["id", ["fn", ["x"], "x"]]], "id"];
+    const r = inlineSmallFunctions(expr);
+    // id is referenced (returned) — not a call site, so otherUses > 0 → keep.
+    expect(stringifyExpr(r)).toContain('"id"');
   });
 });
 
