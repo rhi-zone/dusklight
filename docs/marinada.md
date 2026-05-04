@@ -333,15 +333,11 @@ Pipeline:
 4. **Loop fusion** — adjacent `__native` array operations fused to a single pass (gated on empty effect rows).
 5. **Inlining** — small, non-looping functions inlined at call sites.
 
-### Backends are dumb dispatchers
+### Backends
 
-After the optimizer runs, backends receive an AST containing `__native`, `__lit`, and `__loop` nodes alongside ordinary Marinada ops. Backends do not perform pattern recognition — they just dispatch:
+The optimizer is backend-agnostic. After it runs, every backend — JIT, interpreter, or otherwise — receives the same normalized AST and executes it. Backends do not perform pattern recognition; the optimizer has already done that work.
 
-- `__native "array_map"` → JS: tight `for` loop or `.map()`; Rust: pre-compiled native function (potentially SIMD for typed arrays).
-- `__lit v` → emit the value as a literal.
-- `__loop` → labeled while loop (JS) or `loop` block (Rust).
-
-The optimizer is backend-agnostic — it produces normalized AST containing `__native`, `__lit`, and `__loop` nodes. Any backend must handle these nodes; how it does so is an implementation detail. This makes backend-specific optimizations (SIMD, vectorization, platform intrinsics) viable: the optimizer identifies patterns at optimization time, backends execute the resulting `__native` nodes efficiently.
+This means interpreter backends benefit from optimization equally. A `__native "array_map"` node tells any backend to execute an efficient array traversal — a JIT generates tight native code for it, an interpreter calls a native function. Neither has to interpret a recursive letrec.
 
 The optimizer fires once at load time. Backends execute the normalized AST on every call.
 
