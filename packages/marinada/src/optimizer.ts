@@ -2690,6 +2690,243 @@ export function recognizeLoopPatterns(expr: Expr): Expr {
   return recursed;
 }
 
+// --- Phase 5: Loop fusion ---
+
+/** Build a `compose(g, f)` Marinada expression: `(fn [x] (call g (call f x)))`.
+ * Picks a fresh parameter name to avoid colliding with any free variable in
+ * either function body. */
+function makeCompose(g: Expr, f: Expr): Expr {
+  const taken = new Set<string>();
+  collectAllNames(g, taken);
+  collectAllNames(f, taken);
+  const x = freshName("__x", taken);
+  return ["fn", [x], ["call", g, ["call", f, x]]];
+}
+
+/** Build the combined-predicate expression for filter-after-filter:
+ *   (fn [x] (and (call pred1 x) (call pred2 x)))
+ */
+function makeAndPred(pred1: Expr, pred2: Expr): Expr {
+  const taken = new Set<string>();
+  collectAllNames(pred1, taken);
+  collectAllNames(pred2, taken);
+  const x = freshName("__x", taken);
+  return ["fn", [x], ["and", ["call", pred1, x], ["call", pred2, x]]];
+}
+
+/** Check whether a function-typed value at the given path can be invoked
+ * without producing observable effects. Reads the inferred function type's
+ * latent-effects row from `typeInfo` and returns true when that row has no
+ * concrete effect fields. Returns false for non-function types, missing
+ * type info, or when concrete effects are present.
+ *
+ * Note: this is distinct from `isPure(path)`, which asks about the effects
+ * of *evaluating* the expression at `path`. For a `fn` literal, evaluating
+ * just creates a closure (no effects) — but we care about effects produced
+ * when the function is later *called*. Those live in the fn type's `effects`
+ * row.
+ *
+ * The row's tail may be open (a free var) — that's the normal artifact of
+ * Hindley–Milner inference for an `fn` whose body did not invoke any concrete
+ * effect. A `perform` inside the body would add a concrete field; if no field
+ * is present, no effect was performed during inference. Treating that as pure
+ * is sound for fusion: we are asking "could this function, as written, ever
+ * produce a side effect?" — and the absence of any concrete effect row entry
+ * answers no. */
+function isFunctionPure(typeInfo: TypeInfo, path: number[]): boolean {
+  const t = typeInfo.typeOf(path);
+  if (t === null) return false;
+  if (t.kind !== "fn") return false;
+  const eff = t.effects;
+  if (eff === undefined) return false;
+  if (eff.kind !== "row") return false;
+  return eff.fields.size === 0;
+}
+
+/** Try to fuse a single `__native` array operation with its (already-fused)
+ * inner argument. Returns the fused expression, or null if no rule applies.
+ * `path` is the path to `expr` in the post-walk tree (i.e. paths into
+ * `typeInfo` reflect the SAME tree being walked). */
+function tryFuseAt(expr: Expr[], path: number[], typeInfo: TypeInfo): Expr | null {
+  if (expr[0] !== "__native") return null;
+  const name = expr[1];
+  if (typeof name !== "string") return null;
+
+  // map-after-map / map-after-filter : __native array_map xs f
+  if (name === "array_map" && expr.length === 4) {
+    const xs = expr[2] as Expr;
+    const f = expr[3] as Expr;
+    if (Array.isArray(xs) && xs[0] === "__native") {
+      const innerName = xs[1];
+      // map-after-map
+      if (innerName === "array_map" && xs.length === 4) {
+        const ys = xs[2] as Expr;
+        const g = xs[3] as Expr;
+        // Both inner-g and outer-f must be pure.
+        if (isFunctionPure(typeInfo, [...path, 3]) && isFunctionPure(typeInfo, [...path, 2, 3])) {
+          return ["__native", "array_map", ys, makeCompose(f, g)];
+        }
+      }
+      // map-after-filter → array_map_filter
+      if (innerName === "array_filter" && xs.length === 4) {
+        const ys = xs[2] as Expr;
+        const pred = xs[3] as Expr;
+        if (isFunctionPure(typeInfo, [...path, 3]) && isFunctionPure(typeInfo, [...path, 2, 3])) {
+          return ["__native", "array_map_filter", ys, pred, f];
+        }
+      }
+    }
+  }
+
+  // filter-after-map / filter-after-filter : __native array_filter xs pred
+  if (name === "array_filter" && expr.length === 4) {
+    const xs = expr[2] as Expr;
+    const pred2 = expr[3] as Expr;
+    if (Array.isArray(xs) && xs[0] === "__native") {
+      const innerName = xs[1];
+      // filter-after-map → array_filter_map
+      if (innerName === "array_map" && xs.length === 4) {
+        const ys = xs[2] as Expr;
+        const f = xs[3] as Expr;
+        if (isFunctionPure(typeInfo, [...path, 3]) && isFunctionPure(typeInfo, [...path, 2, 3])) {
+          return ["__native", "array_filter_map", ys, f, pred2];
+        }
+      }
+      // filter-after-filter
+      if (innerName === "array_filter" && xs.length === 4) {
+        const ys = xs[2] as Expr;
+        const pred1 = xs[3] as Expr;
+        if (isFunctionPure(typeInfo, [...path, 3]) && isFunctionPure(typeInfo, [...path, 2, 3])) {
+          return ["__native", "array_filter", ys, makeAndPred(pred1, pred2)];
+        }
+      }
+    }
+  }
+
+  // reduce-after-map : __native array_reduce xs f init
+  if (name === "array_reduce" && expr.length === 5) {
+    const xs = expr[2] as Expr;
+    const f = expr[3] as Expr;
+    const init = expr[4] as Expr;
+    if (Array.isArray(xs) && xs[0] === "__native" && xs[1] === "array_map" && xs.length === 4) {
+      const ys = xs[2] as Expr;
+      const g = xs[3] as Expr;
+      if (isFunctionPure(typeInfo, [...path, 3]) && isFunctionPure(typeInfo, [...path, 2, 3])) {
+        return ["__native", "array_map_reduce", ys, g, f, init];
+      }
+    }
+  }
+
+  return null;
+}
+
+/** Walk `expr` bottom-up (post-order), fusing adjacent `__native` array
+ * operations where safe. `typeInfo` (when supplied) is used to verify purity
+ * of function arguments — its paths must correspond to `expr` as passed in.
+ * Without `typeInfo`, no fusion is performed. */
+export function fuseLoops(expr: Expr, typeInfo?: TypeInfo): Expr {
+  if (typeInfo === undefined) return expr;
+  return fuseLoopsAt(expr, [], typeInfo);
+}
+
+function fuseLoopsAt(expr: Expr, path: number[], typeInfo: TypeInfo): Expr {
+  if (expr === null || typeof expr === "boolean" || typeof expr === "number") return expr;
+  if (typeof expr === "string") return expr;
+  if (!Array.isArray(expr) || expr.length === 0) return expr;
+  const op = expr[0];
+  if (typeof op !== "string") {
+    return expr.map((e, i) => fuseLoopsAt(e as Expr, [...path, i], typeInfo)) as Expr;
+  }
+  if (op === "__lit") return expr;
+
+  // Recurse into children first (post-order).
+  let recursed: Expr;
+  switch (op) {
+    case "fn":
+    case "fn-once":
+      recursed = [op, expr[1] as Expr, fuseLoopsAt(expr[2] as Expr, [...path, 2], typeInfo)];
+      break;
+    case "let":
+    case "letrec": {
+      const bindings = expr[1];
+      const newBindings = Array.isArray(bindings)
+        ? (bindings.map((b, bi) => {
+            if (!Array.isArray(b) || b.length !== 2) return b as Expr;
+            return [
+              b[0] as string,
+              fuseLoopsAt(b[1] as Expr, [...path, 1, bi, 1], typeInfo),
+            ] as Expr;
+          }) as Expr)
+        : (bindings as Expr);
+      recursed = [op, newBindings, fuseLoopsAt(expr[2] as Expr, [...path, 2], typeInfo)];
+      break;
+    }
+    case "match":
+    case "handle": {
+      const out: Expr[] = [op, fuseLoopsAt(expr[1] as Expr, [...path, 1], typeInfo)];
+      for (let i = 2; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        out.push([
+          clause[0] as Expr,
+          fuseLoopsAt(clause[1] as Expr, [...path, i, 1], typeInfo),
+        ] as Expr);
+      }
+      recursed = out;
+      break;
+    }
+    case "cond": {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        const test = clause[0];
+        const body = clause[1] as Expr;
+        const newTest =
+          test === "else" ? "else" : fuseLoopsAt(test as Expr, [...path, i, 0], typeInfo);
+        out.push([newTest as Expr, fuseLoopsAt(body, [...path, i, 1], typeInfo)] as Expr);
+      }
+      recursed = out;
+      break;
+    }
+    case "__loop": {
+      const initArgs = expr[2];
+      const newInit = Array.isArray(initArgs)
+        ? (initArgs.map((a, ai) => fuseLoopsAt(a as Expr, [...path, 2, ai], typeInfo)) as Expr)
+        : (initArgs as Expr);
+      recursed = [
+        op,
+        expr[1] as Expr,
+        newInit,
+        fuseLoopsAt(expr[3] as Expr, [...path, 3], typeInfo),
+      ];
+      break;
+    }
+    default: {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) {
+        out.push(fuseLoopsAt(expr[i] as Expr, [...path, i], typeInfo));
+      }
+      recursed = out;
+    }
+  }
+
+  // After children are fused, attempt to fuse at this node. We only fire once
+  // per node because re-firing at the same path would check purity against
+  // typeInfo paths that no longer correspond to the (now-synthesized) subtree.
+  if (Array.isArray(recursed) && recursed[0] === "__native") {
+    const next = tryFuseAt(recursed as Expr[], path, typeInfo);
+    if (next !== null) return next;
+  }
+  return recursed;
+}
+
 // Re-export helpers for tests.
 export const __test__ = {
   freeIn,

@@ -5,7 +5,9 @@ import {
   inlineSmallFunctions,
   tco,
   recognizeLoopPatterns,
+  fuseLoops,
 } from "./optimizer.ts";
+import type { TypeInfo } from "./typecheck.ts";
 
 // A compiled Marinada expression.
 // Takes an env (variable bindings) and returns a JS-native value.
@@ -319,6 +321,36 @@ const NATIVES = {
       if (_eq(arr[i], v)) return BigInt(i);
     }
     return -1n;
+  },
+  array_map_filter(xs: unknown, pred: unknown, f: unknown): unknown[] {
+    const arr = xs as unknown[];
+    const p = pred as (v: unknown) => boolean;
+    const fn = f as (v: unknown) => unknown;
+    const out: unknown[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      const v = arr[i];
+      if (p(v)) out.push(fn(v));
+    }
+    return out;
+  },
+  array_filter_map(xs: unknown, f: unknown, pred: unknown): unknown[] {
+    const arr = xs as unknown[];
+    const fn = f as (v: unknown) => unknown;
+    const p = pred as (v: unknown) => boolean;
+    const out: unknown[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      const v = fn(arr[i]);
+      if (p(v)) out.push(v);
+    }
+    return out;
+  },
+  array_map_reduce(xs: unknown, g: unknown, f: unknown, init: unknown): unknown {
+    const arr = xs as unknown[];
+    const gn = g as (v: unknown) => unknown;
+    const fn = f as (a: unknown, b: unknown) => unknown;
+    let acc = init;
+    for (let i = 0; i < arr.length; i++) acc = fn(acc, gn(arr[i]));
+    return acc;
   },
 };
 
@@ -1500,6 +1532,9 @@ function compileIsCheck(typStr: string, val: JSExpr): JSExpr {
 export type CompileOptions = {
   /** When true (default), run constant-folding optimizer before code generation. */
   optimize?: boolean;
+  /** Optional type/effect info, used by purity-gated optimizer passes (e.g. loop fusion).
+   * Must be built from the same expression passed to compile(). */
+  typeInfo?: TypeInfo;
 };
 
 /** Internal: compile an already-prepared expression (no optimization step). */
@@ -1512,7 +1547,7 @@ function compileRaw(expr: Expr): JitFn {
 }
 
 /** Run all enabled optimizer passes in pipeline order. */
-function runOptimizer(expr: Expr): Expr {
+function runOptimizer(expr: Expr, typeInfo?: TypeInfo): Expr {
   // Phase 4: tail-call optimization — convert tail-recursive letrec forms
   // into `__loop` / `__continue` nodes. Runs before constant folding so
   // subsequent passes see a normalized loop shape.
@@ -1522,19 +1557,23 @@ function runOptimizer(expr: Expr): Expr {
   e = optimize(e, CONSTANT_FOLDING_RULES);
   // Phase 6: inline small, non-looping, single-use functions.
   e = inlineSmallFunctions(e);
-  // Phase 5: loop pattern recognition — replace `__loop` nodes that match
+  // Phase 5a: loop pattern recognition — replace `__loop` nodes that match
   // known shapes (array-map / array-filter / array-reduce / ...) with
   // `__native` invocations.
   e = recognizeLoopPatterns(e);
-  // Re-run constant folding so newly-inlined / recognized expressions get
-  // folded.
+  // Phase 5b: loop fusion — fuse adjacent pure `__native` array operations
+  // into single-pass equivalents. Gated on TypeInfo's purity check; without
+  // TypeInfo, this is a no-op.
+  e = fuseLoops(e, typeInfo);
+  // Re-run constant folding so newly-inlined / recognized / fused expressions
+  // get folded.
   e = optimize(e, CONSTANT_FOLDING_RULES);
   return e;
 }
 
 /** Internal: render an expression to its generated JS source (for tests/inspection). */
 export function compileToSource(expr: Expr, opts: CompileOptions = {}): string {
-  const e = opts.optimize === false ? expr : runOptimizer(expr);
+  const e = opts.optimize === false ? expr : runOptimizer(expr, opts.typeInfo);
   return serializeExpr(compileExpr(e, emptyCtx()));
 }
 
@@ -1543,7 +1582,7 @@ export function compileToSource(expr: Expr, opts: CompileOptions = {}): string {
 // By default, runs the constant-folding optimizer first; pass `{ optimize: false }`
 // to skip it (useful for tests that want to inspect un-optimized code shape).
 export function compile(expr: Expr, opts: CompileOptions = {}): JitFn {
-  const e = opts.optimize === false ? expr : runOptimizer(expr);
+  const e = opts.optimize === false ? expr : runOptimizer(expr, opts.typeInfo);
   return compileRaw(e);
 }
 

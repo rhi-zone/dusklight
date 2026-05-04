@@ -7,6 +7,7 @@ import {
   inlineSmallFunctions,
   tco,
   recognizeLoopPatterns,
+  fuseLoops,
   type RewriteRule,
 } from "./optimizer.ts";
 import { STD_BINDINGS } from "./std.ts";
@@ -1113,6 +1114,151 @@ describe("recognizeLoopPatterns", () => {
     expect(src).toContain("_nat.array_map");
     // No labeled while-loop should appear (those come from un-recognized __loop).
     expect(src).not.toMatch(/_L\d+:\s*while/);
+  });
+});
+
+// --- Phase 5: Loop fusion ---
+
+describe("fuseLoops", () => {
+  function findNative(expr: Expr, name: string): Expr[] | null {
+    if (!Array.isArray(expr) || expr.length === 0) return null;
+    if (expr[0] === "__native" && expr[1] === name) return expr as Expr[];
+    for (const c of expr) {
+      const r = typeof c === "object" ? findNative(c as Expr, name) : null;
+      if (r) return r;
+    }
+    return null;
+  }
+  function countNative(expr: Expr, name: string): number {
+    if (!Array.isArray(expr) || expr.length === 0) return 0;
+    let n = expr[0] === "__native" && expr[1] === name ? 1 : 0;
+    for (const c of expr) {
+      if (typeof c === "object") n += countNative(c as Expr, name);
+    }
+    return n;
+  }
+
+  it("fuses map-after-map into a single array_map (with TypeInfo)", () => {
+    // map(f, map(g, xs)) where f = *2, g = +1
+    const expr: Expr = [
+      "__native",
+      "array_map",
+      ["__native", "array_map", "xs", ["fn", ["x"], ["+", "x", 1]]],
+      ["fn", ["y"], ["*", "y", 2]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(countNative(fused, "array_map")).toBe(1);
+    // End-to-end correctness via compile.
+    const fn = compile(expr, { typeInfo: info });
+    expect(fn({ xs: [1n, 2n, 3n] })).toEqual([4n, 6n, 8n]);
+  });
+
+  it("fuses map-after-filter into array_map_filter", () => {
+    // map(f, filter(p, xs)): keep evens, then double
+    const expr: Expr = [
+      "__native",
+      "array_map",
+      ["__native", "array_filter", "xs", ["fn", ["x"], ["==", ["%", "x", 2], 0]]],
+      ["fn", ["y"], ["*", "y", 2]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(findNative(fused, "array_map_filter")).not.toBeNull();
+    expect(findNative(fused, "array_map")).toBeNull();
+    expect(findNative(fused, "array_filter")).toBeNull();
+    const fn = compile(expr, { typeInfo: info });
+    expect(fn({ xs: [1n, 2n, 3n, 4n, 5n] })).toEqual([4n, 8n]);
+  });
+
+  it("fuses filter-after-map into array_filter_map", () => {
+    // filter(p, map(f, xs)): double, then keep > 4
+    const expr: Expr = [
+      "__native",
+      "array_filter",
+      ["__native", "array_map", "xs", ["fn", ["x"], ["*", "x", 2]]],
+      ["fn", ["y"], [">", "y", 4]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(findNative(fused, "array_filter_map")).not.toBeNull();
+    expect(findNative(fused, "array_map")).toBeNull();
+    expect(findNative(fused, "array_filter")).toBeNull();
+    const fn = compile(expr, { typeInfo: info });
+    expect(fn({ xs: [1n, 2n, 3n, 4n] })).toEqual([6n, 8n]);
+  });
+
+  it("fuses reduce-after-map into array_map_reduce", () => {
+    // reduce(+, 0, map(*2, xs))
+    const expr: Expr = [
+      "__native",
+      "array_reduce",
+      ["__native", "array_map", "xs", ["fn", ["x"], ["*", "x", 2]]],
+      ["fn", ["a", "b"], ["+", "a", "b"]],
+      0,
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(findNative(fused, "array_map_reduce")).not.toBeNull();
+    expect(findNative(fused, "array_map")).toBeNull();
+    expect(findNative(fused, "array_reduce")).toBeNull();
+    const fn = compile(expr, { typeInfo: info });
+    expect(fn({ xs: [1n, 2n, 3n, 4n] })).toBe(20n);
+  });
+
+  it("fuses filter-after-filter into a single combined-predicate array_filter", () => {
+    // filter(p2, filter(p1, xs)): p1 = >0, p2 = <10
+    const expr: Expr = [
+      "__native",
+      "array_filter",
+      ["__native", "array_filter", "xs", ["fn", ["x"], [">", "x", 0]]],
+      ["fn", ["y"], ["<", "y", 10]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    expect(countNative(fused, "array_filter")).toBe(1);
+    const fn = compile(expr, { typeInfo: info });
+    expect(fn({ xs: [-2n, 0n, 3n, 7n, 11n, 15n] })).toEqual([3n, 7n]);
+  });
+
+  it("does NOT fuse without TypeInfo", () => {
+    const expr: Expr = [
+      "__native",
+      "array_map",
+      ["__native", "array_map", "xs", ["fn", ["x"], ["+", "x", 1]]],
+      ["fn", ["y"], ["*", "y", 2]],
+    ];
+    const fused = fuseLoops(expr); // no typeInfo
+    expect(countNative(fused, "array_map")).toBe(2);
+    expect(fused).toBe(expr);
+  });
+
+  it("does NOT fuse when a function is effectful (perform inside)", () => {
+    // outer map's fn performs an effect — not pure, so no fusion.
+    const expr: Expr = [
+      "__native",
+      "array_map",
+      ["__native", "array_map", "xs", ["fn", ["x"], ["+", "x", 1]]],
+      ["fn", ["y"], ["do", ["perform", "Log", "y"], ["*", "y", 2]]],
+    ];
+    const info = buildTypeInfo(expr);
+    const fused = fuseLoops(expr, info);
+    // Two array_maps remain — no fusion happened.
+    expect(countNative(fused, "array_map")).toBe(2);
+  });
+
+  it("end-to-end via compile: chained pure map ∘ map yields correct result and uses fused native", () => {
+    const expr: Expr = [
+      "__native",
+      "array_map",
+      ["__native", "array_map", "xs", ["fn", ["x"], ["+", "x", 1]]],
+      ["fn", ["y"], ["*", "y", 10]],
+    ];
+    const info = buildTypeInfo(expr);
+    const src = compileToSource(expr, { typeInfo: info });
+    expect((src.match(/_nat\.array_map/g) ?? []).length).toBe(1);
+    const fn = compile(expr, { typeInfo: info });
+    expect(fn({ xs: [1n, 2n, 3n] })).toEqual([20n, 30n, 40n]);
   });
 });
 

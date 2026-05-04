@@ -2961,6 +2961,56 @@ function inferOp(op: string, arr: Expr[], env: TypeEnv, ctx: Ctx): MType {
       return inferCallMethod(arr, env, ctx);
     }
 
+    // -------------------- optimizer-introduced ops --------------------
+    // `__native` and `__loop`/`__continue` are produced by optimizer passes
+    // (loop recognition / TCO). They are not user-facing, but TypeInfo may
+    // be requested on already-optimized expressions (e.g. for purity-gated
+    // fusion). We typecheck sub-expressions so per-path types/effects are
+    // recorded, but otherwise treat the result as an unknown type with no
+    // additional effects (the natives table itself is pure for the array_*
+    // ops; if the user-supplied function arg performs effects, those are
+    // recorded under that arg's path during its inference).
+    case "__native": {
+      // arr[1] is the native name (string literal, no inference).
+      for (let i = 2; i < arr.length; i++) {
+        withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
+      }
+      return ctx.state.freshVar();
+    }
+    case "__loop": {
+      const initArgs = arr[2];
+      if (Array.isArray(initArgs)) {
+        for (let i = 0; i < initArgs.length; i++) {
+          withPath(ctx, 2, (sub) =>
+            withPath(sub, i, (sub2) => infer(initArgs[i] as Expr, env, sub2)),
+          );
+        }
+      }
+      // Body is inferred under fresh param bindings — but for TypeInfo
+      // purposes we just need to populate the index. Use fresh vars.
+      const params = arr[1];
+      const paramBindings: Record<string, MType> = {};
+      if (Array.isArray(params)) {
+        for (const p of params) {
+          if (typeof p === "string") {
+            paramBindings[p] = ctx.state.freshVar();
+          }
+        }
+      }
+      const bodyEnv = env.extend(paramBindings);
+      withPath(ctx, 3, (sub) => infer(at(arr, 3), bodyEnv, sub));
+      return ctx.state.freshVar();
+    }
+    case "__continue": {
+      for (let i = 1; i < arr.length; i++) {
+        withPath(ctx, i, (sub) => infer(at(arr, i), env, sub));
+      }
+      return ctx.state.freshVar();
+    }
+    case "__lit": {
+      return ctx.state.freshVar();
+    }
+
     // -------------------- Phase 6+ ops (still TBD) --------------------
     case "?": {
       for (let i = 1; i < arr.length; i++) {
