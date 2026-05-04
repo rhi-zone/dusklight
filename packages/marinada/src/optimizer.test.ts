@@ -6,10 +6,12 @@ import {
   CONSTANT_FOLDING_RULES,
   inlineSmallFunctions,
   tco,
+  recognizeLoopPatterns,
   type RewriteRule,
 } from "./optimizer.ts";
 import { STD_BINDINGS } from "./std.ts";
-import type { Expr } from "./types.ts";
+import { evaluateModule } from "./module.ts";
+import type { Expr, Module } from "./types.ts";
 
 // --- Helper ---
 function run(expr: Expr, env: Record<string, unknown> = {}): unknown {
@@ -974,6 +976,143 @@ describe("optimizer: tail-call optimization (TCO)", () => {
     const expr: Expr = ["call", stdReduce.expr, ["fn", ["a", "b"], ["+", "a", "b"]], 0, "xs"];
     const fn = compile(expr);
     expect(fn({ xs: [1n, 2n, 3n, 4n] })).toBe(10n);
+  });
+});
+
+// --- Phase 5: loop pattern recognition ---
+
+describe("recognizeLoopPatterns", () => {
+  function hasOp(expr: Expr, op: string): boolean {
+    if (!Array.isArray(expr)) return false;
+    if (expr[0] === op) return true;
+    for (let i = 0; i < expr.length; i++) {
+      if (hasOp(expr[i] as Expr, op)) return true;
+    }
+    return false;
+  }
+
+  // Helper: run the same pipeline as runOptimizer up to (and including) the
+  // recognizer pass.
+  function pipeline(expr: Expr): Expr {
+    let e = tco(expr);
+    e = optimize(e, CONSTANT_FOLDING_RULES);
+    e = inlineSmallFunctions(e);
+    e = recognizeLoopPatterns(e);
+    e = optimize(e, CONSTANT_FOLDING_RULES);
+    return e;
+  }
+
+  // Walk an Expr and return true if any node has shape ["__native", name, ...].
+  function hasNative(expr: Expr, name: string): boolean {
+    if (!Array.isArray(expr) || expr.length === 0) return false;
+    if (expr[0] === "__native" && expr[1] === name) return true;
+    return expr.some((c) => (typeof c === "object" ? hasNative(c as Expr, name) : false));
+  }
+
+  it("recognizes lib:std map as __native array_map", () => {
+    const stdMap = STD_BINDINGS.find((b) => b.name === "map")!;
+    const after = pipeline(stdMap.expr);
+    expect(hasNative(after, "array_map")).toBe(true);
+    expect(hasOp(after, "__loop")).toBe(false);
+  });
+
+  it("recognizes lib:std filter as __native array_filter", () => {
+    const stdFilter = STD_BINDINGS.find((b) => b.name === "filter")!;
+    const after = pipeline(stdFilter.expr);
+    expect(hasNative(after, "array_filter")).toBe(true);
+    expect(hasOp(after, "__loop")).toBe(false);
+  });
+
+  it("recognizes lib:std reduce as __native array_reduce", () => {
+    const stdReduce = STD_BINDINGS.find((b) => b.name === "reduce")!;
+    const after = pipeline(stdReduce.expr);
+    expect(hasNative(after, "array_reduce")).toBe(true);
+    expect(hasOp(after, "__loop")).toBe(false);
+  });
+
+  it("recognizes a user-written, structurally-equivalent map loop (no name checking)", () => {
+    // User defines their own map under a different name; structurally identical.
+    const userMap: Expr = [
+      "letrec",
+      [
+        [
+          "my-map",
+          [
+            "fn",
+            ["g", "ys", "out", "k"],
+            [
+              "if",
+              ["==", "k", ["count", "ys"]],
+              "out",
+              [
+                "call",
+                "my-map",
+                "g",
+                "ys",
+                ["array-push", "out", ["call", "g", ["array-get", "ys", "k"]]],
+                ["+", "k", 1],
+              ],
+            ],
+          ],
+        ],
+      ],
+      ["fn", ["g", "ys"], ["call", "my-map", "g", "ys", ["array"], 0]],
+    ];
+    const after = pipeline(userMap);
+    expect(hasNative(after, "array_map")).toBe(true);
+    expect(hasOp(after, "__loop")).toBe(false);
+  });
+
+  it("leaves a loop that doesn't match any pattern as __loop", () => {
+    // A simple range-sum: (i, acc) -> if i > n then acc else loop(i+1, acc+i).
+    // This loop has 2 params (not 4) and does not fit any pattern.
+    const expr: Expr = [
+      "letrec",
+      [
+        [
+          "loop",
+          [
+            "fn",
+            ["i", "acc"],
+            ["if", [">", "i", "n"], "acc", ["call", "loop", ["+", "i", 1], ["+", "acc", "i"]]],
+          ],
+        ],
+      ],
+      ["call", "loop", 1, 0],
+    ];
+    const after = pipeline(expr);
+    expect(hasOp(after, "__loop")).toBe(true);
+    expect(hasNative(after, "array_map")).toBe(false);
+    expect(hasNative(after, "array_filter")).toBe(false);
+    expect(hasNative(after, "array_reduce")).toBe(false);
+  });
+
+  it("end-to-end: map(double, [1,2,3]) via evaluateModule yields [2,4,6]", () => {
+    const module: Module = {
+      imports: [{ from: "lib:std", import: ["map"] }],
+      main: ["call", "map", ["fn", ["x"], ["*", "x", 2]], ["array", 1, 2, 3]],
+    };
+    const result = evaluateModule(module);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toMatchObject({
+        kind: "array",
+        value: [
+          { kind: "int", value: 2n },
+          { kind: "int", value: 4n },
+          { kind: "int", value: 6n },
+        ],
+      });
+    }
+  });
+
+  it("performance sanity: compiled lib:std map output uses _nat.array_map, not a recursive loop", () => {
+    const stdMap = STD_BINDINGS.find((b) => b.name === "map")!;
+    const expr: Expr = ["call", stdMap.expr, ["fn", ["x"], ["*", "x", 2]], "xs"];
+    const src = compileToSource(expr);
+    expect(src).toContain("_nat.array_map");
+    // No labeled while-loop should appear (those come from un-recognized __loop).
+    expect(src).not.toMatch(/_L\d+:\s*while/);
   });
 });
 

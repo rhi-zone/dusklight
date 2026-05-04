@@ -2369,6 +2369,327 @@ function replaceCall(expr: Expr, name: string, fn: Expr): Expr | null {
   return replaced ? result : null;
 }
 
+// --- Phase 5: loop pattern recognition ---
+//
+// Inspects `__loop` nodes and replaces them with `__native` nodes when they
+// match a known loop shape (array-map, array-filter, array-reduce, ...).
+// Fires on ANY structurally matching loop — does not check the binding name.
+
+/** Treat both AST atoms (0, 1, ...) and `["__lit", n]` as numeric constants. */
+function isZero(e: Expr): boolean {
+  if (e === 0) return true;
+  if (Array.isArray(e) && e.length === 2 && e[0] === "__lit") {
+    const v = e[1];
+    if (v === 0) return true;
+    // bigint 0 is not representable as Expr; check via constants helper
+  }
+  return false;
+}
+
+function isOne(e: Expr): boolean {
+  if (e === 1) return true;
+  if (Array.isArray(e) && e.length === 2 && e[0] === "__lit") {
+    if (e[1] === 1) return true;
+  }
+  return false;
+}
+
+/** True if `e` is a `["__lit", []]` empty-array literal, or the bare AST form. */
+function isEmptyArrayInit(e: Expr): boolean {
+  if (Array.isArray(e) && e.length === 2 && e[0] === "__lit") {
+    const v = e[1];
+    if (Array.isArray(v) && v.length === 0) return true;
+  }
+  if (Array.isArray(e) && e.length === 1 && e[0] === "array") return true;
+  return false;
+}
+
+/** Match `["+", x, 1]` or `["+", 1, x]` returning `x` if so. */
+function matchIncrement(e: Expr, varName: string): boolean {
+  if (!Array.isArray(e) || e.length !== 3 || e[0] !== "+") return false;
+  if (e[1] === varName && isOne(e[2] as Expr)) return true;
+  if (e[2] === varName && isOne(e[1] as Expr)) return true;
+  return false;
+}
+
+/** Match `["==", I, ["count", XS]]` or symmetric. */
+function matchExhaustionTest(e: Expr, iName: string, xsName: string): boolean {
+  if (!Array.isArray(e) || e.length !== 3 || e[0] !== "==") return false;
+  const isCount = (x: Expr): boolean =>
+    Array.isArray(x) && x.length === 2 && x[0] === "count" && x[1] === xsName;
+  if (e[1] === iName && isCount(e[2] as Expr)) return true;
+  if (e[2] === iName && isCount(e[1] as Expr)) return true;
+  return false;
+}
+
+/** Match `["array-get", XS, I]`. */
+function matchArrayGet(e: Expr, xsName: string, iName: string): boolean {
+  return (
+    Array.isArray(e) && e.length === 3 && e[0] === "array-get" && e[1] === xsName && e[2] === iName
+  );
+}
+
+/** Decompose a `__loop` body matching the array-map shape. Returns the
+ * per-element transform expression (in terms of the loop's element-access
+ * sub-expression `["array-get", XS, I]`). The actual user function is
+ * obtained from the loop's first init-arg. */
+type LoopInfo = {
+  fName: string;
+  xsName: string;
+  accName: string;
+  iName: string;
+  fInit: Expr;
+  xsInit: Expr;
+  accInit: Expr;
+};
+
+/** Validate the standard 4-param `(f, xs, acc, i)` loop header and return
+ * the names + inits, or null. */
+function loopHeader(loop: Expr[]): LoopInfo | null {
+  if (loop[0] !== "__loop") return null;
+  const params = loop[1];
+  const initArgs = loop[2];
+  if (!Array.isArray(params) || !Array.isArray(initArgs)) return null;
+  if (params.length !== 4 || initArgs.length !== 4) return null;
+  const fName = params[0];
+  const xsName = params[1];
+  const accName = params[2];
+  const iName = params[3];
+  if (
+    typeof fName !== "string" ||
+    typeof xsName !== "string" ||
+    typeof accName !== "string" ||
+    typeof iName !== "string"
+  ) {
+    return null;
+  }
+  // The 4th init must be the literal 0 (loop starts at index 0).
+  if (!isZero(initArgs[3] as Expr)) return null;
+  return {
+    fName,
+    xsName,
+    accName,
+    iName,
+    fInit: initArgs[0] as Expr,
+    xsInit: initArgs[1] as Expr,
+    accInit: initArgs[2] as Expr,
+  };
+}
+
+/** Match the array-map __loop shape:
+ *   ["__loop", [F, XS, ACC, I], [f0, xs0, [], 0],
+ *     ["if", ["==", I, ["count", XS]], ACC,
+ *       ["__continue", F, XS,
+ *         ["array-push", ACC, ["call", F, ["array-get", XS, I]]],
+ *         ["+", I, 1]]]]
+ */
+function matchArrayMap(loop: Expr[]): Expr | null {
+  const h = loopHeader(loop);
+  if (h === null) return null;
+  if (!isEmptyArrayInit(h.accInit)) return null;
+  const body = loop[3];
+  if (!Array.isArray(body) || body.length !== 4 || body[0] !== "if") return null;
+  if (!matchExhaustionTest(body[1] as Expr, h.iName, h.xsName)) return null;
+  if (body[2] !== h.accName) return null;
+  const cont = body[3];
+  if (!Array.isArray(cont) || cont[0] !== "__continue" || cont.length !== 5) return null;
+  // F, XS, newAcc, i+1
+  if (cont[1] !== h.fName) return null;
+  if (cont[2] !== h.xsName) return null;
+  if (!matchIncrement(cont[4] as Expr, h.iName)) return null;
+  const newAcc = cont[3];
+  if (!Array.isArray(newAcc) || newAcc.length !== 3 || newAcc[0] !== "array-push") return null;
+  if (newAcc[1] !== h.accName) return null;
+  // pushed value: ["call", F, ["array-get", XS, I]]
+  const pushed = newAcc[2];
+  if (!Array.isArray(pushed) || pushed.length !== 3 || pushed[0] !== "call") return null;
+  if (pushed[1] !== h.fName) return null;
+  if (!matchArrayGet(pushed[2] as Expr, h.xsName, h.iName)) return null;
+
+  return ["__native", "array_map", h.xsInit, h.fInit];
+}
+
+/** Match the array-filter __loop shape:
+ *   ["__loop", [F, XS, ACC, I], [f0, xs0, [], 0],
+ *     ["if", ["==", I, ["count", XS]], ACC,
+ *       ["let", [["item", ["array-get", XS, I]]],
+ *         ["if", ["call", F, "item"],
+ *           ["__continue", F, XS, ["array-push", ACC, "item"], ["+", I, 1]],
+ *           ["__continue", F, XS, ACC, ["+", I, 1]]]]]]
+ */
+function matchArrayFilter(loop: Expr[]): Expr | null {
+  const h = loopHeader(loop);
+  if (h === null) return null;
+  if (!isEmptyArrayInit(h.accInit)) return null;
+  const body = loop[3];
+  if (!Array.isArray(body) || body.length !== 4 || body[0] !== "if") return null;
+  if (!matchExhaustionTest(body[1] as Expr, h.iName, h.xsName)) return null;
+  if (body[2] !== h.accName) return null;
+  const inner = body[3];
+  // Either the "let item = array-get; if (f item) ..." shape or a direct
+  // shape that inlines the item access. Accept both.
+  let predExpr: Expr;
+  let keepCont: Expr;
+  let dropCont: Expr;
+  if (Array.isArray(inner) && inner[0] === "let") {
+    const bindings = inner[1];
+    if (!Array.isArray(bindings) || bindings.length !== 1) return null;
+    const b = bindings[0];
+    if (!Array.isArray(b) || b.length !== 2) return null;
+    const itemName = b[0];
+    if (typeof itemName !== "string") return null;
+    if (!matchArrayGet(b[1] as Expr, h.xsName, h.iName)) return null;
+    const ifExpr = inner[2];
+    if (!Array.isArray(ifExpr) || ifExpr.length !== 4 || ifExpr[0] !== "if") return null;
+    const predCall = ifExpr[1];
+    if (!Array.isArray(predCall) || predCall.length !== 3 || predCall[0] !== "call") return null;
+    if (predCall[1] !== h.fName) return null;
+    if (predCall[2] !== itemName) return null;
+    predExpr = itemName;
+    keepCont = ifExpr[2] as Expr;
+    dropCont = ifExpr[3] as Expr;
+    void predExpr;
+    // Verify keep-continue
+    if (!Array.isArray(keepCont) || keepCont[0] !== "__continue" || keepCont.length !== 5) {
+      return null;
+    }
+    if (keepCont[1] !== h.fName || keepCont[2] !== h.xsName) return null;
+    if (!matchIncrement(keepCont[4] as Expr, h.iName)) return null;
+    const newAcc = keepCont[3];
+    if (!Array.isArray(newAcc) || newAcc.length !== 3 || newAcc[0] !== "array-push") return null;
+    if (newAcc[1] !== h.accName) return null;
+    if (newAcc[2] !== itemName) return null;
+    // Verify drop-continue
+    if (!Array.isArray(dropCont) || dropCont[0] !== "__continue" || dropCont.length !== 5) {
+      return null;
+    }
+    if (dropCont[1] !== h.fName || dropCont[2] !== h.xsName) return null;
+    if (dropCont[3] !== h.accName) return null;
+    if (!matchIncrement(dropCont[4] as Expr, h.iName)) return null;
+    return ["__native", "array_filter", h.xsInit, h.fInit];
+  }
+  return null;
+}
+
+/** Match the array-reduce __loop shape:
+ *   ["__loop", [F, XS, ACC, I], [f0, xs0, init0, 0],
+ *     ["if", ["==", I, ["count", XS]], ACC,
+ *       ["__continue", F, XS,
+ *         ["call", F, ACC, ["array-get", XS, I]],
+ *         ["+", I, 1]]]]
+ */
+function matchArrayReduce(loop: Expr[]): Expr | null {
+  const h = loopHeader(loop);
+  if (h === null) return null;
+  // accInit can be anything (the user's `init` value); do not constrain.
+  const body = loop[3];
+  if (!Array.isArray(body) || body.length !== 4 || body[0] !== "if") return null;
+  if (!matchExhaustionTest(body[1] as Expr, h.iName, h.xsName)) return null;
+  if (body[2] !== h.accName) return null;
+  const cont = body[3];
+  if (!Array.isArray(cont) || cont[0] !== "__continue" || cont.length !== 5) return null;
+  if (cont[1] !== h.fName || cont[2] !== h.xsName) return null;
+  if (!matchIncrement(cont[4] as Expr, h.iName)) return null;
+  const newAcc = cont[3];
+  if (!Array.isArray(newAcc) || newAcc.length !== 4 || newAcc[0] !== "call") return null;
+  if (newAcc[1] !== h.fName) return null;
+  if (newAcc[2] !== h.accName) return null;
+  if (!matchArrayGet(newAcc[3] as Expr, h.xsName, h.iName)) return null;
+  // For reduce, the natives table signature is (xs, f, init).
+  return ["__native", "array_reduce", h.xsInit, h.fInit, h.accInit];
+}
+
+const LOOP_PATTERNS: Array<(loop: Expr[]) => Expr | null> = [
+  matchArrayMap,
+  matchArrayFilter,
+  matchArrayReduce,
+];
+
+/** Walk `expr` and replace any `__loop` whose shape matches a known loop
+ * pattern with the corresponding `__native` invocation. */
+export function recognizeLoopPatterns(expr: Expr): Expr {
+  if (typeof expr === "string" || expr === null) return expr;
+  if (typeof expr === "boolean" || typeof expr === "number") return expr;
+  if (!Array.isArray(expr) || expr.length === 0) return expr;
+  const op = expr[0];
+  if (typeof op !== "string") {
+    return expr.map((e) => recognizeLoopPatterns(e as Expr)) as Expr;
+  }
+  if (op === "__lit") return expr;
+
+  // Recurse into children first (so nested loops are recognized too).
+  let recursed: Expr;
+  switch (op) {
+    case "fn":
+    case "fn-once":
+      recursed = [op, expr[1] as Expr, recognizeLoopPatterns(expr[2] as Expr)];
+      break;
+    case "let":
+    case "letrec": {
+      const bindings = expr[1];
+      const newBindings = Array.isArray(bindings)
+        ? (bindings.map((b) => {
+            if (!Array.isArray(b) || b.length !== 2) return b as Expr;
+            return [b[0] as string, recognizeLoopPatterns(b[1] as Expr)] as Expr;
+          }) as Expr)
+        : (bindings as Expr);
+      recursed = [op, newBindings, recognizeLoopPatterns(expr[2] as Expr)];
+      break;
+    }
+    case "match":
+    case "handle": {
+      const out: Expr[] = [op, recognizeLoopPatterns(expr[1] as Expr)];
+      for (let i = 2; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        out.push([clause[0] as Expr, recognizeLoopPatterns(clause[1] as Expr)] as Expr);
+      }
+      recursed = out;
+      break;
+    }
+    case "cond": {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) {
+        const clause = expr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          out.push(clause as Expr);
+          continue;
+        }
+        const test = clause[0];
+        const body = clause[1] as Expr;
+        const newTest = test === "else" ? "else" : recognizeLoopPatterns(test as Expr);
+        out.push([newTest as Expr, recognizeLoopPatterns(body)] as Expr);
+      }
+      recursed = out;
+      break;
+    }
+    case "__loop": {
+      const initArgs = expr[2];
+      const newInit = Array.isArray(initArgs)
+        ? (initArgs.map((a) => recognizeLoopPatterns(a as Expr)) as Expr)
+        : (initArgs as Expr);
+      recursed = [op, expr[1] as Expr, newInit, recognizeLoopPatterns(expr[3] as Expr)];
+      break;
+    }
+    default: {
+      const out: Expr[] = [op];
+      for (let i = 1; i < expr.length; i++) out.push(recognizeLoopPatterns(expr[i] as Expr));
+      recursed = out;
+    }
+  }
+
+  if (Array.isArray(recursed) && recursed[0] === "__loop") {
+    for (const matcher of LOOP_PATTERNS) {
+      const replaced = matcher(recursed as Expr[]);
+      if (replaced !== null) return replaced;
+    }
+  }
+  return recursed;
+}
+
 // Re-export helpers for tests.
 export const __test__ = {
   freeIn,

@@ -1,5 +1,11 @@
 import type { Expr } from "./types.ts";
-import { optimize, CONSTANT_FOLDING_RULES, inlineSmallFunctions, tco } from "./optimizer.ts";
+import {
+  optimize,
+  CONSTANT_FOLDING_RULES,
+  inlineSmallFunctions,
+  tco,
+  recognizeLoopPatterns,
+} from "./optimizer.ts";
 
 // A compiled Marinada expression.
 // Takes an env (variable bindings) and returns a JS-native value.
@@ -1514,10 +1520,14 @@ function runOptimizer(expr: Expr): Expr {
   // Phase 1+2: constant folding + dead-binding elimination + literal copy
   // propagation, all expressed as rewrite rules.
   e = optimize(e, CONSTANT_FOLDING_RULES);
-  // Phase 6: inline small, non-looping, single-use functions. (Phase 5
-  // — loop pattern recognition + loop fusion — is not yet implemented.)
+  // Phase 6: inline small, non-looping, single-use functions.
   e = inlineSmallFunctions(e);
-  // Re-run constant folding so newly-inlined expressions get folded.
+  // Phase 5: loop pattern recognition — replace `__loop` nodes that match
+  // known shapes (array-map / array-filter / array-reduce / ...) with
+  // `__native` invocations.
+  e = recognizeLoopPatterns(e);
+  // Re-run constant folding so newly-inlined / recognized expressions get
+  // folded.
   e = optimize(e, CONSTANT_FOLDING_RULES);
   return e;
 }
