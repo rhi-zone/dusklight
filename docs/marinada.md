@@ -341,7 +341,7 @@ After the optimizer runs, backends receive an AST containing `__native`, `__lit`
 - `__lit v` → emit the value as a literal.
 - `__loop` → labeled while loop (JS) or `loop` block (Rust).
 
-**SIMD in the Rust backend** is viable without runtime recompilation: the optimizer identifies patterns at optimization time (e.g. `__loop` over `array<float>` doing scalar multiplication) and emits specific `__native` nodes. The Rust binary has pre-compiled SIMD implementations for those nodes. Runtime is just a dispatch — no JIT required.
+Backend-specific optimizations (SIMD, vectorization, platform intrinsics) are viable without runtime recompilation: the optimizer identifies patterns at optimization time and emits specific `__native` nodes. Each backend has pre-compiled implementations for those nodes. Runtime is just a dispatch.
 
 The optimizer fires once at load time. Backends execute the normalized AST on every call.
 
