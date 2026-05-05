@@ -9,4 +9,4 @@ export type { JitFn, CompileOptions } from "./jit.ts";
 export { optimize, CONSTANT_FOLDING_RULES } from "./optimizer.ts";
 export type { RewriteRule } from "./optimizer.ts";
 export { compileReactive } from "./reactive.ts";
-export type { ReactiveEnv, ReactiveFn } from "./reactive.ts";
+export type { ReactiveEnv, ReactiveSignal, ReactiveFn } from "./reactive.ts";

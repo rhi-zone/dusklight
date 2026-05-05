@@ -8,10 +8,20 @@ import { evaluate } from "./evaluate.ts";
 import { compile } from "./jit.ts";
 
 /**
+ * Minimal reactive signal shape — only what compileReactive actually needs.
+ * Structurally compatible with @rhi-zone/rainbow's Signal and ReadonlySignal,
+ * and with @dusklight/core's Signal, without requiring the `map` method.
+ */
+export type ReactiveSignal<A = unknown> = {
+  get(): A;
+  subscribe(fn: (value: A) => void): () => void;
+};
+
+/**
  * An environment mapping variable names to reactive signals.
  * Each signal's current value is substituted when the expression evaluates.
  */
-export type ReactiveEnv = Record<string, ReadonlySignal<unknown>>;
+export type ReactiveEnv = Record<string, ReactiveSignal>;
 
 /**
  * A compiled reactive expression: given a ReactiveEnv, returns a derived
