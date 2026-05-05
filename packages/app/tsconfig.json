@@ -1,9 +1,7 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "jsx": "preserve",
-    "jsxImportSource": "solid-js",
-    "rootDir": "./src",
+"rootDir": "./src",
     "outDir": "./dist",
     "lib": ["DOM", "DOM.Iterable", "ES2022"],
     "noEmit": true

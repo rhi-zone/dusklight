@@ -69,14 +69,10 @@ function makeCollapsible(
 export const jsonRenderer: Renderer<unknown, unknown> = {
   id: "@dusklight/renderer-json",
   mount(target: Element, lens: ReactiveLens<unknown, unknown>, _ctx: RendererCtx): () => void {
-    // Initial render
-    renderJsonTree(target, lens.signal());
-
-    // Re-render when value changes — poll via signal subscription
-    // (Concrete signal subscription wired by app shell; here we use a minimal approach:
-    //  return a cleanup that the app shell calls on unmount)
-    // TODO: wire reactive subscription once app shell provides signal runtime
+    renderJsonTree(target, lens.signal.get());
+    const unsub = lens.signal.subscribe((value) => renderJsonTree(target, value));
     return () => {
+      unsub();
       target.innerHTML = "";
     };
   },

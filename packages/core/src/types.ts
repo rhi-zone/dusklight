@@ -98,12 +98,12 @@ export type Optic<S, A> = Lens<S, A> | Traversal<S, A>;
 // --- Reactive Lens ---
 
 /**
- * A signal is a reactive readable value. Inspired by Solid.js signals.
- * Concrete implementation is provided by the app shell (Solid, Preact Signals, etc.).
+ * A reactive readable value. Structurally compatible with @rhi-zone/rainbow's
+ * ReadonlySignal<A> — no import needed, structural typing covers it.
  */
 export type Signal<A> = {
-  (): A;
-  readonly value: A;
+  get(): A;
+  subscribe(fn: (value: A) => void): () => void;
 };
 
 /**
