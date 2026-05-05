@@ -2,9 +2,19 @@ export type { Expr, Module } from "./types.ts";
 export { typecheck, buildTypeInfo } from "./typecheck.ts";
 export type { TypeInfo } from "./typecheck.ts";
 export { evaluate } from "./evaluate.ts";
-export { evaluateModule, evaluateModuleRaw, typecheckModule } from "./module.ts";
+export {
+  evaluateModule,
+  evaluateModuleRaw,
+  evaluateModuleAsync,
+  typecheckModule,
+} from "./module.ts";
 export { typecheckModuleRaw } from "./typecheck.ts";
-export type { ModuleResolver, EvaluateModuleOptions, TypecheckModuleOptions } from "./module.ts";
+export type {
+  ModuleResolver,
+  EvaluateModuleOptions,
+  EvaluateModuleAsyncOptions,
+  TypecheckModuleOptions,
+} from "./module.ts";
 export {
   compile,
   compileOptimized,
@@ -24,5 +34,9 @@ export {
   cacheResolver,
   composeResolvers,
   libStdResolver,
+  asyncProtocolResolver,
+  cacheAsyncResolver,
+  composeAsyncResolvers,
+  httpResolver,
 } from "./resolvers.ts";
-export type { Resolver } from "./resolvers.ts";
+export type { Resolver, AsyncResolver, MaybePromise } from "./resolvers.ts";

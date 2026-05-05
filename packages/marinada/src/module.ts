@@ -7,6 +7,7 @@ import { Env } from "./env.ts";
 import { typecheckModule } from "./typecheck.ts";
 import type { TypecheckResult } from "./typecheck.ts";
 import { libStdResolver } from "./resolvers.ts";
+import type { AsyncResolver, MaybePromise } from "./resolvers.ts";
 
 export type { EvalResult, TypecheckResult };
 
@@ -328,3 +329,198 @@ export function evaluateModuleRaw(module: Module, opts?: EvaluateModuleOptions):
 
 // Re-export typecheckModule so callers can import both from module.ts
 export { typecheckModule };
+
+// ---------------------------------------------------------------------------
+// evaluateModuleAsync
+// ---------------------------------------------------------------------------
+
+export type EvaluateModuleAsyncOptions = {
+  resolver?: AsyncResolver;
+};
+
+/**
+ * Evaluate a full module, supporting async resolvers (resolvers that return
+ * Promises). Every sync `Resolver` is also a valid `AsyncResolver`, so this
+ * is a drop-in superset of `evaluateModule`.
+ *
+ * Cycle detection, deferred patches, and caching carry over identically from
+ * `evaluateModule`. The difference is that each `resolve(path)` call is
+ * awaited, enabling `https:` resolution and other async module loading.
+ */
+export async function evaluateModuleAsync(
+  module: Module,
+  opts?: EvaluateModuleAsyncOptions,
+): Promise<EvalResult> {
+  const resolve = (path: string): MaybePromise<Module | null> =>
+    opts?.resolver?.(path) ?? libStdResolver(path) ?? null;
+  const cache = new Map<string, EvalCacheEntry>();
+  const modCache = new Map<Module, EvalCacheEntry>();
+  return checkDeferredCycles(
+    (await evaluateModuleExportsAsync(module, resolve, cache, modCache, new Map())).result,
+    modCache,
+  );
+}
+
+async function evaluateModuleExportsAsync(
+  module: Module,
+  resolve: (path: string) => MaybePromise<Module | null>,
+  cache: Map<string, EvalCacheEntry>,
+  modCache: Map<Module, EvalCacheEntry>,
+  exports: Map<string, Value>,
+): Promise<ModuleEvalExports> {
+  const selfDeferred: DeferredImportPatch[] = [];
+  const selfEntry: EvalCacheEntry = {
+    status: "in-progress",
+    partialExports: exports,
+    deferred: selfDeferred,
+  };
+  modCache.set(module, selfEntry);
+
+  function patchDeferred(name: string, value: Value): void {
+    for (let i = selfDeferred.length - 1; i >= 0; i--) {
+      const p = selfDeferred[i] as DeferredImportPatch;
+      if (p.name === name) {
+        p.env.set(name, value);
+        selfDeferred.splice(i, 1);
+      }
+    }
+  }
+
+  let env = EMPTY_ENV;
+  for (const imp of module.imports ?? []) {
+    let importExports: Map<string, Value>;
+    const cached = cache.get(imp.from);
+    if (cached === undefined) {
+      const mod = await resolve(imp.from);
+      if (mod === null) {
+        return {
+          result: evalErr("MODULE_NOT_FOUND", `module not found: ${imp.from}`),
+          exports,
+        };
+      }
+      const byId = modCache.get(mod);
+      if (byId !== undefined && byId.status === "in-progress") {
+        cache.set(imp.from, byId);
+        importExports = byId.partialExports;
+      } else {
+        const partialExports = new Map<string, Value>();
+        const deferred: DeferredImportPatch[] = [];
+        const slot: EvalCacheEntry = { status: "in-progress", partialExports, deferred };
+        cache.set(imp.from, slot);
+        const resolved = await evaluateModuleExportsAsync(
+          mod,
+          resolve,
+          cache,
+          modCache,
+          partialExports,
+        );
+        for (const patch of deferred) {
+          const v = partialExports.get(patch.name);
+          if (v !== undefined) patch.env.set(patch.name, v);
+        }
+        cache.set(imp.from, { status: "done", result: resolved });
+        if (!resolved.result.ok) return { result: resolved.result, exports };
+        importExports = resolved.exports;
+      }
+    } else if (cached.status === "in-progress") {
+      importExports = cached.partialExports;
+    } else {
+      if (!cached.result.result.ok) return { result: cached.result.result, exports };
+      importExports = cached.result.exports;
+    }
+    const importBindings: Record<string, Value> = {};
+    const pendingNames: string[] = [];
+    for (const name of imp.import) {
+      if (!importExports.has(name)) {
+        const cachedAgain = cache.get(imp.from);
+        if (cachedAgain !== undefined && cachedAgain.status === "in-progress") {
+          importBindings[name] = NULL;
+          pendingNames.push(name);
+          continue;
+        }
+        return {
+          result: evalErr("UNDEFINED_EXPORT", `module ${imp.from} does not export "${name}"`),
+          exports,
+        };
+      }
+      importBindings[name] = importExports.get(name) as Value;
+    }
+    env = env.extend(importBindings);
+    if (pendingNames.length > 0) {
+      const cachedAgain = cache.get(imp.from);
+      if (cachedAgain !== undefined && cachedAgain.status === "in-progress") {
+        for (const name of pendingNames) {
+          cachedAgain.deferred.push({ env, name });
+        }
+      }
+    }
+  }
+
+  const exportSet = new Set(module.exports ?? []);
+  let cur: Expr = module.main;
+  let curEnv: Env = env;
+
+  while (Array.isArray(cur) && cur.length === 3 && (cur[0] === "let" || cur[0] === "letrec")) {
+    const head = cur[0];
+    const bindings = cur[1];
+    const body = cur[2] as Expr;
+    if (!Array.isArray(bindings)) break;
+
+    if (head === "let") {
+      let stepEnv = curEnv;
+      for (const binding of bindings) {
+        if (!Array.isArray(binding) || binding.length !== 2) {
+          return { result: evaluate(cur, curEnv), exports };
+        }
+        const name = binding[0];
+        if (typeof name !== "string") {
+          return { result: evaluate(cur, curEnv), exports };
+        }
+        const r = evaluate(binding[1] as Expr, stepEnv);
+        if (!r.ok) return { result: r, exports };
+        stepEnv = stepEnv.extend({ [name]: r.value });
+        if (exportSet.has(name)) {
+          exports.set(name, r.value);
+          patchDeferred(name, r.value);
+        }
+      }
+      curEnv = stepEnv;
+    } else {
+      const placeholders: Record<string, Value> = {};
+      const names: string[] = [];
+      for (const binding of bindings) {
+        if (!Array.isArray(binding) || binding.length !== 2) {
+          return { result: evaluate(cur, curEnv), exports };
+        }
+        const name = binding[0];
+        if (typeof name !== "string") {
+          return { result: evaluate(cur, curEnv), exports };
+        }
+        names.push(name);
+        placeholders[name] = NULL;
+      }
+      const recEnv = curEnv.extend(placeholders);
+      for (let i = 0; i < bindings.length; i++) {
+        const binding = bindings[i] as Expr[];
+        const r = evaluate(binding[1] as Expr, recEnv);
+        if (!r.ok) return { result: r, exports };
+        const name = names[i] as string;
+        recEnv.set(name, r.value);
+        if (exportSet.has(name)) {
+          exports.set(name, r.value);
+          patchDeferred(name, r.value);
+        }
+      }
+      curEnv = recEnv;
+    }
+    cur = body;
+  }
+
+  const result = evaluate(cur, curEnv);
+  for (const patch of selfDeferred) {
+    const v = exports.get(patch.name);
+    if (v !== undefined) patch.env.set(patch.name, v);
+  }
+  modCache.set(module, { status: "done", result: { result, exports } });
+  return { result, exports };
+}
