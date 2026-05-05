@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { browserResolver, networkResolver } from "./presets.ts";
+import { browserResolver, networkResolverAsync } from "./presets.ts";
 
 // --- browserResolver ---
 
@@ -36,17 +36,17 @@ describe("browserResolver", () => {
   });
 });
 
-// --- networkResolver ---
+// --- networkResolverAsync ---
 
-describe("networkResolver", () => {
+describe("networkResolverAsync", () => {
   it("resolves 'lib:std' synchronously (no await needed for cached)", async () => {
-    const result = await networkResolver("lib:std");
+    const result = await networkResolverAsync("lib:std");
     expect(result).not.toBeNull();
     expect(typeof result).toBe("object");
   });
 
-  it("lib:std resolved via networkResolver has expected exports", async () => {
-    const result = await networkResolver("lib:std");
+  it("lib:std resolved via networkResolverAsync has expected exports", async () => {
+    const result = await networkResolverAsync("lib:std");
     expect(result).not.toBeNull();
     const exports = result!.exports ?? [];
     expect(exports).toContain("map");
@@ -55,14 +55,14 @@ describe("networkResolver", () => {
   });
 
   it("returns null for 'unknown:...' protocol", async () => {
-    expect(await networkResolver("unknown:something")).toBeNull();
+    expect(await networkResolverAsync("unknown:something")).toBeNull();
   });
 
   it("returns null for paths without a colon", async () => {
-    expect(await networkResolver("nostd")).toBeNull();
+    expect(await networkResolverAsync("nostd")).toBeNull();
   });
 
   it("returns null for 'local:./foo' (not handled)", async () => {
-    expect(await networkResolver("local:./foo")).toBeNull();
+    expect(await networkResolverAsync("local:./foo")).toBeNull();
   });
 });

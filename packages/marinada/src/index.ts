@@ -46,7 +46,7 @@ export type { Resolver, AsyncResolver, MaybePromise } from "./resolvers.ts";
  *
  * - `browserResolver` — sync, lib:std only. For bundled apps with compile-time
  *   known modules. Compose with `mapResolver()` to add more.
- * - `networkResolver` — async, lib:std + https:/http: fetch. For dynamic module
+ * - `networkResolverAsync` — async, lib:std + https:/http: fetch. For dynamic module
  *   loading. Use with `evaluateModuleAsync()`.
  *
  * Node/Bun consumers: import from `./node-preset.ts` directly to get
@@ -54,4 +54,4 @@ export type { Resolver, AsyncResolver, MaybePromise } from "./resolvers.ts";
  * intentionally not re-exported here to prevent `node:fs` from being pulled
  * into browser bundles.
  */
-export { browserResolver, networkResolver } from "./presets.ts";
+export { browserResolver, networkResolverAsync } from "./presets.ts";

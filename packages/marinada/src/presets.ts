@@ -21,7 +21,7 @@ export const browserResolver: Resolver = protocolResolver({
  * Use with evaluateModuleAsync().
  * Suitable for dynamic module loading in browser or server environments.
  */
-export const networkResolver: AsyncResolver = asyncProtocolResolver({
+export const networkResolverAsync: AsyncResolver = asyncProtocolResolver({
   lib: libStdResolver,
   https: cacheAsyncResolver(httpResolver),
   http: cacheAsyncResolver(httpResolver),
