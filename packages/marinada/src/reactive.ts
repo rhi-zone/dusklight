@@ -1,6 +1,10 @@
 import { computed } from "@rhi-zone/rainbow";
 import type { ReadonlySignal } from "@rhi-zone/rainbow";
 import type { Expr } from "./types.ts";
+import type { Value } from "./value.ts";
+import { NULL, bool } from "./value.ts";
+import { EMPTY_ENV } from "./env.ts";
+import { evaluate } from "./evaluate.ts";
 import { compile } from "./jit.ts";
 
 /**
@@ -18,17 +22,16 @@ export type ReactiveFn = (env: ReactiveEnv) => ReadonlySignal<unknown>;
 /**
  * Compile a Marinada expression to a reactive function.
  *
- * The JIT is run once at compile time. At call time, a Proxy env is passed to
- * the compiled function so that every env variable read inside it calls
- * signal.get() — auto-tracked by rainbow's computed(). Dynamic deps (e.g.
- * conditionally read variables) are updated on each re-evaluation, same as
- * Vue's computed model.
+ * Pure expressions: the JIT compiles once; a Proxy env auto-tracks exactly
+ * which signals are read on each evaluation (dynamic deps, Vue-style).
  *
- * Expressions containing `perform` or `handle` still throw CompileError —
- * effect-aware reactive compilation is Phase 2.
+ * Effectful expressions (perform/handle): the interpreter runs on each
+ * re-evaluation with a snapshot of all env signals. Over-tracking is
+ * intentional — free-variable analysis for precision is a future optimisation.
  */
 export function compileReactive(expr: Expr): ReactiveFn {
-  const jitFn = compile(expr); // throws CompileError for perform/handle
+  if (containsEffects(expr)) return compileEffectful(expr);
+  const jitFn = compile(expr);
   return (env: ReactiveEnv) =>
     computed(() => {
       const proxy = new Proxy({} as Record<string, unknown>, {
@@ -38,4 +41,83 @@ export function compileReactive(expr: Expr): ReactiveFn {
       });
       return jitFn(proxy);
     });
+}
+
+// ---------------------------------------------------------------------------
+// Effect detection
+// ---------------------------------------------------------------------------
+
+function containsEffects(expr: Expr): boolean {
+  if (!Array.isArray(expr) || expr.length === 0) return false;
+  const op = expr[0];
+  if (op === "perform" || op === "handle") return true;
+  return expr.slice(1).some((e) => containsEffects(e as Expr));
+}
+
+// ---------------------------------------------------------------------------
+// Effectful path — interpreter with snapshot env
+// ---------------------------------------------------------------------------
+
+function compileEffectful(expr: Expr): ReactiveFn {
+  return (env: ReactiveEnv) =>
+    computed(() => {
+      // Read all env signals inside computed — auto-tracked as deps.
+      // Over-tracks (re-runs when any env signal changes), but correct.
+      const snapshot: Record<string, Value> = {};
+      for (const [key, sig] of Object.entries(env)) {
+        snapshot[key] = jsToValue(sig.get());
+      }
+      const interpEnv = EMPTY_ENV.extend(snapshot);
+      const result = evaluate(expr, interpEnv);
+      if (!result.ok) {
+        throw new Error(`[${result.error.code}] ${result.error.message}`);
+      }
+      return valueToJs(result.value);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// JS ↔ Marinada Value conversion
+// ---------------------------------------------------------------------------
+
+function jsToValue(v: unknown): Value {
+  if (v === null || v === undefined) return NULL;
+  if (typeof v === "boolean") return bool(v);
+  if (typeof v === "bigint") return { kind: "int", value: v };
+  if (typeof v === "number") return { kind: "float", value: v };
+  if (typeof v === "string") return { kind: "string", value: v };
+  if (v instanceof Uint8Array) return { kind: "bytes", value: v };
+  if (Array.isArray(v)) return { kind: "array", value: v.map(jsToValue) };
+  if (typeof v === "object") {
+    return {
+      kind: "record",
+      value: new Map(
+        Object.entries(v as Record<string, unknown>).map(([k, val]) => [k, jsToValue(val)]),
+      ),
+    };
+  }
+  throw new Error(`jsToValue: cannot convert ${typeof v}`);
+}
+
+function valueToJs(v: Value): unknown {
+  switch (v.kind) {
+    case "null":
+      return null;
+    case "bool":
+      return v.value;
+    case "int":
+      return v.value;
+    case "float":
+      return v.value;
+    case "string":
+      return v.value;
+    case "bytes":
+      return v.value;
+    case "array":
+      return v.value.map(valueToJs);
+    case "record":
+      return Object.fromEntries([...v.value.entries()].map(([k, val]) => [k, valueToJs(val)]));
+    default:
+      return v; // fn, variant, cap, continuation — pass through opaque
+  }
 }

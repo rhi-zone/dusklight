@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "bun:test";
 import { signal } from "@rhi-zone/rainbow";
 import { compileReactive } from "./reactive.ts";
 import { CompileError } from "./jit.ts";
+import type { Expr } from "./types.ts";
 
 describe("compileReactive", () => {
   it("constant expression: no deps, static value", () => {
@@ -98,18 +99,81 @@ describe("compileReactive", () => {
     expect(out.get()).toBe("bye world");
   });
 
-  it("perform throws CompileError", () => {
-    expect(() => compileReactive(["perform", "IO", "x"])).toThrow(CompileError);
-  });
-
-  it("handle throws CompileError", () => {
+  it("perform/handle: no longer throws — interpreter fallback", () => {
     expect(() =>
       compileReactive([
         "handle",
-        ["perform", "IO", 0],
-        [["IO", "v", "k"], "v"],
+        ["perform", "Id", 42],
+        [["Id", "v", "k"], "v"],
         [["return", "x"], "x"],
       ]),
-    ).toThrow(CompileError);
+    ).not.toThrow();
+  });
+});
+
+describe("compileReactive (effectful — interpreter path)", () => {
+  it("basic handle/perform: handler aborts with payload", () => {
+    const expr: Expr = [
+      "handle",
+      ["perform", "Greeting", 42],
+      [["Greeting", "msg", "k"], "msg"],
+      [["return", "x"], "x"],
+    ];
+    const fn = compileReactive(expr);
+    const out = fn({});
+    expect(out.get()).toBe(42n);
+  });
+
+  it("handle/perform with env signal as payload", () => {
+    const x = signal<unknown>(5n);
+    const expr: Expr = [
+      "handle",
+      ["perform", "Double", "x"],
+      [
+        ["Double", "v", "k"],
+        ["call", "k", ["*", "v", 2]],
+      ],
+      [["return", "r"], "r"],
+    ];
+    const fn = compileReactive(expr);
+    const out = fn({ x });
+    expect(out.get()).toBe(10n);
+    x.set(7n);
+    expect(out.get()).toBe(14n);
+  });
+
+  it("reactive: subscriber notified on env change", () => {
+    const n = signal<unknown>(3n);
+    const expr: Expr = [
+      "handle",
+      ["perform", "Id", "n"],
+      [
+        ["Id", "v", "k"],
+        ["call", "k", "v"],
+      ],
+      [["return", "r"], "r"],
+    ];
+    const fn = compileReactive(expr);
+    const out = fn({ n });
+    const cb = vi.fn();
+    out.subscribe(cb);
+    n.set(9n);
+    expect(cb).toHaveBeenCalledWith(9n);
+  });
+
+  it("unhandled effect: throws on .get()", () => {
+    const expr: Expr = ["perform", "Unhandled", 0];
+    const fn = compileReactive(expr);
+    const out = fn({});
+    expect(() => out.get()).toThrow("UNHANDLED_EFFECT");
+  });
+
+  it("fn with effect in body: routes to interpreter, returns function value", () => {
+    // JIT can't compile perform anywhere — containsEffects is conservative
+    const expr: Expr = ["fn", ["x"], ["perform", "IO", "x"]];
+    expect(() => compileReactive(expr)).not.toThrow();
+    const fn = compileReactive(expr);
+    const out = fn({});
+    expect(out.get()).toBeDefined();
   });
 });
