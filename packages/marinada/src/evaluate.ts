@@ -1233,6 +1233,14 @@ function* evalGen(expr: Expr, env: Env): EvalGen {
     // --- Match ---
     case "match": {
       // ["match", expr, [["Tag", "b1", ...], body], ...]
+      // Pattern tag can be:
+      //   - string: variant tag (when scrutinee is a variant), or string/null/bool literal otherwise
+      //     - "null" matches { kind: "null" }
+      //     - "true" / "false" matches { kind: "bool", value: true/false }
+      //     - any other string matches { kind: "string", value: tag }
+      //   - number (JS number): matches { kind: "int", value: BigInt(tag) } or { kind: "float", value: tag }
+      //   - boolean: matches { kind: "bool", value: tag }
+      //   - null: matches { kind: "null" }
       if (arr.length < 3) return err("ARITY_ERROR", [], "match requires at least 2 args");
       const scrutR = prependPath(yield* evalGen(at(arr, 1), env), 1);
       if (!scrutR.ok) return scrutR;
@@ -1249,36 +1257,82 @@ function* evalGen(expr: Expr, env: Env): EvalGen {
           return err("TYPE_ERROR", [i, 0], "match pattern must be an array starting with a tag");
         }
         const tag = pattern[0];
-        if (typeof tag !== "string") {
-          return err("TYPE_ERROR", [i, 0], "match pattern tag must be a string");
-        }
-        // Check if scrutinee matches this pattern
-        if (scrutVal.kind !== "variant" || scrutVal.tag !== tag) continue;
-        // Check field count
-        const bindingNames = pattern.slice(1);
-        if (bindingNames.length !== scrutVal.fields.length) {
-          return err(
-            "ARITY_ERROR",
-            [i, 0],
-            "pattern " +
-              tag +
-              " expects " +
-              String(bindingNames.length) +
-              " bindings, variant has " +
-              String(scrutVal.fields.length) +
-              " fields",
-          );
-        }
-        // Bind fields
-        const bindings: Record<string, Value> = {};
-        for (let j = 0; j < bindingNames.length; j++) {
-          const bName = bindingNames[j];
-          if (typeof bName !== "string") {
-            return err("TYPE_ERROR", [i, 0, j + 1], "match binding name must be a string");
+
+        if (scrutVal.kind === "variant") {
+          // Variant matching: tag must be a string identifier
+          if (typeof tag !== "string") {
+            return err(
+              "TYPE_ERROR",
+              [i, 0],
+              "match pattern tag must be a string for variant scrutinee",
+            );
           }
-          bindings[bName] = scrutVal.fields[j] as Value;
+          if (scrutVal.tag !== tag) continue;
+          // Check field count
+          const bindingNames = pattern.slice(1);
+          if (bindingNames.length !== scrutVal.fields.length) {
+            return err(
+              "ARITY_ERROR",
+              [i, 0],
+              "pattern " +
+                tag +
+                " expects " +
+                String(bindingNames.length) +
+                " bindings, variant has " +
+                String(scrutVal.fields.length) +
+                " fields",
+            );
+          }
+          // Bind fields
+          const bindings: Record<string, Value> = {};
+          for (let j = 0; j < bindingNames.length; j++) {
+            const bName = bindingNames[j];
+            if (typeof bName !== "string") {
+              return err("TYPE_ERROR", [i, 0, j + 1], "match binding name must be a string");
+            }
+            bindings[bName] = scrutVal.fields[j] as Value;
+          }
+          return prependPath(yield* evalGen(body, env.extend(bindings)), i);
+        } else {
+          // Literal matching: compare tag against scrutinee value
+          let matched = false;
+          if (tag === null) {
+            matched = scrutVal.kind === "null";
+          } else if (typeof tag === "boolean") {
+            matched = scrutVal.kind === "bool" && scrutVal.value === tag;
+          } else if (typeof tag === "number") {
+            if (scrutVal.kind === "int") {
+              matched = scrutVal.value === BigInt(tag);
+            } else if (scrutVal.kind === "float") {
+              matched = scrutVal.value === tag;
+            }
+          } else {
+            // string tag
+            if (tag === "null") {
+              matched = scrutVal.kind === "null";
+            } else if (tag === "true") {
+              matched = scrutVal.kind === "bool" && scrutVal.value === true;
+            } else if (tag === "false") {
+              matched = scrutVal.kind === "bool" && scrutVal.value === false;
+            } else {
+              matched = scrutVal.kind === "string" && scrutVal.value === tag;
+            }
+          }
+          if (!matched) continue;
+          // Literal patterns support an optional single binding for the scrutinee value
+          const bindingNames = pattern.slice(1);
+          if (bindingNames.length > 1) {
+            return err("ARITY_ERROR", [i, 0], "literal pattern can have at most one binding");
+          }
+          if (bindingNames.length === 1) {
+            const bName = bindingNames[0];
+            if (typeof bName !== "string") {
+              return err("TYPE_ERROR", [i, 0, 1], "match binding name must be a string");
+            }
+            return prependPath(yield* evalGen(body, env.extend({ [bName]: scrutVal })), i);
+          }
+          return prependPath(yield* evalGen(body, env), i);
         }
-        return prependPath(yield* evalGen(body, env.extend(bindings)), i);
       }
 
       // No pattern matched
