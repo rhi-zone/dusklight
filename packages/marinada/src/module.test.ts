@@ -117,26 +117,27 @@ describe("evaluateModule", () => {
     });
   });
 
-  it("does not error on unknown import scheme — imports typed as unknown", () => {
+  it("errors MODULE_NOT_FOUND on unknown import scheme without a resolver", () => {
     const module: Module = {
       imports: [
         { from: "local:./my-types.json", import: ["MyType"] },
         { from: "https://example.com/types.json", import: ["OtherType"] },
       ],
-      // main doesn't use the imports — just verify no crash
       main: 99,
     };
     const result = evaluateModule(module);
-    expect(result).toEqual({ ok: true, value: int(99) });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) expect(result.error.code).toBe("MODULE_NOT_FOUND");
   });
 
-  it("does not error on unknown lib: scheme", () => {
+  it("errors MODULE_NOT_FOUND on unknown lib: scheme without a resolver", () => {
     const module: Module = {
       imports: [{ from: "lib:matrix", import: ["MatrixEvent"] }],
       main: 0,
     };
     const result = evaluateModule(module);
-    expect(result).toEqual({ ok: true, value: int(0) });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) expect(result.error.code).toBe("MODULE_NOT_FOUND");
   });
 
   it("exports list is stored on the module and accessible", () => {
@@ -276,22 +277,28 @@ describe("typecheckModule", () => {
     });
   });
 
-  it("type-checks module with unknown import scheme — imports are unknown, no error", () => {
+  it("errors MODULE_NOT_FOUND on unknown import scheme without a resolver", () => {
     const module: Module = {
       imports: [{ from: "local:./foo.json", import: ["MyType"] }],
       main: 42,
     };
     const result = typecheckModule(module);
-    expect(result).toEqual({ ok: true, type: { kind: "int" } });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === "MODULE_NOT_FOUND")).toBe(true);
+    }
   });
 
-  it("type-checks module with https: import scheme — unknown, no error", () => {
+  it("errors MODULE_NOT_FOUND on https: import scheme without a resolver", () => {
     const module: Module = {
       imports: [{ from: "https://example.com/types.json", import: ["OtherType"] }],
       main: true,
     };
     const result = typecheckModule(module);
-    expect(result).toEqual({ ok: true, type: { kind: "bool" } });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) {
+      expect(result.errors.some((e) => e.code === "MODULE_NOT_FOUND")).toBe(true);
+    }
   });
 
   it("reports type error in main even with valid imports", () => {

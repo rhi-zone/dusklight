@@ -1,4 +1,4 @@
-import type { Expr } from "./types.ts";
+import type { Expr, Module } from "./types.ts";
 
 export type StdBinding = {
   name: string;
@@ -18,6 +18,11 @@ export const STD_BINDINGS: StdBinding[] = [
   { name: "flip", expr: ["fn", ["f"], ["fn", ["a", "b"], ["call", "f", "b", "a"]]] },
 
   // --- Option<T> = None | Some(T) ---
+  // Uppercase aliases — importers may list "None", "Some", "Ok", "Err" in
+  // their import list; these bindings satisfy UNDEFINED_EXPORT checks while
+  // the evaluator also handles them via the uppercase-tag convention.
+  { name: "None", expr: ["None"] },
+  { name: "Some", expr: ["fn", ["x"], ["Some", "x"]] },
   { name: "some", expr: ["fn", ["x"], ["Some", "x"]] },
   { name: "none", expr: ["None"] },
   {
@@ -82,6 +87,9 @@ export const STD_BINDINGS: StdBinding[] = [
   },
 
   // --- Result<T, E> = Ok(T) | Err(E) ---
+  // Uppercase aliases (see Option section above).
+  { name: "Ok", expr: ["fn", ["x"], ["Ok", "x"]] },
+  { name: "Err", expr: ["fn", ["e"], ["Err", "e"]] },
   { name: "ok", expr: ["fn", ["x"], ["Ok", "x"]] },
   { name: "err", expr: ["fn", ["e"], ["Err", "e"]] },
   {
@@ -476,3 +484,12 @@ export const STD_BINDINGS: StdBinding[] = [
 ];
 
 export const STD_EXPORT_NAMES: string[] = STD_BINDINGS.map((b) => b.name);
+
+/**
+ * lib:std as a Module — resolved by `defaultResolver` the same way as any
+ * other module. Exports all STD_BINDINGS via a top-level letrec.
+ */
+export const STD_MODULE: Module = {
+  exports: STD_EXPORT_NAMES,
+  main: ["letrec", STD_BINDINGS.map((b) => [b.name, b.expr]), null],
+};

@@ -1,4 +1,5 @@
 import type { Expr, Module, TypeDef } from "./types.ts";
+import { STD_MODULE } from "./std.ts";
 
 // ---------------------------------------------------------------------------
 // MType — Hindley-Milner monotypes plus a few non-HM extras carried through.
@@ -4026,11 +4027,18 @@ export function buildTypeInfo(expr: Expr, env?: TypeEnv): TypeInfo {
 }
 
 /**
- * Resolves a non-`lib:std` module import to a `Module`. Mirrors
- * `ModuleResolver` in `module.ts`; defined locally here to avoid an import
- * cycle between `typecheck.ts` and `module.ts`.
+ * Resolves a module import path to a `Module`. Mirrors `ModuleResolver` in
+ * `module.ts`; defined locally here to avoid an import cycle between
+ * `typecheck.ts` and `module.ts`. `lib:std` is handled automatically via
+ * `defaultResolver` — user resolvers do not need to handle it.
  */
 type TypecheckModuleResolver = (from: string) => Module | null;
+
+/** Built-in resolver for typecheck — handles lib:std. */
+function defaultResolver(path: string): Module | null {
+  if (path === "lib:std") return STD_MODULE;
+  return null;
+}
 
 export type TypecheckModuleOptions = {
   resolver?: TypecheckModuleResolver;
@@ -4102,23 +4110,22 @@ function typecheckModuleInternal(
     currentEffects: freshEffectsRow(state),
   };
 
-  // Build the import env by resolving each non-lib:std import via the
-  // optional resolver. lib:std types are pre-registered; lib:std value
-  // imports are exposed via STD_BINDINGS at evaluation time but the
-  // type-checker treats them as unknown (existing behavior). For other
-  // imports, when a resolver is supplied we recursively typecheck the
-  // resolved module and inject the requested names' types.
+  // Compose resolvers: defaultResolver first (handles lib:std without
+  // consulting the user resolver), then user resolver for everything else.
+  // MODULE_NOT_FOUND is emitted when neither resolver can resolve the path.
+  const resolve = (path: string): Module | null =>
+    defaultResolver(path) ?? opts?.resolver?.(path) ?? null;
+
+  // Build the import env by resolving each import via the composed resolver.
+  // When a resolver is supplied we recursively typecheck the resolved module
+  // and inject the requested names' types.
   let moduleEnv = EMPTY_TYPE_ENV;
   for (const imp of module.imports ?? []) {
-    if (imp.from === "lib:std") continue;
-    const resolver = opts?.resolver;
-    if (resolver === undefined) continue; // backward-compatible skip
-
     const cached = cache.get(imp.from);
     let importExports: Map<string, MType>;
     let importedExportNames: Set<string>;
     if (cached === undefined) {
-      const mod = resolver(imp.from);
+      const mod = resolve(imp.from);
       if (mod === null) {
         addError(ctx, "MODULE_NOT_FOUND", `module not found: ${imp.from}`, {
           got: imp.from,
@@ -4185,13 +4192,13 @@ function typecheckModuleInternal(
       importExports = cached.placeholders;
       importedExportNames = new Set(cached.exportNames);
       // Re-register the module's types so constructors are visible. We can
-      // call resolver again (host caches cheaply); this only affects DU
+      // call resolve again (host caches cheaply); this only affects DU
       // constructor visibility, not cycle handling.
-      const mod = resolver(imp.from);
+      const mod = resolve(imp.from);
       if (mod !== null) registerModuleTypeDefs(mod.types ?? [], typeDefs, ctors);
     } else {
       // Cached done.
-      const mod = resolver(imp.from);
+      const mod = resolve(imp.from);
       if (mod !== null) registerModuleTypeDefs(mod.types ?? [], typeDefs, ctors);
       if (!cached.result.ok) {
         addError(ctx, "MODULE_IMPORT_ERROR", `module ${imp.from} failed to typecheck`, {

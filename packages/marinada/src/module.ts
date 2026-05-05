@@ -6,17 +6,27 @@ import { NULL } from "./value.ts";
 import { Env } from "./env.ts";
 import { typecheckModule } from "./typecheck.ts";
 import type { TypecheckResult } from "./typecheck.ts";
-import { STD_BINDINGS } from "./std.ts";
+import { STD_MODULE } from "./std.ts";
 
 export type { EvalResult, TypecheckResult };
 
 /**
- * Resolves a non-`lib:std` module import to its `Module` definition. Returns
- * `null` when the host cannot resolve the given path. The resolver is called
+ * Resolves a module import path to its `Module` definition. Returns `null`
+ * when the resolver cannot resolve the given path. The resolver is called
  * lazily during `evaluateModule` / `typecheckModule` and is responsible for
  * any caching, IO, or scheme handling (`local:`, `https:`, custom `lib:`...).
  */
 export type ModuleResolver = (from: string) => Module | null;
+
+/**
+ * Built-in resolver that handles `lib:std`. Always composed into the resolver
+ * chain by `evaluateModule` and `typecheckModule`, so callers never need to
+ * handle `lib:std` themselves.
+ */
+export function defaultResolver(path: string): Module | null {
+  if (path === "lib:std") return STD_MODULE;
+  return null;
+}
 
 export type EvaluateModuleOptions = {
   resolver?: ModuleResolver;
@@ -102,29 +112,18 @@ function evaluateModuleExports(
       }
     }
   }
+  // Compose resolvers: defaultResolver first (handles lib:std without
+  // consulting the user resolver), then user resolver for everything else.
+  const resolve = (path: string): Module | null =>
+    defaultResolver(path) ?? opts?.resolver?.(path) ?? null;
+
   // Build the import env first.
   let env = EMPTY_ENV;
   for (const imp of module.imports ?? []) {
-    if (imp.from === "lib:std") {
-      const bindings: Record<string, Value> = {};
-      for (const name of imp.import) {
-        const binding = STD_BINDINGS.find((b) => b.name === name);
-        if (binding === undefined) continue;
-        const r = evaluate(binding.expr, EMPTY_ENV);
-        if (!r.ok) return { result: r, exports };
-        bindings[name] = r.value;
-      }
-      env = env.extend(bindings);
-      continue;
-    }
-
-    const resolver = opts?.resolver;
-    if (resolver === undefined) continue; // backward compat — silently skip
-
     let importExports: Map<string, Value>;
     const cached = cache.get(imp.from);
     if (cached === undefined) {
-      const mod = resolver(imp.from);
+      const mod = resolve(imp.from);
       if (mod === null) {
         return {
           result: evalErr("MODULE_NOT_FOUND", `module not found: ${imp.from}`),
@@ -277,15 +276,9 @@ function evaluateModuleExports(
 /**
  * Evaluate a full module.
  *
- * For `lib:std` imports, each requested binding is evaluated from its
- * STD_BINDINGS expression and added to the environment before evaluating
- * `module.main`.
- *
- * For other imports, an optional `resolver` is consulted. When provided,
- * resolver returns a `Module` (or `null` for not-found) and that module is
- * recursively evaluated; values for the imported names are extracted from
- * its exports. When no resolver is provided, non-`lib:std` imports are
- * silently skipped (backward-compatible behavior).
+ * All imports are resolved through `defaultResolver` (which handles `lib:std`)
+ * composed with the optional user-provided `resolver`. If neither can resolve
+ * an import, a `MODULE_NOT_FOUND` error is returned.
  *
  * Variant constructors (None, Some, Ok, Err, etc.) are handled automatically
  * by the evaluator's uppercase-tag convention — no env wiring required.
