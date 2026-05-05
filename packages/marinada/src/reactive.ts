@@ -8,7 +8,7 @@ import { NULL, bool } from "./value.ts";
 import { Env, EMPTY_ENV } from "./env.ts";
 import { evaluate, evalGen, callFnGen } from "./evaluate.ts";
 import type { EvalGen } from "./evaluate.ts";
-import { compile } from "./jit.ts";
+import { compile, compileEffectful as jitCompileEffectful } from "./jit.ts";
 import { freeVariables } from "./free-vars.ts";
 
 /**
@@ -84,11 +84,40 @@ export function containsAsyncEffect(expr: Expr): boolean {
 // ---------------------------------------------------------------------------
 
 function compileEffectful(expr: Expr): ReactiveFn {
+  // Attempt JIT compilation. Falls back to interpreter if the expression
+  // contains effects that the JIT can't handle (e.g. perform inside a fn body).
+  let jitFn: ReturnType<typeof jitCompileEffectful> | null = null;
+  try {
+    jitFn = jitCompileEffectful(expr);
+  } catch {
+    // JIT failed — fall back to interpreter path below.
+  }
+
   const freeVars = freeVariables(expr);
+
+  if (jitFn !== null) {
+    const capturedJitFn = jitFn;
+    return (env: ReactiveEnv) =>
+      computed(() => {
+        // Only snapshot the signals for variables that are actually free in the
+        // expression — precise dep tracking avoids spurious re-runs.
+        const snapshot: Record<string, unknown> = {};
+        for (const key of freeVars) {
+          const sig = env[key];
+          if (sig !== undefined) snapshot[key] = sig.get();
+        }
+        const gen = capturedJitFn(snapshot);
+        let step = gen.next();
+        while (!step.done) {
+          throw new Error(`[UNHANDLED_EFFECT] ${(step.value as { tag: string }).tag}`);
+        }
+        return step.value;
+      });
+  }
+
+  // Interpreter fallback for expressions the JIT cannot handle.
   return (env: ReactiveEnv) =>
     computed(() => {
-      // Only snapshot the signals for variables that are actually free in the
-      // expression — precise dep tracking avoids spurious re-runs.
       const snapshot: Record<string, Value> = {};
       for (const key of freeVars) {
         const sig = env[key];

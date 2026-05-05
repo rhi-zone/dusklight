@@ -963,6 +963,9 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
         ...fnCtx,
         path: childCtx(ctx, 2).path,
         loop: null,
+        // fn bodies are arrow functions — yield is invalid inside them.
+        inGenerator: false,
+        continuationVars: new Set(),
       });
       return {
         t: "arrow",
