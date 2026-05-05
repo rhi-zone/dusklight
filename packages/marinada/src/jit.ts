@@ -373,7 +373,8 @@ export type JSExpr =
   | { t: "new"; ctor: JSExpr; args: JSExpr[] }
   | { t: "unary"; op: string; expr: JSExpr; prefix?: boolean }
   | { t: "binary"; op: string; left: JSExpr; right: JSExpr }
-  | { t: "yield"; expr: JSExpr };
+  | { t: "yield"; expr: JSExpr }
+  | { t: "yield-star"; expr: JSExpr };
 
 export type JSStmt =
   | { t: "expr"; expr: JSExpr }
@@ -416,6 +417,7 @@ const J = {
   }),
   rtCall: (method: string, args: JSExpr[]): JSExpr => J.call(J.rt(method), args),
   yield: (expr: JSExpr): JSExpr => ({ t: "yield", expr }),
+  yieldStar: (expr: JSExpr): JSExpr => ({ t: "yield-star", expr }),
   object: (props: [string, JSExpr][]): JSExpr => ({ t: "object", props }),
 };
 
@@ -482,6 +484,7 @@ function precedence(e: JSExpr): number {
     case "arrow":
       return 10;
     case "yield":
+    case "yield-star":
       return 5;
     case "seq":
       return 1;
@@ -546,6 +549,8 @@ export function serializeExpr(e: JSExpr): string {
     }
     case "yield":
       return `(yield ${paren(e.expr, 2)})`;
+    case "yield-star":
+      return `(yield* ${paren(e.expr, 2)})`;
   }
 }
 
@@ -728,6 +733,8 @@ type CompileCtx = {
   loopCounter: { n: number };
   /** When true, yield expressions are valid (we're inside a generator function). */
   inGenerator: boolean;
+  /** JS identifiers that hold continuation generators — calls to these emit `yield*`. */
+  continuationVars: Set<string>;
 };
 
 function emptyCtx(): CompileCtx {
@@ -737,6 +744,7 @@ function emptyCtx(): CompileCtx {
     loop: null,
     loopCounter: { n: 0 },
     inGenerator: false,
+    continuationVars: new Set(),
   };
 }
 
@@ -966,6 +974,15 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
     case "call": {
       const fnE = arg(1);
       const argEs = arr.slice(2).map((e, i) => compileExpr(e, childCtx(ctx, i + 2)));
+      // If calling a known continuation variable inside a generator, delegate with yield*.
+      const callee = arr[1];
+      if (
+        ctx.inGenerator &&
+        typeof callee === "string" &&
+        ctx.continuationVars.has(ctx.scope.resolve(callee) ?? "")
+      ) {
+        return J.yieldStar(J.call(fnE, argEs));
+      }
       return J.call(fnE, argEs);
     }
 
@@ -1216,8 +1233,140 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
         ]),
       );
     }
-    case "handle":
-      throw new CompileError("handle cannot be compiled (use interpreter for effects)", ctx.path);
+    case "handle": {
+      if (!ctx.inGenerator) {
+        throw new CompileError("handle cannot be compiled (use interpreter for effects)", ctx.path);
+      }
+      // ["handle", body, clause1, clause2, ..., returnClause?]
+      // Effect clause: [["EffectTag", "payloadVar", "kVar"], handlerBody]
+      // Return clause: [["return", "resultVar"], returnBody]
+      if (arr.length < 2) {
+        throw new CompileError("handle requires at least 1 arg", ctx.path);
+      }
+
+      type EffectClause = { tag: string; payloadJs: string; kJs: string; body: Expr };
+      type ReturnClause = { bindingJs: string; body: Expr };
+
+      const handleCtx = { ...ctx, scope: ctx.scope.child() };
+      const effectClauses: EffectClause[] = [];
+      let returnClause: ReturnClause | null = null;
+
+      for (let i = 2; i < arr.length; i++) {
+        const clause = arr[i];
+        if (!Array.isArray(clause) || clause.length !== 2) {
+          throw new CompileError("handle clause must be [pattern, body]", [...ctx.path, i]);
+        }
+        const pattern = clause[0];
+        const clauseBody = clause[1] as Expr;
+        if (!Array.isArray(pattern) || pattern.length < 1) {
+          throw new CompileError("handle clause pattern must be an array", [...ctx.path, i, 0]);
+        }
+        const tag = pattern[0];
+        if (typeof tag !== "string") {
+          throw new CompileError("handle clause tag must be a string", [...ctx.path, i, 0]);
+        }
+        if (tag === "return") {
+          if (pattern.length !== 2 || typeof pattern[1] !== "string") {
+            throw new CompileError('return clause must be ["return", bindingName]', [
+              ...ctx.path,
+              i,
+              0,
+            ]);
+          }
+          const bindingJs = handleCtx.scope.bind(pattern[1] as string);
+          returnClause = { bindingJs, body: clauseBody };
+        } else {
+          if (
+            pattern.length !== 3 ||
+            typeof pattern[1] !== "string" ||
+            typeof pattern[2] !== "string"
+          ) {
+            throw new CompileError('effect clause must be ["Tag", payloadBinding, kBinding]', [
+              ...ctx.path,
+              i,
+              0,
+            ]);
+          }
+          const payloadJs = handleCtx.scope.bind(pattern[1] as string);
+          const kJs = handleCtx.scope.bind(pattern[2] as string);
+          effectClauses.push({ tag, payloadJs, kJs, body: clauseBody });
+        }
+      }
+
+      // Generate internal names
+      const genName = handleCtx.scope.gensym("_gen");
+      const dispatchName = handleCtx.scope.gensym("_dispatch");
+      const stepName = handleCtx.scope.gensym("_step");
+      const effName = handleCtx.scope.gensym("_eff");
+      const resumeName = handleCtx.scope.gensym("_resume");
+
+      // Compile body with inGenerator: true
+      const bodyIr = compileExpr(arr[1] as Expr, { ...handleCtx, path: childCtx(ctx, 1).path });
+      const bodySrc = serializeExpr(bodyIr);
+
+      // Build continuation vars set for handler bodies (they can call k)
+      const kNames = new Set(effectClauses.map((c) => c.kJs));
+      const handlerBodyCtx: CompileCtx = {
+        ...handleCtx,
+        inGenerator: true,
+        continuationVars: new Set([...ctx.continuationVars, ...kNames]),
+      };
+
+      // Build _dispatch function body statements as JS source
+      // We build this as raw statements inside a function* body
+      const dispatchBodyStmts: string[] = [];
+
+      // while (!_step.done) { ... }
+      const whileBody: string[] = [];
+      whileBody.push(`const ${effName} = ${stepName}.value;`);
+
+      for (const clause of effectClauses) {
+        const { tag, payloadJs, kJs, body: handlerBody } = clause;
+        const handlerIr = compileExpr(handlerBody, {
+          ...handlerBodyCtx,
+          path: [...ctx.path, arr.indexOf(handlerBody)],
+        });
+        const handlerSrc = serializeExpr(handlerIr);
+        whileBody.push(
+          `if (${effName}.tag === ${JSON.stringify(tag)}) {` +
+            `const ${payloadJs} = ${effName}.payload;` +
+            `const ${kJs} = (_rv) => ${dispatchName}(${genName}.next(_rv));` +
+            `return yield* (function*() { return (${handlerSrc}); })();` +
+            `}`,
+        );
+      }
+      // Propagate unhandled effects
+      whileBody.push(
+        `const ${resumeName} = (yield ${effName});` +
+          `${stepName} = ${genName}.next(${resumeName});`,
+      );
+
+      dispatchBodyStmts.push(`while (!${stepName}.done) { ${whileBody.join(" ")} }`);
+
+      // Return clause (after while)
+      if (returnClause) {
+        const { bindingJs, body: retBody } = returnClause;
+        const retIr = compileExpr(retBody, { ...handlerBodyCtx, path: [...ctx.path] });
+        const retSrc = serializeExpr(retIr);
+        dispatchBodyStmts.push(
+          `const ${bindingJs} = ${stepName}.value;` +
+            `return yield* (function*() { return (${retSrc}); })();`,
+        );
+      } else {
+        dispatchBodyStmts.push(`return ${stepName}.value;`);
+      }
+
+      // Build the handle as a yield*-delegated generator IIFE.
+      // Must be a function* (not arrow) so that yield* and yield inside are valid.
+      const iifeSrc =
+        `(yield* (function*() {` +
+        `const ${genName} = (function*() { return (${bodySrc}); })();` +
+        `function* ${dispatchName}(${stepName}) { ${dispatchBodyStmts.join(" ")} }` +
+        `return yield* ${dispatchName}(${genName}.next());` +
+        `})())`;
+
+      return J.lit(iifeSrc);
+    }
 
     case "__native": {
       const name = arr[1];

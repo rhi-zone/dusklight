@@ -32,3 +32,92 @@ describe("compileEffectful — Phase 1: perform", () => {
     expect((step.value as any).payload).toBe(10n);
   });
 });
+
+describe("compileEffectful — Phase 2: handle", () => {
+  it("basic: handler aborts with payload (no resume)", () => {
+    const expr = [
+      "handle",
+      ["perform", "Greeting", 42],
+      [["Greeting", "msg", "k"], "msg"],
+      [["return", "x"], "x"],
+    ];
+    const fn = compileEffectful(expr);
+    const gen = fn({});
+    const step = gen.next();
+    expect(step.done).toBe(true);
+    expect(step.value).toBe(42n);
+  });
+
+  it("one-shot resume: handler calls k once", () => {
+    const expr = [
+      "handle",
+      ["+", ["perform", "Double", "x"], 1],
+      [
+        ["Double", "v", "k"],
+        ["call", "k", ["*", "v", 2]],
+      ],
+      [["return", "r"], "r"],
+    ];
+    const fn = compileEffectful(expr);
+    // x=5 → Double(5) → k(10) → 10+1=11
+    const gen = fn({ x: 5n });
+    const step = gen.next();
+    expect(step.done).toBe(true);
+    expect(step.value).toBe(11n);
+  });
+
+  it("multi-shot: handler calls k twice (Yield/sum pattern)", () => {
+    // Sum all yielded values via continuation
+    const expr = [
+      "handle",
+      ["do", ["perform", "Yield", 1], ["perform", "Yield", 2], ["perform", "Yield", 3]],
+      [
+        ["Yield", "v", "k"],
+        ["+", "v", ["call", "k", null]],
+      ],
+      [["return", "_"], 0],
+    ];
+    // 1 + (2 + (3 + 0)) = 6
+    const fn = compileEffectful(expr);
+    const gen = fn({});
+    const step = gen.next();
+    expect(step.done).toBe(true);
+    expect(step.value).toBe(6n);
+  });
+
+  it("unhandled effect propagates outward", () => {
+    const expr = [
+      "handle",
+      ["perform", "Unhandled", 0],
+      [["Other", "v", "k"], "v"],
+      [["return", "x"], "x"],
+    ];
+    const fn = compileEffectful(expr);
+    const gen = fn({});
+    const step = gen.next();
+    expect(step.done).toBe(false); // effect propagated
+    expect((step.value as any).tag).toBe("Unhandled");
+  });
+
+  it("nested handles", () => {
+    const expr = [
+      "handle",
+      [
+        "handle",
+        ["perform", "Inner", 1],
+        [
+          ["Inner", "v", "k"],
+          ["call", "k", ["+", "v", 10]],
+        ],
+        [["return", "x"], "x"],
+      ],
+      [["Outer", "v", "k"], "v"],
+      [["return", "x"], "x"],
+    ];
+    const fn = compileEffectful(expr);
+    const gen = fn({});
+    const step = gen.next();
+    expect(step.done).toBe(true);
+    expect(step.value).toBe(11n);
+  });
+});
