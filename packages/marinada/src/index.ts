@@ -18,3 +18,11 @@ export type { RewriteRule } from "./optimizer.ts";
 export { compileReactive } from "./reactive.ts";
 export type { ReactiveEnv, ReactiveSignal, ReactiveFn } from "./reactive.ts";
 export { freeVariables } from "./free-vars.ts";
+export {
+  protocolResolver,
+  mapResolver,
+  cacheResolver,
+  composeResolvers,
+  libStdResolver,
+} from "./resolvers.ts";
+export type { Resolver } from "./resolvers.ts";

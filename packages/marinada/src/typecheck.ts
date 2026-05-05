@@ -1,5 +1,5 @@
 import type { Expr, Module, TypeDef } from "./types.ts";
-import { STD_MODULE } from "./std.ts";
+import { libStdResolver } from "./resolvers.ts";
 
 // ---------------------------------------------------------------------------
 // MType — Hindley-Milner monotypes plus a few non-HM extras carried through.
@@ -4034,12 +4034,6 @@ export function buildTypeInfo(expr: Expr, env?: TypeEnv): TypeInfo {
  */
 type TypecheckModuleResolver = (from: string) => Module | null;
 
-/** Built-in resolver for typecheck — handles lib:std. */
-function defaultResolver(path: string): Module | null {
-  if (path === "lib:std") return STD_MODULE;
-  return null;
-}
-
 export type TypecheckModuleOptions = {
   resolver?: TypecheckModuleResolver;
 };
@@ -4386,7 +4380,7 @@ function typecheckModuleInternal(
 export function typecheckModule(module: Module, opts?: TypecheckModuleOptions): TypecheckResult {
   // User resolver takes priority; defaultResolver (lib:std) is the fallback.
   const resolve = (path: string): Module | null =>
-    opts?.resolver?.(path) ?? defaultResolver(path) ?? null;
+    opts?.resolver?.(path) ?? libStdResolver(path) ?? null;
   return typecheckModuleInternal(module, resolve, new Map(), new State());
 }
 

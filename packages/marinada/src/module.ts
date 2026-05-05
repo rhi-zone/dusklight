@@ -6,7 +6,7 @@ import { NULL } from "./value.ts";
 import { Env } from "./env.ts";
 import { typecheckModule } from "./typecheck.ts";
 import type { TypecheckResult } from "./typecheck.ts";
-import { STD_MODULE } from "./std.ts";
+import { libStdResolver } from "./resolvers.ts";
 
 export type { EvalResult, TypecheckResult };
 
@@ -17,16 +17,6 @@ export type { EvalResult, TypecheckResult };
  * any caching, IO, or scheme handling (`local:`, `https:`, custom `lib:`...).
  */
 export type ModuleResolver = (from: string) => Module | null;
-
-/**
- * Built-in resolver that handles `lib:std`. Always composed into the resolver
- * chain by `evaluateModule` and `typecheckModule`, so callers never need to
- * handle `lib:std` themselves.
- */
-export function defaultResolver(path: string): Module | null {
-  if (path === "lib:std") return STD_MODULE;
-  return null;
-}
 
 export type EvaluateModuleOptions = {
   resolver?: ModuleResolver;
@@ -305,7 +295,7 @@ function checkDeferredCycles(
 export function evaluateModule(module: Module, opts?: EvaluateModuleOptions): EvalResult {
   // User resolver takes priority; defaultResolver (lib:std) is the fallback.
   const resolve = (path: string): Module | null =>
-    opts?.resolver?.(path) ?? defaultResolver(path) ?? null;
+    opts?.resolver?.(path) ?? libStdResolver(path) ?? null;
   const cache = new Map<string, EvalCacheEntry>();
   const modCache = new Map<Module, EvalCacheEntry>();
   // After the evaluation completes, check whether any in-progress deferred
