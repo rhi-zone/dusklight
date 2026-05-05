@@ -102,6 +102,7 @@ Rules of thumb:
 - Codebase-wide analysis (architecture, patterns, cross-file survey) → always subagent
 - Mechanical work across many files (applying the same change everywhere) → parallel subagents
 - Single targeted lookup (one file, one symbol) → inline is fine
+- **Implementation with >2 files or likely type/lint errors → subagent.** Read-edit-typecheck-fix cycles generate enormous inline noise. Delegate; get back a summary and commit hash, not raw tool output.
 
 ## Commit Convention
 
