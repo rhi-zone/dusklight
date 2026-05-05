@@ -8,6 +8,7 @@ import {
   fuseLoops,
 } from "./optimizer.ts";
 import type { TypeInfo } from "./typecheck.ts";
+import type { Effect } from "./evaluate.ts";
 
 // A compiled Marinada expression.
 // Takes an env (variable bindings) and returns a JS-native value.
@@ -371,7 +372,8 @@ export type JSExpr =
   | { t: "object"; props: [string, JSExpr][] }
   | { t: "new"; ctor: JSExpr; args: JSExpr[] }
   | { t: "unary"; op: string; expr: JSExpr; prefix?: boolean }
-  | { t: "binary"; op: string; left: JSExpr; right: JSExpr };
+  | { t: "binary"; op: string; left: JSExpr; right: JSExpr }
+  | { t: "yield"; expr: JSExpr };
 
 export type JSStmt =
   | { t: "expr"; expr: JSExpr }
@@ -413,6 +415,8 @@ const J = {
     prop: method,
   }),
   rtCall: (method: string, args: JSExpr[]): JSExpr => J.call(J.rt(method), args),
+  yield: (expr: JSExpr): JSExpr => ({ t: "yield", expr }),
+  object: (props: [string, JSExpr][]): JSExpr => ({ t: "object", props }),
 };
 
 // --- Serializer ---
@@ -477,6 +481,8 @@ function precedence(e: JSExpr): number {
       return 10;
     case "arrow":
       return 10;
+    case "yield":
+      return 5;
     case "seq":
       return 1;
   }
@@ -538,6 +544,8 @@ export function serializeExpr(e: JSExpr): string {
       const p = precedence(e);
       return `${paren(e.left, p)} ${e.op} ${paren(e.right, p + 1)}`;
     }
+    case "yield":
+      return `(yield ${paren(e.expr, 2)})`;
   }
 }
 
@@ -718,6 +726,8 @@ type CompileCtx = {
   loop: { params: string[]; label: string } | null;
   /** Counter for generating unique loop labels. */
   loopCounter: { n: number };
+  /** When true, yield expressions are valid (we're inside a generator function). */
+  inGenerator: boolean;
 };
 
 function emptyCtx(): CompileCtx {
@@ -726,6 +736,7 @@ function emptyCtx(): CompileCtx {
     scope: new Scope(null, new Set()),
     loop: null,
     loopCounter: { n: 0 },
+    inGenerator: false,
   };
 }
 
@@ -1185,8 +1196,26 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
       return J.rtCall("_asCheck", [J.lit(JSON.stringify(typStr)), arg(2)]);
     }
 
-    case "perform":
-      throw new CompileError("perform cannot be compiled (use interpreter for effects)", ctx.path);
+    case "perform": {
+      if (!ctx.inGenerator) {
+        throw new CompileError(
+          "perform cannot be compiled (use interpreter for effects)",
+          ctx.path,
+        );
+      }
+      // ["perform", tag, payload]
+      const tag = arr[1];
+      if (typeof tag !== "string") {
+        throw new CompileError("perform tag must be a string literal", ctx.path);
+      }
+      const payloadExpr = compileExpr(arr[2] as Expr, childCtx(ctx, 2));
+      return J.yield(
+        J.object([
+          ["tag", J.lit(JSON.stringify(tag))],
+          ["payload", payloadExpr],
+        ]),
+      );
+    }
     case "handle":
       throw new CompileError("handle cannot be compiled (use interpreter for effects)", ctx.path);
 
@@ -1584,6 +1613,31 @@ export function compileToSource(expr: Expr, opts: CompileOptions = {}): string {
 export function compile(expr: Expr, opts: CompileOptions = {}): JitFn {
   const e = opts.optimize === false ? expr : runOptimizer(expr, opts.typeInfo);
   return compileRaw(e);
+}
+
+// A compiled effectful Marinada expression.
+// Takes an env and returns a generator that yields Effects and returns a value.
+export type JitEffectfulFn = (env: Record<string, unknown>) => Generator<Effect, unknown, unknown>;
+
+/** Internal: compile an already-prepared effectful expression (no optimization step). */
+function compileEffectfulRaw(expr: Expr): JitEffectfulFn {
+  const ir = compileExpr(expr, { ...emptyCtx(), inGenerator: true });
+  const src = serializeExpr(ir);
+  // Wrap in function* so yield nodes inside the expression are valid.
+  // eslint-disable-next-line no-new-func
+  const raw = new Function("env", "_rt", "_nat", `return (function*() { return (${src}); })();`);
+  return (env: Record<string, unknown>) =>
+    raw(env, RUNTIME, NATIVES) as Generator<Effect, unknown, unknown>;
+}
+
+/** Compile a Marinada expression containing effects to a generator-based function.
+ * The generator yields Effect objects upward and receives resume values, identical
+ * to the interpreter's evalGen protocol.
+ *
+ * Unlike compile(), this does NOT throw on perform/handle — those are handled
+ * in the generator protocol. */
+export function compileEffectful(expr: Expr, opts: CompileOptions = {}): JitEffectfulFn {
+  return compileEffectfulRaw(opts.optimize === false ? expr : runOptimizer(expr, opts.typeInfo));
 }
 
 /** Compile with constant folding explicitly enabled. Identical to `compile()` default;

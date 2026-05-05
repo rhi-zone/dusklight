@@ -5,8 +5,14 @@ export { evaluate } from "./evaluate.ts";
 export { evaluateModule, evaluateModuleRaw, typecheckModule } from "./module.ts";
 export { typecheckModuleRaw } from "./typecheck.ts";
 export type { ModuleResolver, EvaluateModuleOptions, TypecheckModuleOptions } from "./module.ts";
-export { compile, compileOptimized, compileToSource, CompileError } from "./jit.ts";
-export type { JitFn, CompileOptions } from "./jit.ts";
+export {
+  compile,
+  compileOptimized,
+  compileToSource,
+  compileEffectful,
+  CompileError,
+} from "./jit.ts";
+export type { JitFn, JitEffectfulFn, CompileOptions } from "./jit.ts";
 export { optimize, CONSTANT_FOLDING_RULES } from "./optimizer.ts";
 export type { RewriteRule } from "./optimizer.ts";
 export { compileReactive } from "./reactive.ts";
