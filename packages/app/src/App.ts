@@ -9,10 +9,16 @@ import { reactiveLensFromSignal } from "./reactive.ts";
 const S = {
   app: "font-family: system-ui, sans-serif; padding: 16px; background: #1e1e1e; min-height: 100vh; color: #d4d4d4",
   h1: "margin: 0 0 8px; font-size: 18px; color: #569cd6; font-weight: 600",
-  loaderRow: "display: flex; gap: 8px; align-items: center; margin-bottom: 16px",
+  loaderRow: "display: flex; gap: 8px; align-items: center; margin-bottom: 8px",
   loaderLabel: "font-size: 13px; color: #808080",
   demoBtn:
     "padding: 4px 12px; background: #2d2d2d; color: #d4d4d4; border: 1px solid #3e3e3e; border-radius: 3px; cursor: pointer; font-size: 13px",
+  fetchRow: "display: flex; gap: 8px; align-items: center; margin-bottom: 16px",
+  urlInput:
+    "flex: 1; padding: 4px 8px; background: #2d2d2d; color: #d4d4d4; border: 1px solid #3e3e3e; border-radius: 3px; font-size: 13px",
+  fetchBtn:
+    "padding: 4px 12px; background: #2d2d2d; color: #d4d4d4; border: 1px solid #3e3e3e; border-radius: 3px; cursor: pointer; font-size: 13px",
+  fetchStatus: "font-size: 12px; color: #808080",
   rendererBar: "margin-bottom: 8px; font-size: 12px; color: #808080",
   rendererBtnActive:
     "margin-right: 4px; padding: 2px 8px; background: #569cd6; color: #d4d4d4; border: 1px solid #3e3e3e; border-radius: 3px; cursor: pointer; font-size: 12px",
@@ -28,6 +34,29 @@ const DEMOS = [
   { label: "String", data: "Hello, Dusklight!" },
 ];
 
+async function* fetchAsStream(url: string): AsyncIterable<Uint8Array> {
+  const resp = await fetch(url);
+  if (!resp.body) return;
+  const reader = resp.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      yield value;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function fetchFirstResult(pipeline: Pipeline, url: string): Promise<unknown | null> {
+  for await (const result of pipeline.parseStream(fetchAsStream(url), "application/json")) {
+    if (result.ok) return result.value;
+    throw new Error(result.error);
+  }
+  return null;
+}
+
 export function createApp(registry: PluginRegistry, container: HTMLElement): () => void {
   const pipeline = new Pipeline(registry);
   const data = signal<unknown | null>(null);
@@ -37,12 +66,15 @@ export function createApp(registry: PluginRegistry, container: HTMLElement): () 
     return d === null ? [] : pipeline.matchPatterns(d);
   });
 
-  const [appEl, cleanup] = withScope(() => buildApp(data, selectedRenderer, candidates, registry));
+  const [appEl, cleanup] = withScope(() =>
+    buildApp(pipeline, data, selectedRenderer, candidates, registry),
+  );
   container.appendChild(appEl.node);
   return cleanup;
 }
 
 function buildApp(
+  pipeline: Pipeline,
   data: Signal<unknown | null>,
   selectedRenderer: Signal<string | null>,
   candidates: ReadonlySignal<PatternResult[]>,
@@ -62,7 +94,33 @@ function buildApp(
     });
     loaderRow.node.append(btn.node);
   }
-  app.node.append(h1.node, loaderRow.node);
+  // URL fetch row
+  const fetchRow = html.div({ style: S.fetchRow });
+  const urlInput = html.input({ type: "text", placeholder: "https://...", style: S.urlInput });
+  const fetchBtn = html.button({ style: S.fetchBtn }, "Fetch");
+  const statusEl = html.span({ style: S.fetchStatus });
+  on(fetchBtn.node, "click", () => {
+    const url = (urlInput.node as HTMLInputElement).value.trim();
+    if (!url) return;
+    statusEl.node.textContent = "loading...";
+    fetchFirstResult(pipeline, url).then(
+      (result) => {
+        if (result !== null) {
+          data.set(result);
+          selectedRenderer.set(null);
+          statusEl.node.textContent = "";
+        } else {
+          statusEl.node.textContent = "no result";
+        }
+      },
+      (e: unknown) => {
+        statusEl.node.textContent = String(e);
+      },
+    );
+  });
+  fetchRow.node.append(urlInput.node, fetchBtn.node, statusEl.node);
+
+  app.node.append(h1.node, loaderRow.node, fetchRow.node);
 
   // Content slot — shown only when data !== null
   const contentSlot = html.div({});
