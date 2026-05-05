@@ -420,7 +420,7 @@ describe("evaluateModule with ModuleResolver", () => {
     expect(dCalls.length).toBe(1);
   });
 
-  it("never calls resolver for lib:std imports", () => {
+  it("user resolver is called first for lib:std; defaultResolver handles it when user returns null", () => {
     let called = false;
     const root: Module = {
       imports: [{ from: "lib:std", import: ["Some"] }],
@@ -429,10 +429,10 @@ describe("evaluateModule with ModuleResolver", () => {
     const result = evaluateModule(root, {
       resolver: () => {
         called = true;
-        return null;
+        return null; // defer to defaultResolver
       },
     });
-    expect(called).toBe(false);
+    expect(called).toBe(true); // user resolver is tried first
     expect(result).toEqual({ ok: true, value: variant("Some", int(1)) });
   });
 });

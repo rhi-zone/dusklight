@@ -81,7 +81,7 @@ function evalErr(code: string, message: string): EvalResult {
  */
 function evaluateModuleExports(
   module: Module,
-  opts: EvaluateModuleOptions | undefined,
+  resolve: (path: string) => Module | null,
   cache: Map<string, EvalCacheEntry>,
   modCache: Map<Module, EvalCacheEntry>,
   exports: Map<string, Value>,
@@ -112,10 +112,6 @@ function evaluateModuleExports(
       }
     }
   }
-  // Compose resolvers: defaultResolver first (handles lib:std without
-  // consulting the user resolver), then user resolver for everything else.
-  const resolve = (path: string): Module | null =>
-    defaultResolver(path) ?? opts?.resolver?.(path) ?? null;
 
   // Build the import env first.
   let env = EMPTY_ENV;
@@ -145,7 +141,7 @@ function evaluateModuleExports(
         const deferred: DeferredImportPatch[] = [];
         const slot: EvalCacheEntry = { status: "in-progress", partialExports, deferred };
         cache.set(imp.from, slot);
-        const resolved = evaluateModuleExports(mod, opts, cache, modCache, partialExports);
+        const resolved = evaluateModuleExports(mod, resolve, cache, modCache, partialExports);
         // Apply any deferred patches now that the in-progress module is
         // complete and its partialExports are fully populated.
         for (const patch of deferred) {
@@ -273,25 +269,11 @@ function evaluateModuleExports(
   return { result, exports };
 }
 
-/**
- * Evaluate a full module.
- *
- * All imports are resolved through `defaultResolver` (which handles `lib:std`)
- * composed with the optional user-provided `resolver`. If neither can resolve
- * an import, a `MODULE_NOT_FOUND` error is returned.
- *
- * Variant constructors (None, Some, Ok, Err, etc.) are handled automatically
- * by the evaluator's uppercase-tag convention — no env wiring required.
- */
-export function evaluateModule(module: Module, opts?: EvaluateModuleOptions): EvalResult {
-  const cache = new Map<string, EvalCacheEntry>();
-  const modCache = new Map<Module, EvalCacheEntry>();
-  const result = evaluateModuleExports(module, opts, cache, modCache, new Map()).result;
-  // After the evaluation completes, check whether any in-progress deferred
-  // patches were left unresolved. An unresolved deferred patch means an
-  // importer requested a name that was never bound by the time the cycle
-  // target finished — a true circular dependency on a non-function value
-  // (functions tolerate the deferral via env-set patching at bind time).
+/** Shared post-evaluation check for unresolved deferred patches (cycles). */
+function checkDeferredCycles(
+  result: EvalResult,
+  modCache: Map<Module, EvalCacheEntry>,
+): EvalResult {
   if (!result.ok) {
     for (const entry of modCache.values()) {
       if (entry.status === "in-progress" && entry.deferred.length > 0) {
@@ -308,6 +290,50 @@ export function evaluateModule(module: Module, opts?: EvaluateModuleOptions): Ev
     }
   }
   return result;
+}
+
+/**
+ * Evaluate a full module.
+ *
+ * All imports are resolved through the optional user-provided `resolver` first;
+ * `defaultResolver` (which handles `lib:std`) is composed in as a fallback.
+ * If neither can resolve an import, a `MODULE_NOT_FOUND` error is returned.
+ *
+ * Variant constructors (None, Some, Ok, Err, etc.) are handled automatically
+ * by the evaluator's uppercase-tag convention — no env wiring required.
+ */
+export function evaluateModule(module: Module, opts?: EvaluateModuleOptions): EvalResult {
+  // User resolver takes priority; defaultResolver (lib:std) is the fallback.
+  const resolve = (path: string): Module | null =>
+    opts?.resolver?.(path) ?? defaultResolver(path) ?? null;
+  const cache = new Map<string, EvalCacheEntry>();
+  const modCache = new Map<Module, EvalCacheEntry>();
+  // After the evaluation completes, check whether any in-progress deferred
+  // patches were left unresolved. An unresolved deferred patch means an
+  // importer requested a name that was never bound by the time the cycle
+  // target finished — a true circular dependency on a non-function value
+  // (functions tolerate the deferral via env-set patching at bind time).
+  return checkDeferredCycles(
+    evaluateModuleExports(module, resolve, cache, modCache, new Map()).result,
+    modCache,
+  );
+}
+
+/**
+ * Like `evaluateModule` but without `defaultResolver` composed in. If
+ * `opts.resolver` returns `null` for a path, `MODULE_NOT_FOUND` is returned.
+ * `lib:std` is NOT available unless the caller provides it via `opts.resolver`.
+ * Use this variant when you want full control over which modules are loaded
+ * (e.g. for tree-shaking or custom lib: schemes).
+ */
+export function evaluateModuleRaw(module: Module, opts?: EvaluateModuleOptions): EvalResult {
+  const resolve = (path: string): Module | null => opts?.resolver?.(path) ?? null;
+  const cache = new Map<string, EvalCacheEntry>();
+  const modCache = new Map<Module, EvalCacheEntry>();
+  return checkDeferredCycles(
+    evaluateModuleExports(module, resolve, cache, modCache, new Map()).result,
+    modCache,
+  );
 }
 
 // Re-export typecheckModule so callers can import both from module.ts

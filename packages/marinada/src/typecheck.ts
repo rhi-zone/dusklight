@@ -4092,7 +4092,7 @@ function discoverExportNames(module: Module): string[] {
  */
 function typecheckModuleInternal(
   module: Module,
-  opts: TypecheckModuleOptions | undefined,
+  resolve: (path: string) => Module | null,
   cache: Map<string, TypecheckCacheEntry>,
   state: State,
 ): TypecheckResult {
@@ -4109,12 +4109,6 @@ function typecheckModuleInternal(
     capMethods: makeBuiltinCapMethods(),
     currentEffects: freshEffectsRow(state),
   };
-
-  // Compose resolvers: defaultResolver first (handles lib:std without
-  // consulting the user resolver), then user resolver for everything else.
-  // MODULE_NOT_FOUND is emitted when neither resolver can resolve the path.
-  const resolve = (path: string): Module | null =>
-    defaultResolver(path) ?? opts?.resolver?.(path) ?? null;
 
   // Build the import env by resolving each import via the composed resolver.
   // When a resolver is supplied we recursively typecheck the resolved module
@@ -4145,7 +4139,7 @@ function typecheckModuleInternal(
       for (const name of exportNames) placeholders.set(name, state.freshVar());
       cache.set(imp.from, { status: "in-progress", placeholders, exportNames });
 
-      const resolved = typecheckModuleInternal(mod, opts, cache, state);
+      const resolved = typecheckModuleInternal(mod, resolve, cache, state);
       cache.set(imp.from, { status: "done", result: resolved });
 
       // Close the cycle: unify each placeholder against the actually
@@ -4390,5 +4384,20 @@ function typecheckModuleInternal(
 }
 
 export function typecheckModule(module: Module, opts?: TypecheckModuleOptions): TypecheckResult {
-  return typecheckModuleInternal(module, opts, new Map(), new State());
+  // User resolver takes priority; defaultResolver (lib:std) is the fallback.
+  const resolve = (path: string): Module | null =>
+    opts?.resolver?.(path) ?? defaultResolver(path) ?? null;
+  return typecheckModuleInternal(module, resolve, new Map(), new State());
+}
+
+/**
+ * Like `typecheckModule` but without `defaultResolver` composed in. If
+ * `opts.resolver` returns `null` for a path, `MODULE_NOT_FOUND` is emitted.
+ * `lib:std` is NOT available unless the caller provides it via `opts.resolver`.
+ * Use this variant when you want full control over which modules are loaded
+ * (e.g. for tree-shaking or custom lib: schemes).
+ */
+export function typecheckModuleRaw(module: Module, opts?: TypecheckModuleOptions): TypecheckResult {
+  const resolve = (path: string): Module | null => opts?.resolver?.(path) ?? null;
+  return typecheckModuleInternal(module, resolve, new Map(), new State());
 }
