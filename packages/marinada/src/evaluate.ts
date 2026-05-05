@@ -212,11 +212,11 @@ function setIn(obj: Value, path: Value[], val: Value, pathPrefix: number[]): Eva
 
 // --- Generator type alias ---
 
-type EvalGen = Generator<Effect, EvalResult, Value>;
+export type EvalGen = Generator<Effect, EvalResult, Value>;
 
 // --- Call a fn or continuation value (generator version) ---
 
-function* callFnGen(fn: Value, args: Value[], callPath: number[]): EvalGen {
+export function* callFnGen(fn: Value, args: Value[], callPath: number[]): EvalGen {
   if (fn.kind === "continuation") {
     if (args.length !== 1) {
       return err("ARITY_ERROR", callPath, "continuation expects 1 arg, got " + String(args.length));
@@ -299,7 +299,7 @@ function* dispatchHandler(
 
 // --- Main evaluator (generator) ---
 
-function* evalGen(expr: Expr, env: Env): EvalGen {
+export function* evalGen(expr: Expr, env: Env): EvalGen {
   // Atoms
   if (expr === null) return ok(NULL);
   if (typeof expr === "boolean") return ok(bool(expr));
@@ -317,6 +317,12 @@ function* evalGen(expr: Expr, env: Env): EvalGen {
       return err("UNDEFINED_VAR", [], "undefined variable: " + expr);
     }
     return ok(val);
+  }
+
+  // Non-array object: an opaque Marinada Value embedded directly in the Expr
+  // tree (e.g. a cap or fn value injected by the host). Return it as-is.
+  if (!Array.isArray(expr)) {
+    return ok(expr as unknown as Value);
   }
 
   // Array = call

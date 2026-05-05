@@ -20,6 +20,9 @@ function collect(expr: Expr, bound: Set<string>, out: Set<string>): void {
     if (!bound.has(expr)) out.add(expr);
     return;
   }
+  // Non-array object: an opaque Value embedded directly in the expression tree
+  // (e.g. a cap or fn value from the host). No free variables to extract.
+  if (!Array.isArray(expr)) return;
   // Array form
   if (expr.length === 0) return;
   const [op, ...args] = expr;
