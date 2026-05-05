@@ -2,10 +2,6 @@
 
 *Open threads from a previous session. Treat as starting context, not instructions — verify relevance before acting.*
 
-### [ ] Marinada: effect-aware reactivity — free-variable analysis for precision
-
-`compileReactive` (reactive.ts) is implemented: pure expressions use the JIT + Proxy env with auto-tracking; effectful expressions (`perform`/`handle`) fall back to the interpreter. The effectful path over-tracks — it reads ALL env signals on every evaluation, not just the ones the expression actually uses. This is correct but wasteful. Free-variable analysis would let us subscribe only to the signals the expression reads, avoiding spurious re-evaluations. Low priority until a real performance problem appears.
-
 ### [ ] Marinada: reactive compilation — async effect cancellation
 
 When a reactive computation containing `perform "Async"` re-runs due to a dep change, any in-flight async continuation from the previous run is silently abandoned. Correct for now (no Async effects in use), but needs explicit cancellation tokens before async effects are used in reactive contexts.
