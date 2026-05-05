@@ -6,6 +6,7 @@ import { NULL, bool } from "./value.ts";
 import { EMPTY_ENV } from "./env.ts";
 import { evaluate } from "./evaluate.ts";
 import { compile } from "./jit.ts";
+import { freeVariables } from "./free-vars.ts";
 
 /**
  * Minimal reactive signal shape — only what compileReactive actually needs.
@@ -69,13 +70,15 @@ function containsEffects(expr: Expr): boolean {
 // ---------------------------------------------------------------------------
 
 function compileEffectful(expr: Expr): ReactiveFn {
+  const freeVars = freeVariables(expr);
   return (env: ReactiveEnv) =>
     computed(() => {
-      // Read all env signals inside computed — auto-tracked as deps.
-      // Over-tracks (re-runs when any env signal changes), but correct.
+      // Only snapshot the signals for variables that are actually free in the
+      // expression — precise dep tracking avoids spurious re-runs.
       const snapshot: Record<string, Value> = {};
-      for (const [key, sig] of Object.entries(env)) {
-        snapshot[key] = jsToValue(sig.get());
+      for (const key of freeVars) {
+        const sig = env[key];
+        if (sig !== undefined) snapshot[key] = jsToValue(sig.get());
       }
       const interpEnv = EMPTY_ENV.extend(snapshot);
       const result = evaluate(expr, interpEnv);

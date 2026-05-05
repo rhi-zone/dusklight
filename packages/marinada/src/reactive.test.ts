@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from "bun:test";
 import { signal } from "@rhi-zone/rainbow";
 import { compileReactive } from "./reactive.ts";
-import { CompileError } from "./jit.ts";
 import type { Expr } from "./types.ts";
 
 describe("compileReactive", () => {
@@ -175,5 +174,28 @@ describe("compileReactive (effectful — interpreter path)", () => {
     const fn = compileReactive(expr);
     const out = fn({});
     expect(out.get()).toBeDefined();
+  });
+
+  it("effectful: does not re-run when unused env signal changes", () => {
+    const x = signal<unknown>(5n);
+    const unused = signal<unknown>(99n);
+    // expr only reads x, not unused
+    const expr: Expr = [
+      "handle",
+      ["perform", "Id", "x"],
+      [
+        ["Id", "v", "k"],
+        ["call", "k", "v"],
+      ],
+      [["return", "r"], "r"],
+    ];
+    const fn = compileReactive(expr);
+    const out = fn({ x, unused });
+    const cb = vi.fn();
+    out.subscribe(cb);
+    unused.set(100n); // should NOT trigger re-run
+    expect(cb).not.toHaveBeenCalled();
+    x.set(7n); // SHOULD trigger
+    expect(cb).toHaveBeenCalledWith(7n);
   });
 });
