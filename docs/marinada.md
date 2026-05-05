@@ -421,7 +421,7 @@ There is no function coloring problem — effectful and pure functions are not s
 Reactivity is effect-aware. When a reactive computation's dependencies change, the system cancels any in-flight effects from the previous run and restarts the computation. Behavior per effect:
 
 - **`Error`** — propagates through the reactive graph cleanly
-- **`Async`** — previous continuation is cancelled, computation restarts (analogous to Solid's `createResource`)
+- **`Async`** — previous continuation is cancelled, computation restarts (analogous to Solid's `createResource`). The payload must be a `fn` that accepts an `AbortSignal`-compatible value and returns a `Promise`. The reactive layer creates an `AbortController` per evaluation, passes `controller.signal` to the fn, and calls `controller.abort()` before restarting. Any object structurally compatible with `AbortSignal` is accepted — no platform lock-in.
 - **`Yield`** — generator restarts from the beginning
 
 This means reactive async data fetches, reactive streams, and reactive error propagation all work without restriction. Pure reactive computations (no effects) are a subset of this model.
