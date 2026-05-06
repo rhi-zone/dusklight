@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@dusklight/core":          "workspace:*",
-    "@dusklight/marinada":      "workspace:*",
+    "@dusklight/marinada":      "github:rhi-zone/marinada",
     "@dusklight/renderer-json": "workspace:*",
     "@rhi-zone/rainbow":        "file:../../../rainbow/packages/core",
     "@rhi-zone/rainbow-ui":     "file:../../../rainbow/packages/ui"
