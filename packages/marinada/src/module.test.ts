@@ -34,13 +34,13 @@ describe("evaluateModule", () => {
     expect(result).toEqual({ ok: true, value: NULL });
   });
 
-  it("bare string main with unbound name evaluates to string literal", () => {
+  it("bare string main fails as undefined variable (strings are variable references)", () => {
     const module: Module = {
       main: "hello",
     };
-    // unbound bare string falls through to string literal
+    // bare string = variable lookup; undefined var is an error
     const result = evaluateModule(module);
-    expect(result).toMatchObject({ ok: true });
+    expect(result).toMatchObject({ ok: false });
   });
 
   it("evaluates a module with type definitions — variant constructors work in main", () => {
