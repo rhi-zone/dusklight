@@ -311,12 +311,9 @@ export function* evalGen(expr: Expr, env: Env): EvalGen {
     }
   }
   if (typeof expr === "string") {
-    // Bare strings are variable references
+    // Bare strings are variable references; if unbound, fall through to string literal
     const val = env.lookup(expr);
-    if (val === undefined) {
-      return err("UNDEFINED_VAR", [], "undefined variable: " + expr);
-    }
-    return ok(val);
+    return ok(val ?? { kind: "string", value: expr });
   }
 
   // Non-array object: an opaque Marinada Value embedded directly in the Expr

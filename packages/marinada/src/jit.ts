@@ -760,7 +760,12 @@ function pushScope(ctx: CompileCtx): CompileCtx {
 function varRef(name: string, ctx: CompileCtx): JSExpr {
   const local = ctx.scope.resolve(name);
   if (local !== undefined) return J.id(local);
-  return J.idx(J.id("env"), J.lit(JSON.stringify(name)));
+  // If not in scope, use env lookup with fallback to string literal (unbound strings are literals)
+  return J.binary(
+    "??",
+    J.idx(J.id("env"), J.lit(JSON.stringify(name))),
+    J.lit(JSON.stringify(name)),
+  );
 }
 
 /** Serialize a JS value as a JS literal string, matching the JIT's value representation. */

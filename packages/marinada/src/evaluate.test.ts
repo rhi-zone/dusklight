@@ -77,8 +77,8 @@ describe("atoms", () => {
     expect(r).toEqual(ok(int(99)));
   });
 
-  it("undefined variable returns error", () => {
-    expect(evaluate("missing")).toEqual(err("UNDEFINED_VAR"));
+  it("unbound string falls through to string literal", () => {
+    expect(evaluate("missing")).toEqual(ok(str("missing")));
   });
 });
 
@@ -272,8 +272,8 @@ describe("let", () => {
     ).toEqual(ok(str("hello world")));
   });
 
-  it("undefined var in let value returns error", () => {
-    expect(evaluate(["let", [["x", "missing"]], "x"])).toEqual(err("UNDEFINED_VAR"));
+  it("unbound string in let value falls through to string literal", () => {
+    expect(evaluate(["let", [["x", "missing"]], "x"])).toEqual(ok(str("missing")));
   });
 });
 
