@@ -851,6 +851,12 @@ function compileExpr(expr: Expr, ctx: CompileCtx): JSExpr {
     case "if":
       return J.cond(arg(1), arg(2), arg(3));
 
+    case "str": {
+      if (arr.length !== 2) throw new CompileError("str requires exactly 1 arg", ctx.path);
+      // Argument is raw data — compile to a JS string literal directly
+      return J.lit(JSON.stringify(String(arr[1])));
+    }
+
     case "do": {
       if (arr.length < 2) throw new CompileError("do requires at least 1 expr", ctx.path);
       const parts = arr.slice(1).map((e, i) => compileExpr(e, childCtx(ctx, i + 1)));

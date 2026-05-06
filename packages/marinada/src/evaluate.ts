@@ -503,6 +503,12 @@ export function* evalGen(expr: Expr, env: Env): EvalGen {
       }
     }
 
+    case "str": {
+      if (arr.length !== 2) return err("ARITY_ERROR", [], "str requires exactly 1 arg");
+      // Argument is taken as raw data, not evaluated — explicit string literal quoting
+      return ok({ kind: "string", value: String(arr[1]) });
+    }
+
     case "do": {
       if (arr.length < 2) return err("ARITY_ERROR", [], "do requires at least 1 expr");
       let last: EvalResult = ok(NULL);
