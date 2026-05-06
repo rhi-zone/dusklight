@@ -503,10 +503,18 @@ export function* evalGen(expr: Expr, env: Env): EvalGen {
       }
     }
 
-    case "str": {
-      if (arr.length !== 2) return err("ARITY_ERROR", [], "str requires exactly 1 arg");
-      // Argument is taken as raw data, not evaluated — explicit string literal quoting
-      return ok({ kind: "string", value: String(arr[1]) });
+    case "__lit": {
+      if (arr.length !== 2) return err("ARITY_ERROR", [], "__lit requires exactly 1 arg");
+      // Raw literal value — argument is not evaluated, returned as-is
+      const v = arr[1];
+      if (v === null) return ok(NULL);
+      if (typeof v === "boolean") return ok(bool(v));
+      if (typeof v === "number")
+        return ok(
+          Number.isInteger(v) ? { kind: "int", value: BigInt(v) } : { kind: "float", value: v },
+        );
+      if (typeof v === "string") return ok({ kind: "string", value: v });
+      return ok(NULL);
     }
 
     case "do": {
