@@ -14,3 +14,13 @@
 - `packages/core` and `packages/app` switched from `workspace:*` marinada to the external git dep
 - `packages/marinada/` directory deleted
 - Pre-commit hook needs `tsc` from the nix shell — use `nix develop .#default --command bash -c '...'` for commits
+
+## Pending: sync ecosystem-common CLAUDE.md region (deferred 2026-06-14)
+
+The canonical ecosystem-common region in `~/git/rhizone/github-io/CLAUDE.md` was updated (data-over-code principle made conditional; verify-before-assert bullet reworded). This repo's `CLAUDE.md` had uncommitted edits to that same region during propagation on 2026-06-14, so it was skipped to avoid clobbering in-flight work. After committing the in-flight CLAUDE.md edits, run:
+
+```sh
+sh ~/git/rhizone/github-io/tooling/propagate-claude-md.sh "$(git rev-parse --show-toplevel)/CLAUDE.md"
+```
+
+The propagator replaces the entire region from canonical, so it will reconcile both your edits and the canonical update. Commit with `docs(claude): sync ecosystem-common region (data-over-code principle)`.
