@@ -50,19 +50,3 @@ git push
 
 (`direnv exec` puts the nix toolchain on PATH so the pre-commit hook passes; never use `--no-verify`.)
 
-## Pending: ecosystem-rules region sync (deferred — LIVE marker-region edits 2026-06-15)
-
-WARNING: CLAUDE.md has uncommitted in-flight edits INSIDE the `<!-- BEGIN/END ECOSYSTEM RULES -->`
-region (a mid-migration toward the canonical region, including re-adding the very bullets being
-removed upstream). Do NOT run the propagator until that work is committed/resolved — it would
-overwrite the live region. The canonical region (github-io commit e678388) dropped two
-harness-management bullets ("No ecosystem changes without checking all affected repos." and
-"Control surface stays self-contained and versioned."). After the in-flight CLAUDE.md work lands,
-re-run:
-
-```sh
-sh ~/git/rhizone/github-io/tooling/propagate-claude-md.sh "$(git rev-parse --show-toplevel)/CLAUDE.md"
-git add CLAUDE.md
-git commit -m "docs(claude): sync ecosystem rules — drop harness-management bullets"
-git push
-```
