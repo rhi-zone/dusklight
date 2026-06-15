@@ -24,3 +24,15 @@ sh ~/git/rhizone/github-io/tooling/propagate-claude-md.sh "$(git rev-parse --sho
 ```
 
 The propagator replaces the entire region from canonical, so it will reconcile both your edits and the canonical update. Commit with `docs(claude): sync ecosystem-common region (data-over-code principle)`.
+
+## CLAUDE.md ecosystem sync deferred — live marker-region WIP (2026-06-15)
+
+CLAUDE.md has uncommitted in-flight edits INSIDE the ecosystem marker region (a partial, older-wording sync of the Meta decision-rule bullets). The propagator was NOT run, to avoid clobbering that WIP. Meanwhile canonical advanced again (commit 050410c in github-io: refined "At a decision point…" bullet + "Prefer data over code" refinement).
+
+Resolve the in-flight CLAUDE.md edits first (commit or discard), then sync from canonical:
+
+```sh
+sh ~/git/rhizone/github-io/tooling/propagate-claude-md.sh "$(git rev-parse --show-toplevel)/CLAUDE.md"
+```
+
+The propagator replaces the entire region from canonical, so it reconciles the WIP and the canonical update in one pass. Commit with `docs(claude): sync ecosystem CLAUDE.md decision-rule region`.
