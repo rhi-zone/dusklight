@@ -32,10 +32,27 @@ A Marinada expression is a JSON value:
 - **Call**: a JSON array `[op, arg1, arg2, ...]` where `op` is a string naming the operation and args are expressions
 
 ```json
-["set", "key", ["+", ["get", "key"], 1]]
+["set", ["var", "state"], "counters", ["+", ["get", ["var", "state"], "counters"], 1]]
 ```
 
-Symbols (op names) are plain JSON strings in the first position of an array. They are not first-class values — a bare string outside the op position is a string literal.
+Symbols (op names) are plain JSON strings in the first position of an array. They are not first-class values.
+
+### Strings and variables
+
+A **bare JSON string in argument position is always a string literal** — unconditionally and independent of its value. It evaluates to itself and the type checker types it as `string`. This is what makes the example above read directly: `"counters"` is a literal field name, not a lookup.
+
+A **variable reference is the explicit op `["var", name]`** (arity 1). Its single argument is a bare string read raw (never evaluated). Evaluating `["var", name]` looks `name` up in the environment; an unbound name is an `UNDEFINED_VAR` error.
+
+```json
+["+", ["var", "x"], 1]                    // x + 1  — x is a variable
+["+", "x", 1]                              // type error: "x" is a string literal, not a number
+["get", ["var", "record"], "x"]           // field "x" of the record bound to `record`
+["get", ["var", "record"], ["var", "k"]]  // dynamic field: key held in variable k
+```
+
+Prior art: this mirrors JSONLogic's `{"var": x}` and CloudFormation's `{"Ref": ...}` — a plain-JSON, value-independent reference marker with no custom lexer.
+
+> **`__lit`** is retired for authors. It survives only as (a) the optimizer's internal constant-fold node and (b) a deprecated compatibility alias: `["__lit", s]` still evaluates, typechecks, and compiles as the literal `s`. New code writes bare strings for string literals.
 
 There are no comments. Use JSON structure for clarity.
 
@@ -84,9 +101,9 @@ Constructors:
 
 Pattern matching via `match` — exact, exhaustive, deterministic:
 ```json
-["match", expr,
-  [["Circle", "r"], ["*", 3.14159, ["*", "r", "r"]]],
-  [["Rect", "w", "h"], ["*", "w", "h"]]]
+["match", ["var", "shape"],
+  [["Circle", "r"], ["*", 3.14159, ["*", ["var", "r"], ["var", "r"]]]],
+  [["Rect", "w", "h"], ["*", ["var", "w"], ["var", "h"]]]]
 ```
 
 The type checker enforces exhaustiveness. Non-exhaustive `match` is a compile error.
@@ -115,7 +132,7 @@ The `?` op propagates errors up: if the inner expression is `Err`, return it imm
 `letrec` for mutually recursive definitions (required for tree traversal):
 
 ```json
-["letrec", [["f", ["fn", ["x"], ["f", "x"]]]], ["f", 0]]
+["letrec", [["f", ["fn", ["x"], ["call", ["var", "f"], ["var", "x"]]]]], ["call", ["var", "f"], 0]]
 ```
 
 TCO is guaranteed — implementations must not overflow the stack on tail-recursive calls. The compiler transforms tail calls; user code does not need trampolining.
@@ -131,7 +148,7 @@ The default type. All external data (source output, plugin op return values with
 Explicit escape hatch. Bypasses type checking for `expr` and all sub-expressions. Use when working with data whose shape genuinely cannot be statically described.
 
 ```json
-["untyped", ["get", "data", "some-dynamic-key"]]
+["untyped", ["get", ["var", "data"], ["var", "some-dynamic-key"]]]
 ```
 
 Type of `["untyped", expr]` is `unknown`.
@@ -140,14 +157,24 @@ Type of `["untyped", expr]` is `unknown`.
 
 ## Built-in Operations
 
+### Variables
+
+```json
+["var", name]   // reference the variable `name`. name is a bare string, read raw.
+```
+
+`name` is not evaluated. Unbound names raise `UNDEFINED_VAR`. A bare string anywhere else is a string literal (see [Strings and variables](#strings-and-variables)).
+
 ### Data Access
 
 ```json
-["get", record, key]           // get field. key is string or number.
+["get", record, key]           // get field. key is a string/number literal, or ["var", k] for a dynamic key.
 ["get-in", record, path]       // get nested field. path is array<string|number>.
 ["set", record, key, value]    // return new record with key set to value.
 ["set-in", record, path, val]  // return new record with nested path set.
 ```
+
+Here `record` and `value` are expressions (often `["var", ...]`); a bare-string `key` is a literal field name.
 
 ### Arithmetic
 
@@ -185,7 +212,7 @@ Require `boolean`. Return `boolean`.
 `if`: cond must be `boolean`. then/else must have the same type.
 `cond`: first matching branch is evaluated.
 `do`: evaluate in sequence, return last.
-`let`: bind names in scope of expr.
+`let`: bind names in scope of expr. Binding names are bare strings; refer to them in the body with `["var", name]`.
 
 ### Type Operations
 
@@ -247,11 +274,11 @@ Higher-level string ops (`split`, `trim`, `starts-with`, `ends-with`, `replace`,
 ### Function & Method Calls
 
 ```json
-["call", f, arg1, arg2]           // call a function or lambda.
+["call", f, arg1, arg2]           // call a function or lambda. f is an expression, usually ["var", name].
 ["call.method", cap, method, ...] // call a named method on a capability object.
 ```
 
-`call.method` is a family of ops where the method name is a string argument. The type checker resolves the method signature from the capability's type.
+`call.method` is a family of ops where the method name is a bare string literal (structural, read raw — not a variable). The type checker resolves the method signature from the capability's type.
 
 ```json
 ["call.method", networkCap, "get", "https://api.example.com/data"]
@@ -327,7 +354,7 @@ The optimizer is a **tree automaton rule engine**: rules are indexed by their ro
 
 Pipeline:
 
-1. **Constant folding** — `["+", 1, 2]` → `["__lit", 3n]`. Applies to any pure expression over known values, including compound values (arrays, records).
+1. **Constant folding** — `["+", 1, 2]` → `["__lit", 3n]`. Applies to any pure expression over known values, including compound values (arrays, records). `["__lit", v]` is the optimizer's internal literal node (also a deprecated author-facing alias); see [Strings and variables](#strings-and-variables).
 2. **TCO** — tail-recursive `letrec` → `["__loop", ...]` nodes. This is the key normalization step: after TCO, all loops have a single canonical form.
 3. **Loop pattern recognition** — `__loop` nodes matching known patterns (array-map, array-filter, array-reduce, etc.) → `["__native", ...]` nodes. Fires on ANY structurally matching loop — lib:std, user-defined, or generated. No name checking.
 4. **Loop fusion** — adjacent `__native` array operations fused to a single pass (gated on empty effect rows).
@@ -433,13 +460,13 @@ This means reactive async data fetches, reactive streams, and reactive error pro
 ## Lambdas
 
 ```json
-["fn", ["x", "y"], ["+", "x", "y"]]
+["fn", ["x", "y"], ["+", ["var", "x"], ["var", "y"]]]
 ```
 
-Parameters are untyped by default (`unknown`). Optional type annotations:
+Parameter names in the binder list are bare strings; uses in the body are `["var", name]`. Parameters are untyped by default (`unknown`). Optional type annotations:
 
 ```json
-["fn", [["x", "int"], ["y", "int"]], ["+", "x", "y"]]
+["fn", [["x", "int"], ["y", "int"]], ["+", ["var", "x"], ["var", "y"]]]
 ```
 
 ## Types
@@ -498,10 +525,10 @@ Standard library types (`option<T>`, `result<T, E>`) are defined in `lib:std` �
 ## Effects — Handler Syntax
 
 ```json
-["handle", expr,
-  [["Yield", "val", "k"], ["do", ["collect", "val"], ["call", "k", null]]],
-  [["Error", "err", "k"], ["log", "err"]],
-  [["return", "x"], "x"]]
+["handle", ["var", "body"],
+  [["Yield", "val", "k"], ["do", ["call", ["var", "collect"], ["var", "val"]], ["call", ["var", "k"], null]]],
+  [["Error", "err", "k"], ["call", ["var", "log"], ["var", "err"]]],
+  [["return", "x"], ["var", "x"]]]
 ```
 
 Each clause binds the effect payload and the continuation `k` as explicit named parameters — first-class values, no magic. `k` can be called, passed around, stored.
@@ -559,7 +586,7 @@ When a reactive computation re-runs due to a dependency change, any linear value
 Linear types used in reactive computations must declare a destructor — a cleanup expression run before the value is discarded. The runtime calls it automatically on re-run.
 
 ```json
-{ "name": "FileHandle", "linear": true, "destructor": ["fn", ["h"], ["close", "h"]] }
+{ "name": "FileHandle", "linear": true, "destructor": ["fn", ["h"], ["close", ["var", "h"]]] }
 ```
 
 Affine types (at most once) may be silently dropped — dropping is explicitly permitted by the `affine` modifier.
