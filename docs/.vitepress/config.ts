@@ -31,16 +31,17 @@ export default withMermaid(
         include: ['mermaid'],
       },
     },
-    title: 'Dusklight',
+    title: 'dusklight',
     description: 'Universal UI client with control plane',
 
     base: '/dusklight/',
+    srcExclude: ['**/CLAUDE.md'],
 
     themeConfig: {
       nav: [
         { text: 'Philosophy', link: '/philosophy' },
         { text: 'Architecture', link: '/architecture' },
-        { text: 'RHI', link: 'https://docs.rhi.zone/' },
+        { text: 'rhi', link: 'https://docs.rhi.zone/' },
       ],
 
       sidebar: {
